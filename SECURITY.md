@@ -39,14 +39,20 @@ Constraints this project holds itself to:
 - **Profile-safe paths.** Hermes supports multiple profiles via `HERMES_HOME`;
   hardcoding `~/.hermes` would read or corrupt another profile's data. Use the
   host's `get_hermes_home()`.
-- **Least surface.** The plugin registers only what it needs. This release
-  registers one read-only skill: no tools, no hooks, no filesystem or network
-  access, and no data collected, stored, or transmitted.
+- **Least surface.** The plugin registers only what it needs. Today that is one
+  read-only skill: no tools, no hooks, no filesystem access, no network
+  requests, and no data collected, stored, or transmitted.
+- **No runtime dependencies.** `dependencies` is empty, so installing the
+  plugin adds no third-party code to a user's Hermes environment and brings no
+  transitive supply-chain surface with it.
 
-## Scope of this release
+## Scope of this foundation
 
-v0.1.0 ships a bundled skill and no executable tools, so its attack surface is
-the skill text itself. Skill content reaches the model, so treat it as
-untrusted input to the agent: Hermes logs a warning when skill content resembles
-a prompt-injection attempt but still serves it. Review changes to `SKILL.md`
-with that in mind.
+This is an early development foundation, not the feature-complete public
+release. It ships one bundled skill and no executable tools. It has no storage
+and does not persist progress, no Mini App or web surface, and makes no network
+requests — so its attack surface is the skill text itself.
+
+Skill content reaches the model, so treat it as untrusted input to the agent:
+Hermes logs a warning when skill content resembles a prompt-injection attempt
+but still serves it. Review changes to `SKILL.md` with that in mind.

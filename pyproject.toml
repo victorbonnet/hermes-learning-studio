@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "hermes-learning-studio"
 version = "0.1.0"
-description = "A standalone Hermes plugin for adaptive, spaced-repetition learning sessions"
+description = "A generic adaptive learning and interactive exercise studio for Hermes agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -20,20 +20,32 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Education",
 ]
-dependencies = ["PyYAML>=6.0"]
+# The runtime plugin code imports only the standard library. Anything added
+# here is installed into every user's Hermes environment, so it stays empty
+# until the plugin genuinely needs a third-party package at runtime.
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/victorbonnet/hermes-learning-studio"
 Issues = "https://github.com/victorbonnet/hermes-learning-studio/issues"
 
-# Hermes discovers pip-installed plugins through this entry-point group. The
-# entry-point name becomes the plugin's manifest name -- and therefore the
+# Hermes discovers pip-installed plugins through this entry-point group.
+#
+# The value must point at the MODULE, with no `:attribute` suffix. Hermes'
+# loader does `module = ep.load()` and then `getattr(module, "register", None)`,
+# so a `learning_studio:register` value would make `ep.load()` return the
+# function itself, leaving no `.register` attribute to find and failing with
+# "Plugin 'learning-studio' has no register() function".
+#
+# The entry-point name becomes the plugin's manifest name -- and therefore the
 # skill namespace -- so it must stay identical to `name:` in plugin.yaml.
 [project.entry-points."hermes_agent.plugins"]
-learning-studio = "learning_studio:register"
+learning-studio = "learning_studio"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+# PyYAML is a test-only dependency: it parses plugin.yaml and SKILL.md
+# frontmatter in the suite. The plugin itself never imports it.
+dev = ["pytest>=8.0", "PyYAML>=6.0", "ruff>=0.6"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["learning_studio"]

@@ -4,14 +4,33 @@ A standalone [Hermes](https://hermes-agent.nousresearch.com) plugin for adaptive
 learning: structured study sessions built on active recall and spaced
 repetition.
 
-> **Status: foundation release (v0.1.0).** This release registers a single
-> bundled skill and nothing else — no tools, no storage, no dashboard. Sessions
-> run as ordinary conversation and nothing is persisted between them. See
-> [Roadmap](#roadmap) for what is deferred.
+> **Status: early development foundation.** This is not the feature-complete
+> public release. What exists today is a single bundled skill and nothing else:
+> **no tools, no storage, no progress persistence, no Mini App, and no network
+> requests.** Study sessions run as ordinary conversation, and nothing carries
+> over between them. See [Roadmap](#roadmap) for what is still to come.
 
 ## Install
 
-As a directory plugin:
+The supported way to install is Hermes' own plugin installer:
+
+```bash
+hermes plugins install victorbonnet/hermes-learning-studio --enable
+```
+
+For a specific Hermes profile:
+
+```bash
+hermes --profile <profile> plugins install victorbonnet/hermes-learning-studio --enable
+```
+
+Plugins are opt-in. `--enable` turns the plugin on as part of the install; drop
+it and enable later with `hermes plugins enable learning-studio`.
+
+Verify with `hermes plugins list`, or
+`HERMES_PLUGINS_DEBUG=1 hermes plugins list` if the plugin does not appear.
+
+### Alternative: clone into the plugins directory
 
 ```bash
 git clone https://github.com/victorbonnet/hermes-learning-studio.git \
@@ -19,16 +38,20 @@ git clone https://github.com/victorbonnet/hermes-learning-studio.git \
 hermes plugins enable learning-studio
 ```
 
-Or from a checkout, as a pip-installed plugin:
+### Alternative: pip install
 
 ```bash
-pip install .
+pip install git+https://github.com/victorbonnet/hermes-learning-studio.git
 hermes plugins enable learning-studio
 ```
 
-Plugins are opt-in, so the `enable` step is required either way. Verify with
-`hermes plugins list`, or `HERMES_PLUGINS_DEBUG=1 hermes plugins list` if the
-plugin does not appear.
+This path registers the plugin through the `hermes_agent.plugins` entry point.
+The entry point resolves to the `learning_studio` **module** (not
+`learning_studio:register`), because Hermes calls `ep.load()` and then looks up
+`.register` on the result — a `module:attribute` value returns the function
+itself and fails with `Plugin 'learning-studio' has no register() function`.
+`tests/test_entry_point.py` verifies the load path behaviourally, and the wheel
+is installed into a clean virtualenv during verification to confirm it.
 
 ## Usage
 
@@ -69,6 +92,15 @@ for pip installs. `plugin.yaml` and the `hermes_agent.plugins` entry point in
 `learning-studio:adaptive-learning` however it was installed. A test asserts the
 manifest name and the registered namespace agree.
 
+**The entry point names a module, never `module:attribute`.** Hermes' loader is
+`module = ep.load()` followed by `getattr(module, "register", None)`. A value of
+`learning_studio:register` makes `ep.load()` return the function, which has no
+`.register` attribute, so the plugin silently fails to load with a warning
+rather than a traceback. The value is `learning_studio`, and
+`tests/test_entry_point.py` loads it through `importlib.metadata` and asserts a
+module comes back — including a test that the old value would *not* satisfy the
+contract, so the guard cannot rot.
+
 **The root shim uses a relative import.** Hermes loads directory plugins with
 `spec_from_file_location(..., submodule_search_locations=[plugin_dir])` under
 the `hermes_plugins` namespace — the plugin directory is never placed on
@@ -86,22 +118,27 @@ imports inside the code paths that need them; a test blocks those modules at
 import time and asserts registration still succeeds.
 
 **The skill tells the truth about its own scope.** `SKILL.md` states plainly
-that this release has no tools and no persistence, because a skill that implies
-otherwise sends the agent after tools that do not exist. A test fails if the
-skill body references tool names while `register()` registers no tools.
+that this foundation has no tools and no persistence, because a skill that
+implies otherwise sends the agent after tools that do not exist. A test fails if
+the skill body references tool names while `register()` registers no tools.
+
+**No runtime dependencies.** `dependencies` is empty, so installing the plugin
+adds nothing to a user's Hermes environment. PyYAML is a test-only dependency
+in the `dev` extra — the plugin code itself imports only the standard library.
 
 Reserved for later PRs: the toolset name `plugin_learning_studio`.
 
 ## Configuration
 
 Behavioural settings belong in Hermes' `config.yaml`. Secrets belong in `.env`
-and are never committed. This release reads neither.
+and are never committed. This foundation reads neither.
 
 ## Roadmap
 
-Deliberately **not** in this release: runtime tools, SQLite persistence, the
-FastAPI dashboard, Telegram authentication, frontend code, tunnels, and image
-handling. Each lands in a later PR.
+Deliberately **not** here yet: runtime tools, SQLite persistence, learning
+tracks, memory integration, exercise manifests, the FastAPI dashboard and Mini
+App, Telegram authentication, frontend code, Cloudflare tunnels, slash commands,
+and image handling. Each lands in a later PR.
 
 ## Development
 

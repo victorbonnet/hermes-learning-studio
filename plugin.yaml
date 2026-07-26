@@ -6,7 +6,7 @@
 # installs and pip installs resolve to the same namespace.
 name: learning-studio
 version: 0.1.0
-description: Adaptive learning sessions for Hermes — study plans, recall practice, and progress tracking.
+description: Generic adaptive-learning guidance for structured conversational study sessions in Hermes.
 author: Victor Bonnet
 kind: standalone
 

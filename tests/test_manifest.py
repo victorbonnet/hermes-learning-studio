@@ -81,7 +81,12 @@ def test_reserved_identities_are_stable():
 def test_entry_point_name_matches_manifest_name(repo_root: Path, manifest):
     """Directory installs read plugin.yaml; pip installs use the entry-point
     name as the manifest name. They must agree or the skill namespace differs
-    depending on how the plugin was installed."""
+    depending on how the plugin was installed.
+
+    This checks the *name* only. Whether the entry-point *value* actually
+    loads the way Hermes expects is covered behaviourally in
+    ``tests/test_entry_point.py``.
+    """
     tomllib = pytest.importorskip("tomllib")
 
     with (repo_root / "pyproject.toml").open("rb") as handle:
@@ -89,4 +94,3 @@ def test_entry_point_name_matches_manifest_name(repo_root: Path, manifest):
 
     entry_points = pyproject["project"]["entry-points"]["hermes_agent.plugins"]
     assert list(entry_points) == [manifest["name"]]
-    assert entry_points[manifest["name"]] == "learning_studio:register"

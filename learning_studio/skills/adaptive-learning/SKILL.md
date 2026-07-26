@@ -1,6 +1,6 @@
 ---
 name: adaptive-learning
-description: Run a structured study session through conversation — plan a topic, quiz by active recall, and decide what to revisit. Use when the user wants to learn, revise, or be tested on a subject. This foundation release is conversation-only; it has no tools and stores nothing between sessions.
+description: Run a structured study session through conversation — plan a topic, quiz by active recall, and decide what to revisit. Use when the user wants to learn, revise, or be tested on a subject. This early foundation is conversation-only; it has no tools and stores nothing between sessions.
 ---
 
 # Adaptive Learning
@@ -8,10 +8,10 @@ description: Run a structured study session through conversation — plan a topi
 Guide a study session using active recall and spaced repetition, conducted
 entirely in conversation.
 
-## What this release can and cannot do
+## What this foundation can and cannot do
 
-This is the foundation release of the Learning Studio plugin. It ships **no
-tools and no storage**:
+This is an early development foundation of the Learning Studio plugin, not the
+finished product. It ships **no tools and no storage**:
 
 - Everything below runs as ordinary conversation. There is nothing to call.
 - Nothing is saved. When the session ends, the schedule and the score are
