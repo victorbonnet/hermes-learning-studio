@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-learning-studio"
+version = "0.1.0"
+description = "A standalone Hermes plugin for adaptive, spaced-repetition learning sessions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Victor Bonnet" }]
+keywords = ["hermes", "hermes-agent", "plugin", "learning", "spaced-repetition"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Education",
+]
+dependencies = ["PyYAML>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/victorbonnet/hermes-learning-studio"
+Issues = "https://github.com/victorbonnet/hermes-learning-studio/issues"
+
+# Hermes discovers pip-installed plugins through this entry-point group. The
+# entry-point name becomes the plugin's manifest name -- and therefore the
+# skill namespace -- so it must stay identical to `name:` in plugin.yaml.
+[project.entry-points."hermes_agent.plugins"]
+learning-studio = "learning_studio:register"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["learning_studio"]
+
+[tool.hatch.build.targets.sdist]
+include = ["learning_studio", "tests", "plugin.yaml", "__init__.py", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers --strict-config"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately import inside functions to exercise fresh module state.
+"tests/*" = ["E402"]

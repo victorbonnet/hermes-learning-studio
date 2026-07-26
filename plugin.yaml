@@ -1,0 +1,20 @@
+# Hermes plugin manifest.
+#
+# `name` is the plugin's identity in Hermes: it is the namespace for bundled
+# skills (`learning-studio:adaptive-learning`) and must match the
+# `hermes_agent.plugins` entry-point name in pyproject.toml so that directory
+# installs and pip installs resolve to the same namespace.
+name: learning-studio
+version: 0.1.0
+description: Adaptive learning sessions for Hermes — study plans, recall practice, and progress tracking.
+author: Victor Bonnet
+kind: standalone
+
+# This release registers a bundled skill only. Tools, hooks, and slash
+# commands arrive in later PRs and will be declared here when they exist.
+provides_tools: []
+provides_hooks: []
+
+# No credentials are needed. A non-empty `requires_env` would gate the plugin
+# off entirely when the variable is unset.
+requires_env: []
