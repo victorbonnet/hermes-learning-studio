@@ -3,20 +3,47 @@
 The shape every exercise card shares. This is the vocabulary you think in when
 you design an item, whether it ends up rendered by a runtime or typed into chat.
 
-## Exercises are declarative data, never code
+## Exercises are declarative data, never renderer code
 
 An exercise is a description of *what to ask and how to judge the answer*. It
 is never an implementation of how to draw that on a screen.
 
 **Never write, generate, or emit HTML, JavaScript, CSS, or any other frontend
-code to deliver an exercise.** Not as a file, not in a message, not "just to
-show what it would look like". Renderers are the runtime's job; generated
-markup is unreviewable, unauditable, inaccessible by default, and impossible to
-evaluate consistently. If you find yourself writing a `<div>`, you have left
-the contract.
+code as the delivery mechanism for an exercise** — no renderer, no widget, no
+interactive page, not even "just to show what it would look like". Rendering is
+the runtime's job. Agent-authored UI code is unreviewable, unauditable,
+inaccessible by default, and impossible to score consistently. If you are
+writing a `<div>` so the learner can *interact* with it, you have left the
+contract.
 
 The same goes for scoring: express the answer key as data. Do not emit a
 snippet of code that computes the score.
+
+### Code as subject matter is explicitly allowed
+
+This prohibition is about **who renders the interface**, not about what may
+appear inside an exercise. Web technologies are subjects like any other, and
+this plugin must be able to teach them.
+
+Code — including HTML, CSS, and JavaScript — is allowed and expected when it is
+the:
+
+- **subject matter** — teaching how the box model or the event loop works;
+- **prompt** — "what does this selector match?", "find the bug in this
+  handler";
+- **answer or answer key** — the corrected rule, the fixed function;
+- **source material** — the learner's own stylesheet or component;
+- **instructional feedback** — showing the corrected snippet beside theirs.
+
+The rule that makes this safe: **such code is inert content.** It travels in
+`prompt`, `payload`, `answer`, or `feedback` as text to be read, compared, or
+reasoned about. It is never executed, never mounted, and never used as the
+Mini App's renderer. A CSS debugging exercise ships the broken rule as a string
+in the prompt; it does not ship a live page that applies it.
+
+If you cannot tell which side of the line you are on, ask: *is this code
+something the learner reads and reasons about, or something that draws the
+screen they are answering on?* The first is content. The second is prohibited.
 
 ## Status
 
@@ -48,6 +75,43 @@ Every card, regardless of type, carries:
 
 Only `id`, `type`, `prompt`, `payload`, and `answer` are always required.
 Everything else is optional but nearly always worth filling in.
+
+## The private/public boundary
+
+A manifest has two halves, and **the split is a security boundary, not a
+formatting choice.** Anything delivered to a client — a Mini App, a browser, a
+rendered message — is readable by the learner, whatever the interface shows.
+There is no such thing as a hidden field on the client.
+
+**Public (client-side).** Safe to send to the renderer:
+
+`id`, `type`, `prompt`, `payload` (options, items, steps, cells), `media`,
+`hints` (only those already released), `accessibility`, and the presentation
+of feedback *after* an answer is submitted.
+
+**Private (server-side only).** The answer key is never sent to the client
+before the attempt is graded, and neither is anything else in this half:
+
+`answer`, `evaluation` internals such as accepted variants and tolerances,
+`rubric` levels where the learner is meant to attempt before seeing them,
+per-distractor feedback, unreleased `hints`, and any scoring weights.
+
+Rules that follow from this:
+
+- **Grade on the server.** A client that knows the key can be read; a client
+  that reports its own score can be edited. Neither is a hypothetical.
+- **Release hints one at a time**, on request. Shipping all three with the item
+  ships the answer.
+- **Send feedback in response to an attempt**, not bundled with the question.
+- **Never rely on the interface to conceal a field.** Collapsed, hidden, and
+  off-screen are all fully readable.
+- Where an exercise genuinely cannot be graded without the key on the client —
+  an offline flashcard self-check, for instance — that is a legitimate design,
+  but say so explicitly and never present its score as an assessment result.
+
+None of this is implemented yet; there is no client and no server. The boundary
+is recorded now because retrofitting it after a renderer exists means changing
+a wire format that already has data in it.
 
 ## Rules that hold for every card
 

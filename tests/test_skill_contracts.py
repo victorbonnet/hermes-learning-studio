@@ -84,19 +84,60 @@ def test_never_claims_an_exercise_was_started(corpus: str):
     )
 
 
-def test_skill_does_not_advertise_tools_that_do_not_exist(corpus: str, ctx):
-    """Extends the PR-01 guard to every reference file.
+#: Host tools verified to exist in Hermes' own toolset registry. The guidance
+#: may instruct the agent to call these and nothing else, because this plugin
+#: registers no tools of its own.
+KNOWN_HOST_TOOLS = frozenset(
+    {
+        "read_file",
+        "write_file",
+        "search_files",
+        "patch",
+        "skill_view",
+        "skills_list",
+        "image_generate",
+        "vision_analyze",
+        "memory",
+        "session_search",
+        "web_search",
+        "todo",
+        "clarify",
+    }
+)
 
-    ``register()`` still registers no tools, so any tool-call syntax anywhere in
-    the skill corpus would send the agent after something that cannot answer.
+#: Anything that looks like ``some_tool(`` in the guidance.
+CALL_SYNTAX_RE = re.compile(r"\b([a-z_][a-z0-9_]{2,})\(")
+
+
+def test_guidance_calls_no_tool_that_does_not_exist(corpus: str, ctx):
+    """Every call-like token in the corpus must name a real host tool.
+
+    ``register()`` registers no tools, so any call the guidance shows must be
+    one the *host* provides. This scans for call syntax generally rather than
+    blocklisting a couple of known-bad prefixes, so inventing a brand-new tool
+    name fails here instead of shipping.
     """
     from learning_studio import register
 
     register(ctx)
-    assert ctx.tools == [], "this guard assumes no tools are registered yet"
+    assert ctx.tools == [], "this guard assumes this plugin registers no tools"
 
-    for token in ("learning_studio_", "plugin_learning_studio("):
-        assert token not in corpus, f"guidance references '{token}' but no such tool is registered"
+    called = set(CALL_SYNTAX_RE.findall(corpus))
+    unknown = sorted(called - KNOWN_HOST_TOOLS)
+    assert unknown == [], (
+        f"guidance calls {unknown}, which no registered plugin tool and no known "
+        f"host tool provides — the agent would be sent after something that "
+        f"cannot answer"
+    )
+
+
+def test_tool_guard_rejects_an_invented_tool_name():
+    """Proves the guard above discriminates rather than passing vacuously."""
+    invented = 'Call learning_studio_start_exercise("deck") to begin.'
+
+    called = set(CALL_SYNTAX_RE.findall(invented))
+
+    assert sorted(called - KNOWN_HOST_TOOLS) == ["learning_studio_start_exercise"]
 
 
 # ── Exercises are declarative, never generated code ────────────────────────
@@ -119,6 +160,115 @@ def test_generated_code_prohibition_appears_in_the_manifest_contract(references:
         references.get("manifest-contract", ""),
         (r"never (write|generate|emit|produce|author)", r"(html|javascript|code)"),
         "manifest-contract code prohibition",
+    )
+
+
+def test_code_is_allowed_when_it_is_the_subject_matter(references: dict[str, str]):
+    """The prohibition must not stop the plugin teaching web subjects.
+
+    Banning HTML/CSS/JS outright would make it impossible to run a CSS
+    debugging drill or a JavaScript tracing exercise — a whole class of
+    subjects the plugin claims to serve.
+    """
+    assert_states(
+        references.get("manifest-contract", ""),
+        (
+            r"(subject matter|code as subject)",
+            r"(allowed|expected)",
+            r"(prompt|answer|source material|feedback)",
+        ),
+        "code-as-content allowance",
+    )
+
+
+def test_instructional_code_must_stay_inert(references: dict[str, str]):
+    """Allowing code as content must not allow it to be executed."""
+    assert_states(
+        references.get("manifest-contract", ""),
+        (
+            r"inert",
+            r"never (executed|run|mounted)|not executed",
+            r"renderer",
+        ),
+        "inert instructional code",
+    )
+
+
+def test_prohibition_targets_the_renderer_not_the_content(references: dict[str, str]):
+    text = normalize(references.get("manifest-contract", ""))
+    assert "delivery mechanism" in text or "renderer code" in text, (
+        "the prohibition must be scoped to renderer/UI implementation code, "
+        "not to code appearing inside an exercise"
+    )
+
+
+# ── Private/public manifest boundary ───────────────────────────────────────
+
+
+def test_manifest_declares_a_private_public_boundary(references: dict[str, str]):
+    assert_states(
+        references.get("manifest-contract", ""),
+        (
+            r"(private|server-side)",
+            r"(public|client-side)",
+            r"answer[^.]{0,120}(never|not) (be )?sent",
+        ),
+        "private/public split",
+    )
+
+
+def test_grading_happens_server_side(references: dict[str, str]):
+    assert_states(
+        references.get("manifest-contract", ""),
+        (r"grade on the server", r"(no such thing as a hidden field|readable by the learner)"),
+        "server-side grading",
+    )
+
+
+# ── Mastery, timing, and scheduling coherence ──────────────────────────────
+
+
+def test_meeting_the_standard_retires_the_objective(skill_md: str):
+    """Success at the standard must not be read as 'the material is too easy'."""
+    assert_states(
+        skill_md,
+        (
+            r"succeeding at the standard",
+            r"(retire|maintenance|schedule a review)",
+            r"(does )?not license expanding the syllabus|not[^.]{0,60}expand",
+        ),
+        "mastery stopping rule",
+    )
+
+
+def test_raising_difficulty_is_scoped_to_below_standard_success(skill_md: str):
+    assert_states(
+        skill_md,
+        (r"succeeding below the standard", r"raise the difficulty"),
+        "below-standard difficulty rule",
+    )
+
+
+def test_latency_is_only_evidence_when_speed_is_the_objective(skill_md: str):
+    assert_states(
+        skill_md,
+        (
+            r"only when speed or automatic recall is part of the stated objective",
+            r"(otherwise|not evidence)[^.]{0,120}(not evidence|latency)",
+        ),
+        "objective-dependent timing",
+    )
+
+
+def test_flashcards_separate_relearning_from_future_scheduling(references: dict[str, str]):
+    assert_states(
+        references.get("flashcards-and-recall", ""),
+        (
+            r"relearning step",
+            r"next review interval",
+            r"after the relearning attempt succeeds",
+        ),
+        "relearning vs review interval",
     )
 
 
@@ -181,9 +331,78 @@ def test_multi_user_memory_warning_is_present(corpus: str):
     )
 
 
+#: The clauses that make the multi-user warning a warning. Matching on the
+#: substance, not on the words "memory" and "learner", which appear throughout
+#: SKILL.md for unrelated reasons and would keep this test green after the
+#: whole subsection was deleted.
+MULTI_USER_CLAUSES = (
+    r"(dedicated to (a )?(one|single) learner|single-learner profile)",
+    r"(isolated per user|per-user isolation|verified[^.]{0,60}isolat)",
+    r"per-user studio storage|studio storage[^.]{0,60}per user",
+    r"(profile|memory)[^.]{0,80}(not|never)[^.]{0,40}(to a person|belong to a person)"
+    r"|belongs to a \*?profile\*?, not to a person",
+)
+
+
+def strip_multi_user_section(skill_md: str) -> str:
+    """SKILL.md with the multi-user warning subsection removed."""
+    start = skill_md.index("### Before writing anything learner-specific")
+    end = skill_md.index("## Hard rules")
+    return skill_md[:start] + skill_md[end:]
+
+
 def test_multi_user_warning_is_visible_in_the_skill_itself(skill_md: str):
     """A privacy rule buried in a reference file may never be read."""
-    assert_states(skill_md, (r"memory", r"learner"), "memory warning in SKILL.md")
+    assert_states(skill_md, MULTI_USER_CLAUSES, "multi-user warning in SKILL.md")
+
+
+def test_multi_user_warning_check_fails_without_the_warning(skill_md: str):
+    """The discrimination guard.
+
+    If this starts passing, the test above has stopped protecting the privacy
+    rule and would survive its deletion — which is exactly how the previous
+    version of this check failed review.
+    """
+    gutted = strip_multi_user_section(skill_md)
+    assert len(gutted) < len(skill_md), "fixture no longer removes the section"
+
+    with pytest.raises(AssertionError):
+        assert_states(gutted, MULTI_USER_CLAUSES, "multi-user warning in SKILL.md")
+
+
+# ── Consent before persistence ─────────────────────────────────────────────
+
+
+def test_inferred_facts_are_confirmed_before_they_are_persisted(skill_md: str):
+    assert_states(
+        skill_md,
+        (r"infer", r"(confirm|correct)[^.]{0,90}(before|durable)"),
+        "confirm-before-persist",
+    )
+
+
+def test_sensitive_information_needs_affirmative_permission(skill_md: str):
+    assert_states(
+        skill_md,
+        (r"ask before persisting", r"sensitive", r"accept no as the answer|say no"),
+        "affirmative consent for sensitive data",
+    )
+
+
+def test_accessibility_needs_are_session_only_by_default(skill_md: str):
+    assert_states(
+        skill_md,
+        (r"accessibility needs are session-only", r"explicitly asks"),
+        "session-only accessibility",
+    )
+
+
+def test_uncertainty_resolves_to_not_persisting(skill_md: str):
+    assert_states(
+        skill_md,
+        (r"(consent|isolation) is uncertain", r"do not persist|uncertainty resolves to no"),
+        "uncertainty resolves to no",
+    )
 
 
 # ── Subject neutrality ─────────────────────────────────────────────────────

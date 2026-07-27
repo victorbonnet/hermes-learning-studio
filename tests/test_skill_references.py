@@ -119,8 +119,46 @@ def test_every_reference_is_linked_from_the_skill(references: dict[str, str], sk
 def test_skill_tells_the_agent_to_load_references_selectively(skill_md: str):
     """Loading the whole catalogue defeats the point of progressive disclosure."""
     normalized = " ".join(skill_md.lower().split())
-    assert "skill_view" in normalized, "SKILL.md must show how to open a reference"
-    assert "only" in normalized and "reference" in normalized
+    assert "only the references" in normalized or "load only" in normalized
+    assert "do not preload" in normalized
+
+
+def test_references_are_opened_with_read_file_and_the_skill_dir_token(skill_md: str):
+    """The only mechanism that actually works for a plugin-namespaced skill.
+
+    Hermes substitutes ``${HERMES_SKILL_DIR}`` for the skill's real directory
+    before serving SKILL.md, so a ``read_file`` on that path resolves. This is
+    the same idiom Hermes' own bundled skills use for sibling files.
+    """
+    assert "${HERMES_SKILL_DIR}/references/" in skill_md, (
+        "SKILL.md must address references through ${HERMES_SKILL_DIR}"
+    )
+    assert 'read_file("${HERMES_SKILL_DIR}/references/' in skill_md, (
+        "SKILL.md must show a concrete read_file call for opening a reference"
+    )
+
+
+def test_skill_warns_that_skill_view_cannot_open_a_reference(skill_md: str):
+    """``skill_view``'s file_path is silently ignored for plugin skills.
+
+    Hermes' ``skill_view`` dispatches qualified ``plugin:skill`` names to
+    ``_serve_plugin_skill()``, which takes no ``file_path`` argument — the call
+    returns SKILL.md again and *reports success*. An agent that follows the
+    wrong idiom would silently re-read this file instead of the reference, so
+    the warning has to be in the text.
+    """
+    normalized = " ".join(skill_md.lower().split())
+    assert "do not try to load a reference with `skill_view`" in normalized, (
+        "SKILL.md must warn against the skill_view idiom"
+    )
+    assert "ignored for plugin" in normalized and "returns this same skill.md" in normalized
+
+
+def test_skill_gives_a_fallback_when_substitution_is_disabled(skill_md: str):
+    """``template_vars`` can be switched off in a profile's skills config."""
+    normalized = " ".join(skill_md.lower().split())
+    assert "substitution is switched off" in normalized
+    assert "search_files" in normalized
 
 
 # ── One skill, not one skill per card ──────────────────────────────────────

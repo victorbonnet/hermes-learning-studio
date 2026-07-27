@@ -42,11 +42,24 @@ The UI catalogue is large on purpose and expensive to carry. It lives in
 separate files, and **you should open only the references the current decision
 needs** — typically one or two per exercise. Do not preload the catalogue.
 
-Open one with the second argument to `skill_view`:
+Open one with `read_file`, using the skill directory token:
 
 ```
-skill_view("learning-studio:adaptive-learning", "references/selection-cards.md")
+read_file("${HERMES_SKILL_DIR}/references/selection-cards.md")
 ```
+
+`${HERMES_SKILL_DIR}` is replaced with this skill's real absolute directory
+before you ever see this text, so the path above is already concrete.
+
+**Do not try to load a reference with `skill_view`.** Its `file_path` argument
+is ignored for plugin-namespaced skills like this one — the call silently
+returns this same SKILL.md instead of the reference you asked for, which looks
+like success and is not. Use `read_file`.
+
+If the token above still reads literally as `${HERMES_SKILL_DIR}`, template
+substitution is switched off in this profile. Locate the file yourself with
+`search_files` for `references/selection-cards.md`, or continue without the
+catalogue — the workflow below stands on its own.
 
 | Reference | Open it when |
 | --- | --- |
@@ -132,7 +145,15 @@ Match the method to the objective, not to habit:
   first makes the explanation stick.
 
 Difficulty should sit where the learner succeeds roughly three times in four.
-Consistent success means the material is too easy, not that they are done.
+Read consistent success against the objective's stated standard, not against
+your appetite for more material:
+
+- **Succeeding below the standard** — reliably right, but not yet at the
+  required speed, independence, or transfer — means the material is too easy at
+  this level. Raise the difficulty toward the standard.
+- **Succeeding at the standard** means the objective is met. Retire it, move it
+  to maintenance, or schedule a review. It does **not** license expanding the
+  syllabus; that is the learner's decision, not yours.
 
 ### 4. Choose the exercise format
 
@@ -197,7 +218,11 @@ Read the pattern, not the percentage:
 - **Wrong for a reason** — a consistent misconception — needs re-teaching, not
   repetition. Three failures all placing photosynthesis in the mitochondrion is
   one gap, not three.
-- **Right but slow** means it is not yet automatic; keep it in rotation.
+- **Right but slow** indicates incomplete automaticity **only when speed or
+  automatic recall is part of the stated objective**; then keep it in rotation.
+  Otherwise latency is not evidence of weak mastery — learners read, type, and
+  think at different speeds, and treating that as a deficit penalises the
+  learner for something the objective never asked for.
 - **Right but hesitant** should be re-asked later in the session, phrased
   differently.
 - **Inconsistent** usually means the item is ambiguous. Suspect your item
@@ -242,9 +267,28 @@ scheduling state, item history. That store does not exist yet, so today this
 data is simply not persisted; say so rather than implying otherwise.
 
 **Durable preferences and goals may become Hermes memory candidates** — a
-confirmed long-term goal, a standing preference about feedback style, an
-accessibility need, a target level. Only when the learner has confirmed a
-track, and only for facts that stay true next month.
+confirmed long-term goal, a standing preference about feedback style, a target
+level. Only when the learner has confirmed a track, and only for facts that
+stay true next month. Being a *candidate* is not permission to write it.
+
+### Consent, before anything is persisted
+
+Profile isolation stops one learner's data reaching another. It is not consent
+to retain the data at all. Both are required.
+
+1. **Confirm the fact is accurate.** Most of what you know about a learner is
+   inferred from how they performed, and inferences are often wrong. Say what
+   you concluded and let them correct it before it becomes durable.
+2. **Ask before persisting anything sensitive**, in plain words, and accept no
+   as the answer. Learning difficulties, disabilities, diagnoses, assessment
+   results, professional weaknesses, and the reasons behind a goal are
+   sensitive. So is anything the learner would not volunteer to a stranger.
+3. **Accessibility needs are session-only by default.** Honour them fully for
+   this session; persist them only if the learner explicitly asks you to
+   remember them. Never record an accessibility need as an inference.
+4. **If consent or isolation is uncertain, do not persist.** Uncertainty
+   resolves to no. There is no cost to asking again next session and a real
+   cost to a wrong permanent record.
 
 Rules:
 

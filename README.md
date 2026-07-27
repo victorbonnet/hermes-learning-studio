@@ -70,8 +70,11 @@ The skill links a catalogue of exercise-format references, which the agent
 opens one at a time rather than loading wholesale:
 
 ```
-skill_view("learning-studio:adaptive-learning", "references/selection-cards.md")
+read_file("${HERMES_SKILL_DIR}/references/selection-cards.md")
 ```
+
+`${HERMES_SKILL_DIR}` is substituted for the skill's real directory before the
+content reaches the agent, so the path is concrete by the time it is read.
 
 ## Architecture
 
@@ -129,12 +132,24 @@ import time and asserts registration still succeeds.
 **One skill, many references.** The skill is a single orchestration workflow —
 discovery, objectives, pedagogy, format selection, verification, activation,
 interpretation, adaptation — with a catalogue of exercise-format references
-beside it. The catalogue is *not* registered as fourteen skills: Hermes'
-progressive disclosure means `skill_view(name)` returns SKILL.md and
-`skill_view(name, "references/selection-cards.md")` returns one reference, so
-the agent pays for only what the current decision needs. Tests assert that
-every reference is linked by a valid relative path, that none is orphaned, and
-that the registered surface stays at exactly one skill.
+beside it. The catalogue is *not* registered as fourteen skills; the agent
+opens one reference at a time, so it pays for only what the current decision
+needs. Tests assert that every reference is linked by a valid relative path,
+that none is orphaned, and that the registered surface stays at exactly one
+skill.
+
+**References are opened with `read_file`, not `skill_view`.** This is a
+correctness constraint, not a preference. Hermes' `skill_view` accepts a
+`file_path` argument, but qualified `plugin:skill` names are dispatched to
+`_serve_plugin_skill()`, which has no such parameter — the argument is dropped
+and SKILL.md is returned again *with `success: true`*. An agent following that
+idiom would silently re-read the same file instead of the reference it asked
+for. So SKILL.md addresses references as
+`read_file("${HERMES_SKILL_DIR}/references/<file>.md")`, the same token Hermes'
+own bundled skills use for sibling files, and warns explicitly against the
+`skill_view` route. `tests/test_hermes_integration.py` verifies both halves
+against a real Hermes checkout, and fails if Hermes ever fixes the plugin path
+so the workaround can be removed.
 
 **The skill tells the truth about its own scope.** `SKILL.md` states plainly
 that this foundation has no tools and no persistence, because a skill that
@@ -179,6 +194,17 @@ uv run ruff format --check .
 uv run ruff check .
 uv run pytest
 ```
+
+Hermes is not on PyPI and is not a dependency, so the tests that exercise the
+host's real skill machinery are opt-in. Point them at a checkout of
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent):
+
+```bash
+HERMES_AGENT_SRC=/path/to/hermes-agent uv run pytest tests/test_hermes_integration.py
+```
+
+They skip when the variable is unset, so CI stays self-contained. Run them
+before changing how the skill loads its references.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 

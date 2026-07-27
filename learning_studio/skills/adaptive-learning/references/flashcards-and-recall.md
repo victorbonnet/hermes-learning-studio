@@ -39,23 +39,35 @@ verdict that decides when the item comes back.
 
 ## Evaluation
 
-Flashcards are **self-graded**, and the grade drives the schedule:
+Flashcards are **self-graded**, and the grade drives two separate mechanisms.
+Keep them distinct — conflating them is why hand-rolled schedules misbehave:
 
-| Verdict | Meaning | Next interval |
+- **Relearning step** — what happens *within* the current session. A failed
+  card re-enters the session queue and comes back after a few intervening
+  cards. It stays in the relearning queue until it is retrieved correctly.
+- **Next review interval** — when the card is next due in a *future* session.
+  This is assigned only after the relearning attempt succeeds; a card still
+  failing has no future interval yet, because there is nothing to space.
+
+| Verdict | Relearning step | Next review interval |
 | --- | --- | --- |
-| Failed | Could not retrieve | Reset — same session |
-| Hard | Retrieved slowly or partially | Shorten |
-| Good | Retrieved correctly | Expand |
-| Easy | Immediate and automatic | Expand sharply |
+| Failed | Re-queue in this session | None yet — assigned once relearned |
+| Hard | None | Shorten relative to the last interval |
+| Good | None | Expand |
+| Easy | None | Expand sharply |
+
+So a card failed and then relearned in the same session does not resume its old
+schedule: it starts again from the shortest interval. "Halve the interval" is
+the rule for a *hard* card that was still retrieved, not for a failed one.
 
 Self-grading is only honest if the learner attempted retrieval *before* the
 reveal. Say this explicitly: showing the answer first destroys the effect that
 makes the technique work.
 
-A rough default: one day, three days, a week, two weeks, a month; halve after a
-failure. Interleave tags rather than blocking by topic — mixing enzyme cards
-with membrane-transport cards teaches discrimination that blocked practice
-never does.
+A rough default for the review interval: one day, three days, a week, two
+weeks, a month. Interleave tags rather than blocking by topic — mixing enzyme
+cards with membrane-transport cards teaches discrimination that blocked
+practice never does.
 
 **Today there is no scheduler.** Nothing persists between sessions. Give the
 learner the schedule as advice and tell them plainly they must keep it
