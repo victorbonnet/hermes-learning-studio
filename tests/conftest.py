@@ -21,6 +21,41 @@ def repo_root() -> Path:
 
 
 @pytest.fixture
+def skill_dir() -> Path:
+    """The bundled skill's directory, derived from the plugin's own helper.
+
+    Going through ``skill_path()`` rather than hardcoding the layout means a
+    move of the skill directory fails registration tests, not these.
+    """
+    from learning_studio.plugin import skill_path
+
+    return skill_path().parent
+
+
+@pytest.fixture
+def skill_md(skill_dir: Path) -> str:
+    """Full text of SKILL.md, frontmatter included."""
+    return (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def references(skill_dir: Path) -> dict[str, str]:
+    """Every bundled reference, keyed by filename stem."""
+    reference_dir = skill_dir / "references"
+    if not reference_dir.is_dir():
+        return {}
+    return {
+        path.stem: path.read_text(encoding="utf-8") for path in sorted(reference_dir.glob("*.md"))
+    }
+
+
+@pytest.fixture
+def corpus(skill_md: str, references: dict[str, str]) -> str:
+    """SKILL.md and every reference concatenated — the full agent-facing text."""
+    return "\n".join([skill_md, *references.values()])
+
+
+@pytest.fixture
 def ctx():
     """A fake Hermes plugin context bound to this plugin's manifest name."""
     from tests.fake_hermes import FakePluginContext
