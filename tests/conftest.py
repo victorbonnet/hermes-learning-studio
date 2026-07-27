@@ -61,3 +61,17 @@ def ctx():
     from tests.fake_hermes import FakePluginContext
 
     return FakePluginContext(plugin_name="learning-studio")
+
+
+@pytest.fixture
+def hermes_home(tmp_path: Path, monkeypatch) -> Path:
+    """An isolated ``HERMES_HOME`` for anything that touches the filesystem.
+
+    Persistence tests must never reach the developer's real profile: it would
+    leak their learning data into the suite and couple tests to each other.
+    Every storage-facing test takes this fixture.
+    """
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home

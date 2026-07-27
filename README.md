@@ -4,12 +4,15 @@ A standalone [Hermes](https://hermes-agent.nousresearch.com) plugin for adaptive
 learning: structured study sessions built on active recall and spaced
 repetition.
 
-> **Status: early development foundation.** This is not the feature-complete
-> public release. What exists today is a single bundled skill — agent guidance
-> and nothing else: **no tools, no storage, no progress persistence, no Mini
-> App, and no network requests.** Study sessions run as ordinary conversation,
-> and nothing carries over between them. See [Roadmap](#roadmap) for what is
-> still to come.
+> **Status: early development.** This is not the feature-complete public
+> release. What exists today is a bundled skill plus two tools that remember a
+> learner's **context** — their goals, level, preferences, and confirmed
+> learning tracks — in profile-scoped SQLite.
+>
+> There is still **no exercise runtime**: no card renderer, no manifest
+> validator, no Mini App, no scoring, no scheduler, and no network requests.
+> Exercises run as ordinary conversation, and attempts, answers, and scores
+> are not persisted. See [Roadmap](#roadmap) for what is still to come.
 
 ## Install
 
@@ -88,6 +91,15 @@ installable **Python package**, which drives the layout:
 ├── learning_studio/            # Implementation package
 │   ├── __init__.py             # Re-exports register(), owns __version__
 │   ├── plugin.py               # register(ctx) — the whole host contract
+│   ├── paths.py                # Profile-safe path resolution
+│   ├── config.py               # Validated `learning_studio` config.yaml section
+│   ├── models.py               # Context fields, provenance, validation
+│   ├── storage.py              # SQLite connections and versioned migrations
+│   ├── context.py              # Precedence resolution
+│   ├── candidates.py           # Memory-candidate rules
+│   ├── service.py              # Reads, writes, ownership, consent gates
+│   ├── schemas.py              # JSON schemas for the two tools
+│   ├── tools.py                # Tool handlers
 │   └── skills/
 │       └── adaptive-learning/
 │           ├── SKILL.md        # The orchestration workflow
@@ -166,25 +178,198 @@ fails if any one domain accounts for more than 40% of the examples in the
 skill corpus or if a format reference illustrates fewer than three unrelated
 subjects.
 
-**No runtime dependencies.** `dependencies` is empty, so installing the plugin
-adds nothing to a user's Hermes environment. PyYAML is a test-only dependency
-in the `dev` extra — the plugin code itself imports only the standard library.
+**Authorisation lives in the storage layer, not the handler.** Every
+learner-owned query carries `profile_id` and `learner_id` in its `WHERE`
+clause, so a handler that forgot an ownership check still could not read
+another learner's track — there is no query that can. Foreign keys enforce
+referential integrity; they do not decide who may read a row. Not-found and
+not-yours return the same message, because distinguishing them would turn a
+track ID into an oracle for whether another learner exists. Adversarial tests
+try exactly that, with valid IDs belonging to someone else.
 
-Reserved for later PRs: the toolset name `plugin_learning_studio`.
+**Learner identities are never stored.** The caller's `learner_key` is
+converted to a salted HMAC digest with a per-database salt; the raw key never
+reaches disk. Someone who obtains the database file learns that *some*
+learners exist, not who they are. All primary keys are opaque generated
+tokens, so nothing keys on a label a learner can change.
+
+**Migrations are all-or-nothing, and never destructive.** Each migration runs
+in its own transaction and rolls back completely on failure, because a
+half-applied schema is harder to recover from than a failed startup. A
+database written by a newer version of the plugin is refused with an
+explanation and left untouched — deleting or "resetting" it would destroy a
+learner's record to make the code happy.
+
+**`register()` opens no database.** It registers a skill and two tools and
+returns. Initialising storage at startup would let a corrupt or
+newer-versioned database take the whole plugin down, instead of failing one
+tool call with a message the agent can act on.
+
+**No runtime dependencies.** `dependencies` is empty, so installing the plugin
+adds nothing to a user's Hermes environment. Persistence uses the standard
+library's `sqlite3`. PyYAML is a test-only dependency in the `dev` extra, and
+a test blocks FastAPI, Pillow, Telegram, HTTP clients, and PyYAML at import
+time then asserts the tools still register *and run*.
 
 ## Configuration
 
-Behavioural settings belong in Hermes' `config.yaml`. Secrets belong in `.env`
-and are never committed. This foundation reads neither.
+Behavioural settings belong in Hermes' `config.yaml`, under a single
+`learning_studio` section. Secrets belong in `.env` — this plugin has none and
+reads none. Every setting below is optional; the defaults shown are what
+applies when the section is absent.
+
+```yaml
+learning_studio:
+  # How long unconfirmed temporary context stays readable, in hours (1–8760).
+  temporary_context_ttl_hours: 72
+
+  # Upper bound on active tracks per learner (1–200).
+  max_tracks_per_learner: 20
+
+  # SQLite lock wait, in milliseconds (100–60000).
+  busy_timeout_ms: 5000
+
+  # wal | delete | truncate. WAL falls back automatically on filesystems
+  # that cannot support it.
+  journal_mode: wal
+
+  # Independent observations before repeated evidence may be proposed as a
+  # memory candidate (2–50).
+  memory_candidate_min_evidence: 3
+
+  # Operator policy, not consent. Accessibility needs are session-only by
+  # default regardless; this only decides whether they *may* be stored
+  # durably when a learner explicitly asks. Set false on a shared or managed
+  # profile to refuse even on request.
+  allow_durable_accessibility_needs: true
+
+  # Longest single context value, in characters (80–20000).
+  max_context_value_chars: 2000
+
+  # Context values that apply to everyone on this profile.
+  profile_context:
+    explanation_language: English
+
+  # Last-resort values used only where nothing else is known. They never
+  # overwrite anything stored or explicit.
+  defaults:
+    session_duration: 20 minutes
+```
+
+`profile_context` and `defaults` accept any of the context fields listed in
+[Learning context](#learning-context).
+
+**The section fails closed.** A malformed value raises rather than falling
+back to a default, and an unknown key is an error rather than being ignored —
+every setting here governs retention, isolation, or consent, and a misspelled
+`allow_durable_accessibility_needs` that silently degraded to "off" would look
+exactly like the setting working.
+
+### Storage
+
+The database lives at:
+
+```
+$HERMES_HOME/workspace/learning-studio/learning-studio.sqlite3
+```
+
+resolved through the host's `get_hermes_home()`, so it follows the active
+profile. Directories are created `0700` and the database `0600` where the
+filesystem supports it. Each Hermes profile gets its own database; nothing is
+shared between them.
+
+## Tools
+
+Two tools, both in the `plugin_learning_studio` toolset. Both are scoped to a
+caller-supplied `learner_key` — an opaque, stable identifier such as a
+platform user ID, never a display name — so several people sharing one Hermes
+profile stay separate.
+
+### `learning_studio_get_context`
+
+Returns the learner's context in three distinct parts, and never guesses:
+
+- `temporary_context` — unconfirmed conversational evidence, which expires.
+- `confirmed_context` — the durable context of a confirmed track.
+- `resolved_context` — one value per field after precedence, each carrying its
+  `provenance`, whether it is `confirmed`, and the `superseded` candidates it
+  beat.
+
+If a learner has several active tracks and the call names none,
+`track_selection.mode` is `ambiguous` and the tracks are listed, so the agent
+asks instead of studying the wrong thing.
+
+### `learning_studio_save_context`
+
+Saves temporary context, evidence, explicit corrections, confirmed tracks,
+objectives, and memory candidates, all in one transaction. The response
+reports exactly what became durable, what stayed temporary, and what was
+refused and why.
+
+**Creating a track requires `track.confirmed: true`.** Absence of the flag
+means no durable track is created — the context is kept as temporary instead.
+Repetition, agent confidence, and prior sessions are not confirmation, and no
+code path treats them as such.
+
+## Learning context
+
+The context fields are deliberately subject-neutral — they describe *how*
+someone is learning, never *what*, and no subject, language, or discipline is
+the default:
+
+`track_name`, `subject`, `goal`, `success_criteria`, `current_level`,
+`target_level`, `prior_knowledge`, `knowledge_gaps`, `interests`,
+`preferred_modalities`, `explanation_language`, `content_language`,
+`session_duration`, `learning_horizon`, `assessment_preferences`,
+`feedback_preferences`, `accessibility_needs`, `source_material`,
+`constraints`.
+
+### Precedence
+
+Values disagree routinely. They resolve in this order, highest first:
+
+```
+current explicit request
+  > explicit correction
+  > active confirmed track
+  > profile configuration
+  > confirmed durable preferences
+  > recent evidence
+  > safe defaults
+  > unconfirmed inference
+```
+
+Two consequences carry most of the weight. **What the learner says now wins** —
+saved context never overrides someone who has just said something different.
+And **defaults never overwrite anything**; they fill gaps. Resolution is
+deterministic, and the losing candidates are returned rather than discarded so
+a caller can explain why a value was chosen.
+
+### Memory candidates are proposals, not writes
+
+The plugin never imports, calls, or writes Hermes memory. It returns validated
+*candidates*; only the agent decides whether any of them becomes a memory. The
+save response says `hermes_memory_updated: false` every time.
+
+A candidate may come only from an explicit durable preference, a confirmed
+long-term goal, an explicit correction, an explicit withdrawal, or evidence
+repeated often enough to be worth asking about. It may never come from one
+error, one slow response, a single inference, momentary frustration, a raw
+score, raw attempts, or session state — and it may never carry raw answers,
+transcripts, session identifiers, tokens, credentials, or an inferred
+disability or diagnosis.
+
+Accessibility needs are **session-only by default**: honoured in full for the
+session, stored durably only when the learner explicitly asks.
 
 ## Roadmap
 
-Deliberately **not** here yet: runtime tools, SQLite persistence, a manifest
-renderer or validator, the FastAPI dashboard and Mini App, Telegram
-authentication, frontend code, Cloudflare tunnels, slash commands, managed
-asset import, and any scheduler. Each lands in a later PR. The skill describes
-how the agent will use those capabilities and instructs it to fall back to
-chat until they exist.
+Deliberately **not** here yet: the exercise runtime and manifest validator,
+card renderers, the FastAPI dashboard and Mini App, Telegram authentication,
+frontend code, Cloudflare tunnels, slash commands, managed asset import,
+image generation, progress dashboards, and any scheduler. Each lands in a
+later PR. The skill describes how the agent will use those capabilities and
+instructs it to fall back to chat until they exist.
 
 ## Development
 

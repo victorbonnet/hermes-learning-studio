@@ -27,9 +27,23 @@ def test_manifest_identity(manifest):
     assert manifest["description"].strip()
 
 
-def test_manifest_declares_no_tools_or_hooks_yet(manifest):
-    """The foundation registers no runtime surface, so it must claim none."""
-    assert manifest.get("provides_tools", []) == []
+def test_manifest_declares_exactly_the_tools_that_are_registered(manifest, ctx):
+    """``provides_tools`` is what users see in ``hermes plugins list``.
+
+    Derived from ``register()`` rather than hardcoded, so adding a tool
+    without declaring it — or declaring one that was never built — fails
+    here instead of misleading whoever is deciding whether to enable the
+    plugin.
+    """
+    from learning_studio import register
+
+    register(ctx)
+
+    assert sorted(manifest.get("provides_tools", [])) == sorted(tool.name for tool in ctx.tools)
+
+
+def test_manifest_declares_no_hooks_yet(manifest):
+    """No lifecycle hooks are registered, so none may be claimed."""
     assert manifest.get("provides_hooks", []) == []
 
 

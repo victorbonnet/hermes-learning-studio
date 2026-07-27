@@ -110,20 +110,21 @@ CALL_SYNTAX_RE = re.compile(r"\b([a-z_][a-z0-9_]{2,})\(")
 
 
 def test_guidance_calls_no_tool_that_does_not_exist(corpus: str, ctx):
-    """Every call-like token in the corpus must name a real host tool.
+    """Every call-like token in the corpus must name a tool that exists.
 
-    ``register()`` registers no tools, so any call the guidance shows must be
-    one the *host* provides. This scans for call syntax generally rather than
-    blocklisting a couple of known-bad prefixes, so inventing a brand-new tool
-    name fails here instead of shipping.
+    A call in the guidance is either one this plugin registers or one the
+    *host* provides; anything else sends the agent after nothing. This scans
+    for call syntax generally rather than blocklisting a couple of known-bad
+    prefixes, so inventing a brand-new tool name fails here instead of
+    shipping.
     """
     from learning_studio import register
 
     register(ctx)
-    assert ctx.tools == [], "this guard assumes this plugin registers no tools"
+    registered = {tool.name for tool in ctx.tools}
 
     called = set(CALL_SYNTAX_RE.findall(corpus))
-    unknown = sorted(called - KNOWN_HOST_TOOLS)
+    unknown = sorted(called - KNOWN_HOST_TOOLS - registered)
     assert unknown == [], (
         f"guidance calls {unknown}, which no registered plugin tool and no known "
         f"host tool provides — the agent would be sent after something that "
@@ -301,7 +302,10 @@ def test_detailed_progress_belongs_to_studio_storage(corpus: str):
     assert_states(
         corpus,
         (
-            r"(detailed )?progress[^.]{0,80}(studio|sqlite)",
+            # "learning state" as well as "progress": attempts and scores are
+            # not stored yet, so the skill names what Studio storage actually
+            # holds rather than overpromising progress tracking.
+            r"(detailed )?(progress|learning state)[^.]{0,80}(studio|sqlite)",
             r"(attempt|score)s?[^.]{0,120}(never|not|do not|don't)[^.]{0,60}"
             r"(hermes memory|global memory)"
             r"|(never|do not|don't)[^.]{0,120}(attempt|score)s?[^.]{0,80}"

@@ -42,13 +42,32 @@ def test_skill_is_addressable_as_namespaced_name(ctx):
     assert ctx.qualified_skill_names == ["learning-studio:adaptive-learning"]
 
 
-def test_register_registers_no_tools_hooks_or_commands(ctx):
-    """The foundation ships no runtime surface — that lands in later PRs."""
+def test_register_registers_exactly_the_two_context_tools(ctx):
+    """Two tools, no more. Later PRs add the exercise runtime, not this one."""
     from learning_studio import register
 
     register(ctx)
 
-    assert ctx.tools == []
+    assert sorted(tool.name for tool in ctx.tools) == [
+        "learning_studio_get_context",
+        "learning_studio_save_context",
+    ]
+
+
+def test_registered_tools_share_the_reserved_toolset(ctx):
+    from learning_studio import register
+
+    register(ctx)
+
+    assert {tool.toolset for tool in ctx.tools} == {"plugin_learning_studio"}
+
+
+def test_register_registers_no_hooks_or_commands(ctx):
+    """Hooks, slash commands, and CLI subcommands belong to later PRs."""
+    from learning_studio import register
+
+    register(ctx)
+
     assert ctx.hooks == []
     assert ctx.commands == []
     assert ctx.cli_commands == []

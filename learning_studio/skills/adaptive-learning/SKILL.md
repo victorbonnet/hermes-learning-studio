@@ -17,9 +17,16 @@ it too narrowly.
 
 ## Runtime status: read this first
 
-The Learning Studio's interactive runtime — the exercise tools, the persistent
-store, the Mini App — **is not part of this release.** No tool is registered.
-There is nothing to call.
+Two tools exist, and they cover **learning context only**:
+
+| Tool | What it does |
+| --- | --- |
+| `learning_studio_get_context` | Retrieve what is known about a learner before you plan |
+| `learning_studio_save_context` | Record what you learned; propose memory candidates |
+
+**The exercise runtime does not exist yet** — no card renderer, no manifest
+validator, no Mini App, no scoring, no scheduler. Exercises are still designed
+and delivered by you, in conversation.
 
 That does not weaken the workflow. Every phase below is executed in
 conversation by default; the runtime, when it exists, replaces the *delivery*
@@ -27,14 +34,42 @@ of exercises, not the thinking that produces them. So:
 
 - **Check before you route.** A runtime step happens only if the corresponding
   tool is actually in your tool list.
-- **If the Studio tools are not yet available, continue the whole session in
+- **If a Studio tool is not available, continue that part of the session in
   chat.** Present the exercise as text, take the answer as a message, evaluate
   it yourself, and carry the state in the conversation.
 - **Never claim that an exercise or a Mini App was launched, opened, or is
   running** unless a tool call returned a result saying so. Do not describe a
   screen the learner cannot see. Do not report a score you did not receive.
-- Say plainly that nothing is stored between sessions, and that a review
-  schedule is advice the learner has to keep themselves.
+- Say plainly that **attempts, answers, and scores are not stored** — only
+  context, tracks, and objectives are — and that a review schedule is advice
+  the learner has to keep themselves.
+
+### Using the context tools
+
+Call `learning_studio_get_context` before you plan a session, passing what the
+learner is asking for right now as `current_request`. What they just said
+always outranks anything stored, and the response tells you which value won
+and why in `resolved_context.<field>.provenance`.
+
+Read the two halves of the response differently. `confirmed_context` is what
+the learner has confirmed; `temporary_context` is unconfirmed evidence from
+conversation that expires. Never present the second as though it were the
+first. If `track_selection.mode` is `ambiguous`, the learner has several
+active tracks — ask which one they mean rather than guessing.
+
+Call `learning_studio_save_context` when you have learned something worth
+keeping. Send session findings as `temporary_context`; send what their answers
+merely *suggest* as `evidence_context`, so the two are never confused.
+
+**Creating an ongoing track needs `track.confirmed: true`, and that flag means
+the learner said yes in so many words.** Not that they came back, not that you
+are confident, not that a curriculum would be useful. Without it the call is
+refused and your context is kept as temporary — which is the correct outcome
+for a one-off request.
+
+The response always reports `hermes_memory_updated: false`. That is not a
+failure: the plugin has no access to Hermes memory and never writes it. Any
+memory candidates it returns are proposals for **you** to weigh.
 
 ## References: load only what you need
 
@@ -262,9 +297,11 @@ the answer *is* the image, the alt text must not give it away.
 
 Two stores, two purposes. Keep them separate.
 
-**Detailed progress belongs in Studio SQLite** — attempts, scores, timings,
-scheduling state, item history. That store does not exist yet, so today this
-data is simply not persisted; say so rather than implying otherwise.
+**Detailed learning state belongs in Studio SQLite**, reached through
+`learning_studio_save_context`: context, confirmed tracks, objectives, and
+their revision history. Attempts, scores, timings, and scheduling state have
+no store yet — that arrives with the exercise runtime — so today they are
+simply not persisted. Say so rather than implying otherwise.
 
 **Durable preferences and goals may become Hermes memory candidates** — a
 confirmed long-term goal, a standing preference about feedback style, a target
@@ -307,8 +344,13 @@ several people — a shared assistant, a family device, a group chat.
 
 Write learner-specific memory only when the profile is dedicated to a single
 learner, or when Hermes memory is verified to be isolated per user. If neither
-holds, keep it in per-user Studio storage instead, and where that is not
-available yet, keep it in the conversation and do not persist it at all.
+holds, keep it in per-user Studio storage instead — `learning_studio_save_context`
+is scoped to the `learner_key` you pass, so several people sharing one profile
+stay separate there even though Hermes memory would not.
+
+Pass a **stable, opaque** `learner_key` — a platform user ID, not a display
+name or username. A mutable label silently splits one learner into two records
+when they rename themselves, or merges two people who picked the same name.
 
 Someone else's learning goals, weaknesses, and assessment results leaking into
 a shared assistant's memory is a privacy failure. When in doubt, do not write.

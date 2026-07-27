@@ -50,13 +50,24 @@ def _load_module(name: str, path: Path, src: Path):
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
 
+    if name in sys.modules:
+        return sys.modules[name]
+
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    # Registered before execution because ``@dataclass`` resolves annotations
+    # via ``sys.modules[cls.__module__]``; an unregistered module makes that
+    # lookup return None and the class definition fails.
+    sys.modules[name] = module
     try:
         spec.loader.exec_module(module)
     except ImportError as exc:
+        del sys.modules[name]
         pytest.skip(f"Hermes checkout is missing its own dependencies: {exc}")
+    except Exception:
+        del sys.modules[name]
+        raise
     return module
 
 
@@ -142,3 +153,139 @@ def test_plugin_dispatch_returns_before_file_path_is_handled():
         "file_path handling now precedes the plugin dispatch — re-evaluate "
         "whether skill_view can open plugin references directly"
     )
+
+
+# ── The runtime APIs this plugin depends on ────────────────────────────────
+
+
+def test_get_hermes_home_exists_and_is_profile_aware(monkeypatch, tmp_path: Path):
+    """``paths.hermes_home()`` delegates to this; a rename would break isolation."""
+    src = _hermes_src()
+    constants = _load_module("_hermes_constants", src / "hermes_constants.py", src)
+
+    assert hasattr(constants, "get_hermes_home"), (
+        "hermes_constants.get_hermes_home is gone — learning_studio.paths must be updated"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-x"))
+    assert Path(constants.get_hermes_home()) == tmp_path / "profile-x"
+
+
+def test_the_plugin_resolves_storage_under_the_real_hermes_home(monkeypatch, tmp_path: Path):
+    """End to end: the host's resolver, through this plugin's path helper."""
+    src = _hermes_src()
+    _load_module("_hermes_constants", src / "hermes_constants.py", src)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-y"))
+    from learning_studio.paths import storage_root
+
+    assert storage_root() == tmp_path / "profile-y" / "workspace" / "learning-studio"
+
+
+def test_register_tool_signature_matches_what_the_plugin_calls():
+    """The parameter order is easy to get wrong and silent when wrong.
+
+    The host's signature is ``(name, toolset, schema, handler, ...)``. Public
+    documentation has shown ``(name, schema, handler, toolset="")``, which
+    would bind a schema dict to ``toolset``. This plugin passes keywords
+    only, so what matters is that every keyword it passes still exists.
+    """
+    src = _hermes_src()
+    plugins_source = (src / "hermes_cli" / "plugins.py").read_text(encoding="utf-8")
+
+    signature = re.search(r"def register_tool\((.*?)\) -> None:", plugins_source, re.S)
+    assert signature, "could not find PluginContext.register_tool in this Hermes checkout"
+
+    params = signature.group(1)
+    for keyword in ("name", "toolset", "schema", "handler", "description"):
+        assert f"{keyword}:" in params, (
+            f"PluginContext.register_tool no longer accepts '{keyword}' — "
+            "learning_studio.plugin.register must be updated"
+        )
+
+
+def test_the_toolset_name_does_not_collide_with_a_builtin_toolset():
+    """A collision would make the registry reject our tools at startup."""
+    src = _hermes_src()
+    registry_source = (src / "tools" / "registry.py").read_text(encoding="utf-8")
+
+    from learning_studio import TOOLSET_NAME
+
+    assert f'toolset="{TOOLSET_NAME}"' not in registry_source
+
+
+def test_the_tool_names_do_not_shadow_a_builtin_tool():
+    """Shadowing a built-in is rejected without an operator opt-in we do not have."""
+    src = _hermes_src()
+    from learning_studio.schemas import TOOL_SCHEMAS
+
+    builtin_names: set[str] = set()
+    for path in (src / "tools").glob("*.py"):
+        builtin_names.update(
+            re.findall(
+                r'registry\.register\(\s*name=["\']([a-z0-9_]+)["\']',
+                path.read_text(encoding="utf-8", errors="ignore"),
+            )
+        )
+
+    collisions = sorted(set(TOOL_SCHEMAS) & builtin_names)
+    assert collisions == [], f"tool names collide with Hermes built-ins: {collisions}"
+
+
+def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypatch, tmp_path: Path):
+    """Register through the host's own PluginContext, then call the tools.
+
+    The fake context mirrors the host, but only the host proves the plugin
+    actually loads. This drives the real ``PluginContext`` and the real tool
+    registry, in an isolated HERMES_HOME.
+    """
+    import json
+
+    src = _hermes_src()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "live-profile"))
+
+    plugins = _load_module("_hermes_plugins", src / "hermes_cli" / "plugins.py", src)
+
+    # Not via _load_module: PluginContext.register_tool does
+    # ``from tools.registry import registry``, so the assertions have to read
+    # that exact module object. Loading a second copy under an alias would
+    # inspect a registry nothing ever wrote to.
+    registry_module = importlib.import_module("tools.registry")
+
+    manifest = plugins.PluginManifest(name="learning-studio", version="0.1.0")
+    manager = plugins.PluginManager()
+    ctx = plugins.PluginContext(manifest, manager)
+
+    from learning_studio import TOOLSET_NAME, register
+
+    register(ctx)
+
+    registry = registry_module.registry
+    registered = {
+        name: entry for name, entry in registry._tools.items() if entry.toolset == TOOLSET_NAME
+    }
+    assert sorted(registered) == [
+        "learning_studio_get_context",
+        "learning_studio_save_context",
+    ]
+
+    saved = json.loads(
+        registry.dispatch(
+            "learning_studio_save_context",
+            {
+                "learner_key": "user-live-1",
+                "track": {"name": "Live track", "confirmed": True, "context": {"goal": "g"}},
+            },
+        )
+    )
+    assert saved["ok"] is True
+    assert saved["outcome"]["track"]["status"] == "created"
+    assert saved["hermes_memory_updated"] is False
+
+    fetched = json.loads(
+        registry.dispatch("learning_studio_get_context", {"learner_key": "user-live-1"})
+    )
+    assert fetched["confirmed_context"]["goal"]["value"] == "g"
+
+    db = tmp_path / "live-profile" / "workspace" / "learning-studio" / "learning-studio.sqlite3"
+    assert db.is_file(), "the real run did not write to the profile-scoped storage root"
