@@ -300,10 +300,109 @@ _MIGRATION_002 = (
 )
 
 
+# Version 3 adds stored learning experiences.
+#
+# The split across two tables is the schema half of the manifest's
+# visible/hidden boundary. ``experience_components`` holds only what a learner
+# may see; every answer key, rubric, scoring rule, hint, per-option feedback,
+# branch and evaluator note lives in ``experience_component_evaluations``. A
+# projection that forgets to exclude a column therefore cannot leak an answer,
+# because the learner-facing table does not contain one — and a future reader
+# that only ever joins the first table is safe by default.
+#
+# ``component_key`` is the author's own label for a component. It is not a
+# primary key and never an authorisation boundary: rows key on generated
+# opaque ids, so nothing a model writes can address a row.
+_MIGRATION_003 = (
+    # Objectives gained composite uniqueness so an experience can reference one
+    # through a composite foreign key. Additive: an index, not a table change.
+    """
+    CREATE UNIQUE INDEX idx_objectives_identity
+        ON objectives (id, profile_id, learner_id)
+    """,
+    """
+    CREATE TABLE experiences (
+        id                        TEXT PRIMARY KEY,
+        learner_id                TEXT NOT NULL,
+        profile_id                TEXT NOT NULL,
+        track_id                  TEXT,
+        objective_id              TEXT,
+        manifest_schema_version   INTEGER NOT NULL,
+        title                     TEXT    NOT NULL,
+        objective_behavior        TEXT    NOT NULL,
+        objective_condition       TEXT    NOT NULL,
+        objective_standard        TEXT    NOT NULL,
+        instructions              TEXT    NOT NULL,
+        ui_locale                 TEXT    NOT NULL,
+        content_locale            TEXT,
+        expected_duration_minutes INTEGER NOT NULL
+                                  CHECK (expected_duration_minutes BETWEEN 1 AND 240),
+        difficulty                TEXT    NOT NULL
+                                  CHECK (difficulty IN (
+                                      'introductory', 'intermediate', 'advanced', 'expert'
+                                  )),
+        accessibility             TEXT    NOT NULL,
+        source_references         TEXT    NOT NULL,
+        delivery                  TEXT    NOT NULL,
+        component_count           INTEGER NOT NULL CHECK (component_count > 0),
+        created_at                TEXT    NOT NULL,
+        updated_at                TEXT    NOT NULL,
+        UNIQUE (id, profile_id, learner_id),
+        FOREIGN KEY (learner_id, profile_id)
+            REFERENCES learners (id, profile_id) ON DELETE CASCADE,
+        FOREIGN KEY (track_id, profile_id, learner_id)
+            REFERENCES tracks (id, profile_id, learner_id) ON DELETE CASCADE,
+        FOREIGN KEY (objective_id, profile_id, learner_id)
+            REFERENCES objectives (id, profile_id, learner_id) ON DELETE SET NULL
+    )
+    """,
+    "CREATE INDEX idx_experiences_owner ON experiences (profile_id, learner_id, created_at)",
+    """
+    CREATE TABLE experience_components (
+        id             TEXT    PRIMARY KEY,
+        experience_id  TEXT    NOT NULL,
+        learner_id     TEXT    NOT NULL,
+        profile_id     TEXT    NOT NULL,
+        position       INTEGER NOT NULL CHECK (position > 0),
+        component_key  TEXT    NOT NULL,
+        component_type TEXT    NOT NULL,
+        learner_payload TEXT   NOT NULL,
+        created_at     TEXT    NOT NULL,
+        UNIQUE (experience_id, position),
+        UNIQUE (experience_id, component_key),
+        UNIQUE (id, profile_id, learner_id),
+        FOREIGN KEY (experience_id, profile_id, learner_id)
+            REFERENCES experiences (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX idx_experience_components_owner
+        ON experience_components (profile_id, learner_id, experience_id, position)
+    """,
+    """
+    CREATE TABLE experience_component_evaluations (
+        component_id  TEXT PRIMARY KEY,
+        experience_id TEXT NOT NULL,
+        learner_id    TEXT NOT NULL,
+        profile_id    TEXT NOT NULL,
+        evaluation    TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        FOREIGN KEY (component_id, profile_id, learner_id)
+            REFERENCES experience_components (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX idx_experience_evaluations_owner
+        ON experience_component_evaluations (profile_id, learner_id, experience_id)
+    """,
+)
+
+
 #: Ordered, contiguous from 1. The list order is the application order.
 MIGRATIONS: list[Migration] = [
     Migration(version=1, statements=_MIGRATION_001),
     Migration(version=2, statements=_MIGRATION_002),
+    Migration(version=3, statements=_MIGRATION_003),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

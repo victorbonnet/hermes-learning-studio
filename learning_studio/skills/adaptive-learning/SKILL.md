@@ -17,16 +17,18 @@ it too narrowly.
 
 ## Runtime status: read this first
 
-Two tools exist, and they cover **learning context only**:
+Three tools exist:
 
 | Tool | What it does |
 | --- | --- |
 | `learning_studio_get_context` | Retrieve what is known about a learner before you plan |
 | `learning_studio_save_context` | Record what you learned; propose memory candidates |
+| `learning_studio_prepare` | Validate and store an exercise you have designed |
 
-**The exercise runtime does not exist yet** — no card renderer, no manifest
-validator, no Mini App, no scoring, no scheduler. Exercises are still designed
-and delivered by you, in conversation.
+**There is still no delivery runtime** — no card renderer, no Mini App, no
+scoring engine, no scheduler. `learning_studio_prepare` *stores* a validated
+exercise; it does not run one, and calling it opens nothing on the learner's
+screen. Exercises are still delivered by you, in conversation.
 
 That does not weaken the workflow. Every phase below is executed in
 conversation by default; the runtime, when it exists, replaces the *delivery*
@@ -40,9 +42,41 @@ of exercises, not the thinking that produces them. So:
 - **Never claim that an exercise or a Mini App was launched, opened, or is
   running** unless a tool call returned a result saying so. Do not describe a
   screen the learner cannot see. Do not report a score you did not receive.
-- Say plainly that **attempts, answers, and scores are not stored** — only
-  context, tracks, and objectives are — and that a review schedule is advice
-  the learner has to keep themselves.
+- Say plainly that **attempts and scores are not stored** — only context,
+  tracks, objectives, and the exercises you prepare are — and that a review
+  schedule is advice the learner has to keep themselves.
+
+### Preparing an exercise
+
+Once you have designed an exercise, call `learning_studio_prepare` with it.
+Do this as a matter of course when someone asks to practise, revise, be
+quizzed, or drill anything: it validates the whole thing before storing it, so
+a mistake in your answer key comes back as an error instead of reaching the
+learner. Then **deliver it in conversation as usual**, and say that is what you
+are doing.
+
+What the tool gives you back is a summary and an opaque `experience_id`.
+Deliberately absent: answer keys, rubrics, scoring rules, hints, per-option
+feedback, and branch targets. Those are stored where the learner cannot read
+them, and are not returned to you either — so keep your own copy in the
+conversation if you are going to mark the answers yourself.
+
+Three rules when you build the manifest:
+
+- **Everything is inert text.** Markup is refused everywhere, including in
+  code fields: a prompt containing `<div>` or `<script>` is rejected, and so
+  is a URL, a filesystem path, or anything shaped like a credential. Write a
+  comparison as `a < b`, with spaces. Code is fine as *subject matter* as long
+  as it carries no tags — teaching HTML or CSS through a stored manifest is not
+  possible in this release, so run those sessions in chat.
+- **Say where accessibility metadata came from.** `accessibility.source` must
+  be `explicit_request`, `confirmed_track`, or `profile_config`. There is no
+  value for "I inferred it", because you must not. Putting an accessibility
+  need on an exercise does **not** store a fact about the learner and does not
+  create a memory candidate; the consent rules under *Memory* are unchanged.
+- **Attach a `track_id` only for sustained work.** A one-off exercise takes no
+  track. Naming one you were not given, or one belonging to anybody else, is
+  refused.
 
 ### Using the context tools
 
@@ -245,8 +279,11 @@ Wrong practice material teaches the wrong thing and is worse than no exercise:
 ### 6. Activate
 
 **An explicit learner request may launch immediately.** If they asked for
-practice, and the tools exist, launch the exercise without asking for further
-confirmation — a confirmation step there is friction, not consent.
+practice, and the tools exist, prepare and start the exercise without asking
+for further confirmation — a confirmation step there is friction, not consent.
+The learner never has to name a tool, a skill, or a command; working out that
+"can we revise photosynthesis?" means preparing an exercise is your job, not
+theirs.
 
 **Practice you propose yourself needs a yes.** When you suggest an exercise the
 learner did not ask for, describe it in one line and wait for them to confirm
@@ -308,10 +345,11 @@ the answer *is* the image, the alt text must not give it away.
 Two stores, two purposes. Keep them separate.
 
 **Detailed learning state belongs in Studio SQLite**, reached through
-`learning_studio_save_context`: context, confirmed tracks, objectives, and
-their revision history. Attempts, scores, timings, and scheduling state have
-no store yet — that arrives with the exercise runtime — so today they are
-simply not persisted. Say so rather than implying otherwise.
+`learning_studio_save_context` and `learning_studio_prepare`: context,
+confirmed tracks, objectives, their revision history, and prepared exercises.
+Attempts, scores, timings, and scheduling state have no store yet — that
+arrives with the exercise runtime — so today they are simply not persisted.
+Say so rather than implying otherwise.
 
 **Durable preferences and goals may become Hermes memory candidates** — a
 confirmed long-term goal, a standing preference about feedback style, a target

@@ -28,7 +28,7 @@ from . import service
 from .config import ConfigError
 from .identity import IdentityError, resolve_principal
 from .paths import PathResolutionError
-from .schemas import GET_TOOL_NAME, SAVE_TOOL_NAME, TOOL_SCHEMAS
+from .schemas import GET_TOOL_NAME, PREPARE_TOOL_NAME, SAVE_TOOL_NAME, TOOL_SCHEMAS
 from .validation import SchemaViolation, validate
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,28 @@ def handle_save_context(params: Any = None, **_kwargs: Any) -> str:
     return _run(SAVE_TOOL_NAME, params, call)
 
 
+def handle_prepare(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_prepare``.
+
+    Note what is *not* passed through: nothing names a learner, and the
+    experience id is generated during storage rather than accepted from the
+    caller. The response is built by the service from the manifest's visible
+    half, so no answer key can travel back up this path.
+    """
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        return service.prepare_experience(
+            principal=principal,
+            manifest=args.get("manifest"),
+            track_id=args.get("track_id"),
+            objective_id=args.get("objective_id"),
+        )
+
+    return _run(PREPARE_TOOL_NAME, params, call)
+
+
 HANDLERS = {
     GET_TOOL_NAME: handle_get_context,
     SAVE_TOOL_NAME: handle_save_context,
+    PREPARE_TOOL_NAME: handle_prepare,
 }

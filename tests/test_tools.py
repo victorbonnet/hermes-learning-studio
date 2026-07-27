@@ -24,12 +24,12 @@ def _call(handler, **params) -> dict:
 # ── Registration ──────────────────────────────────────────────────────────
 
 
-def test_exactly_two_tools_are_registered(ctx):
+def test_exactly_three_tools_are_registered(ctx):
     from learning_studio import register
 
     register(ctx)
 
-    assert len(ctx.tools) == 2
+    assert len(ctx.tools) == 3
 
 
 def test_the_tool_names_are_the_agreed_ones(ctx):
@@ -39,6 +39,7 @@ def test_the_tool_names_are_the_agreed_ones(ctx):
 
     assert sorted(tool.name for tool in ctx.tools) == [
         "learning_studio_get_context",
+        "learning_studio_prepare",
         "learning_studio_save_context",
     ]
 
@@ -65,12 +66,18 @@ def test_every_handler_is_callable_and_returns_json(ctx, hermes_home, gateway_se
 def test_handlers_tolerate_the_kwargs_hermes_passes(ctx, hermes_home, gateway_session):
     """The host calls ``handler(args, **kwargs)`` with context it may extend."""
     from learning_studio import register
+    from tests.component_examples import manifest
 
     register(ctx)
 
+    #: Arguments each tool needs to reach a successful result. The context
+    #: tools take none; preparing an exercise needs the exercise.
+    required = {"learning_studio_prepare": {"manifest": manifest()}}
+
     for tool in ctx.tools:
-        result = tool.handler({}, session_id="abc", task_id="def", agent=object())
-        assert json.loads(result)["ok"] is True
+        args = required.get(tool.name, {})
+        result = tool.handler(args, session_id="abc", task_id="def", agent=object())
+        assert json.loads(result)["ok"] is True, result
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────
@@ -145,8 +152,9 @@ def test_every_string_and_array_is_bounded(name: str):
 
 
 #: Parameter names that would mean the tool accepts a path, code, or SQL.
-#: Matched against property *names* only — "description" legitimately
-#: contains "script", and prose about not accepting SQL is a feature.
+#: Matched against the *words* of a property name rather than as substrings:
+#: "long_description" contains "script" and is not a script, and prose about
+#: not accepting SQL is a feature.
 FORBIDDEN_PARAM_WORDS = (
     "path",
     "file",
@@ -164,6 +172,18 @@ FORBIDDEN_PARAM_WORDS = (
 )
 
 
+#: Fields that carry code as *subject matter* — inert text a learner reads,
+#: writes, or is compared against. They are named here explicitly, with the
+#: reason, so that adding a genuinely executable parameter still fails: the
+#: exemption is per-field, not per-word. Nothing in this plugin compiles,
+#: imports, or runs any of it; see tests/test_experience_security.py.
+INERT_CODE_FIELDS = frozenset({"starter_code"})
+
+
+def _property_words(name: str) -> set[str]:
+    return set(name.lower().replace("-", "_").split("_"))
+
+
 @pytest.mark.parametrize("name", sorted(TOOL_SCHEMAS))
 def test_no_parameter_accepts_a_path_code_or_sql(name: str):
     """There must be no parameter through which a caller could reach outside."""
@@ -172,9 +192,11 @@ def test_no_parameter_accepts_a_path_code_or_sql(name: str):
     def walk(node, path: str) -> None:
         if isinstance(node, dict):
             for prop in node.get("properties", {}):
-                lowered = prop.lower()
+                if prop in INERT_CODE_FIELDS:
+                    continue
+                words = _property_words(prop)
                 for word in FORBIDDEN_PARAM_WORDS:
-                    if word in lowered:
+                    if word in words:
                         offenders.append(f"{path}.{prop} (matches '{word}')")
             for key, value in node.items():
                 walk(value, f"{path}.{key}")
@@ -188,13 +210,14 @@ def test_no_parameter_accepts_a_path_code_or_sql(name: str):
 
 def test_the_parameter_name_guard_would_catch_a_real_offender():
     """Proves the check above discriminates rather than passing vacuously."""
-    offenders = [
+    candidates = {"source_file_path", "learner_key", "long_description", "shell_command"}
+    offenders = sorted(
         prop
-        for prop in {"source_file_path": {}, "learner_key": {}}
-        if any(word in prop.lower() for word in FORBIDDEN_PARAM_WORDS)
-    ]
+        for prop in candidates
+        if prop not in INERT_CODE_FIELDS and _property_words(prop) & set(FORBIDDEN_PARAM_WORDS)
+    )
 
-    assert offenders == ["source_file_path"]
+    assert offenders == ["shell_command", "source_file_path"]
 
 
 @pytest.mark.parametrize("name", sorted(TOOL_SCHEMAS))

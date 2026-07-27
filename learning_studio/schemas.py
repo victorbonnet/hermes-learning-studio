@@ -30,6 +30,7 @@ from .models import (
 
 GET_TOOL_NAME = "learning_studio_get_context"
 SAVE_TOOL_NAME = "learning_studio_save_context"
+PREPARE_TOOL_NAME = "learning_studio_prepare"
 
 _MAX_ITEMS = 25
 
@@ -353,7 +354,68 @@ SAVE_CONTEXT_SCHEMA: dict[str, Any] = {
     },
 }
 
+
+def _prepare_parameters() -> dict[str, Any]:
+    """Build the prepare schema from the component registry itself.
+
+    Generated rather than written out, so the schema the model is shown and
+    the rules the handler enforces are the same declarations. A component type
+    added to the registry appears here automatically; one described here that
+    the registry does not implement cannot exist.
+    """
+    from .components import components_schema, shared_definitions
+    from .manifest import manifest_schema
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["manifest"],
+        # Shapes every component type shares, stated once. The union of 31
+        # fully inlined types is over 140 KB of schema on every request; these
+        # references are the same declarations, written down a single time.
+        "$defs": shared_definitions(),
+        "properties": {
+            "track_id": {
+                **_TRACK_ID,
+                "description": (
+                    "Attach this experience to a confirmed learning track. Omit it for a "
+                    "one-off exercise; a track is never created here."
+                ),
+            },
+            "objective_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "description": (
+                    "An existing objective on that track that this experience assesses. "
+                    "Requires track_id."
+                ),
+            },
+            "manifest": manifest_schema(components_schema()),
+        },
+    }
+
+
+PREPARE_SCHEMA: dict[str, Any] = {
+    "name": PREPARE_TOOL_NAME,
+    "description": (
+        "Prepare a bespoke exercise for the person you are talking to and store it as "
+        "validated data. Use it whenever someone asks to practise, revise, be quizzed, "
+        "drill, or test themselves on anything at all - any subject, any level. You "
+        "design the exercise: choose the components, write the prompts, and supply the "
+        "answer key. The answer key, rubrics, scoring rules, hints and feedback are kept "
+        "server-side and are never returned to you, so nothing you get back can give the "
+        "answers away. Returns an opaque experience id and a learner-safe summary. This "
+        "tool stores an exercise; it does not run one, render one, or open anything - "
+        "deliver it in conversation and say so. The learner is identified from the Hermes "
+        "session, never from an argument."
+    ),
+    "parameters": _prepare_parameters(),
+}
+
+
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     GET_TOOL_NAME: GET_CONTEXT_SCHEMA,
     SAVE_TOOL_NAME: SAVE_CONTEXT_SCHEMA,
+    PREPARE_TOOL_NAME: PREPARE_SCHEMA,
 }

@@ -5,14 +5,16 @@ learning: structured study sessions built on active recall and spaced
 repetition.
 
 > **Status: early development.** This is not the feature-complete public
-> release. What exists today is a bundled skill plus two tools that remember a
-> learner's **context** — their goals, level, preferences, and confirmed
-> learning tracks — in profile-scoped SQLite.
+> release. What exists today is a bundled skill plus three tools: two that
+> remember a learner's **context** — their goals, level, preferences, and
+> confirmed learning tracks — and one that validates and stores the
+> **exercises** an agent designs, all in profile-scoped SQLite.
 >
-> There is still **no exercise runtime**: no card renderer, no manifest
-> validator, no Mini App, no scoring, no scheduler, and no network requests.
-> Exercises run as ordinary conversation, and attempts, answers, and scores
-> are not persisted. See [Roadmap](#roadmap) for what is still to come.
+> There is still **no delivery runtime**: no card renderer, no Mini App, no
+> scoring engine, no scheduler, and no network requests. A prepared exercise is
+> stored data, not a running session; exercises are delivered as ordinary
+> conversation, and attempts and scores are not persisted. See
+> [Roadmap](#roadmap) for what is still to come.
 
 ## Install
 
@@ -97,8 +99,11 @@ installable **Python package**, which drives the layout:
 │   ├── storage.py              # SQLite connections and versioned migrations
 │   ├── context.py              # Precedence resolution
 │   ├── candidates.py           # Memory-candidate rules
+│   ├── safety.py               # Content rules — inert text or nothing
+│   ├── components.py           # The trusted component registry (31 types)
+│   ├── manifest.py             # The experience envelope and its validation
 │   ├── service.py              # Reads, writes, ownership, consent gates
-│   ├── schemas.py              # JSON schemas for the two tools
+│   ├── schemas.py              # JSON schemas for the three tools
 │   ├── tools.py                # Tool handlers
 │   └── skills/
 │       └── adaptive-learning/
@@ -209,7 +214,7 @@ database written by a newer version of the plugin is refused with an
 explanation and left untouched — deleting or "resetting" it would destroy a
 learner's record to make the code happy.
 
-**`register()` opens no database.** It registers a skill and two tools and
+**`register()` opens no database.** It registers a skill and three tools and
 returns. Initialising storage at startup would let a corrupt or
 newer-versioned database take the whole plugin down, instead of failing one
 tool call with a message the agent can act on.
@@ -289,9 +294,9 @@ shared between them.
 
 ## Tools
 
-Two tools, both in the `plugin_learning_studio` toolset. Neither takes a
-learner argument: identity is resolved from the Hermes session, so a call
-always reads and writes the context of whoever sent the current message.
+Three tools, all in the `plugin_learning_studio` toolset. None takes a learner
+argument: identity is resolved from the Hermes session, so a call always reads
+and writes the record of whoever sent the current message.
 
 ### `learning_studio_get_context`
 
@@ -320,6 +325,87 @@ Repetition, agent confidence, and prior sessions are not confirmation, and no
 code path treats them as such.
 
 `outcome.not_stored` lists anything deliberately dropped, with a reason.
+
+### `learning_studio_prepare`
+
+Validates a complete **experience manifest** — an ordered set of exercise
+components with their answer keys — and stores it transactionally. Returns an
+opaque `experience_id` and a learner-safe summary.
+
+The manifest is the UI contract. It is data, never renderer code: no tool here
+generates HTML, and every string is checked to be inert text. See
+[Exercise manifests](#exercise-manifests).
+
+## Exercise manifests
+
+An agent designs an exercise; this plugin decides whether it is storable. The
+contract has three parts.
+
+**A discriminated component registry.** Thirty-one component types across nine
+families — selection, text input, ordering and matching, recall, visual,
+timeline and process, structured, scenarios, and reflection. A component's
+`type` selects exactly one specification; an unknown type is refused, and so is
+any field that specification does not declare, at every level of nesting. The
+registry is subject-neutral by design: `fill_blank` serves a chemistry equation
+and a Spanish conjugation equally, and nothing privileges one discipline.
+
+`code_response` collects and compares code **as text**. Nothing in this plugin
+compiles, imports, or runs it, and a test parses every source file to prove
+there is no `eval`, `exec`, `compile`, or `subprocess` anywhere that could.
+
+**Visible and hidden are different places, not different names.** Each
+component splits in two:
+
+| Half | Fields | Where it goes |
+| --- | --- | --- |
+| Learner-visible | `id`, `type`, `prompt`, `content`, `accessibility` | `experience_components` |
+| Evaluator-only | `answer`, `evaluation` (rubric, scoring, hints, feedback, branching, notes) | `experience_component_evaluations` |
+
+The learner payload is **constructed from an allowlist**, not filtered. A field
+that is not named in `LEARNER_VISIBLE_KEYS` cannot reach a learner, whatever a
+future caller does, and nothing has to remember to delete anything. The split
+runs all the way into the schema: the learner-facing table contains no answer
+column, so a projection that forgets to exclude one still cannot leak a key.
+The tool's own response is built from the visible half, so no answer travels
+back through the model either. Tests put a distinctive canary in every hidden
+field and assert recursively that none appears in the payload, the projection,
+or the tool response.
+
+**Inert text or nothing.** Every string — learner-visible and evaluator-only
+alike — is refused if it contains markup, event-handler attributes, `javascript:`
+or `data:` URLs, HTML entities, stylesheet syntax, any URL, a filesystem path,
+`../` traversal, credential-shaped values, or invisible and bidirectional
+characters. Hidden fields are held to the same rule because hidden today is not
+hidden forever, and a store that already holds markup has to be sanitised on
+the way out forever.
+
+*A known limitation:* this makes it impossible to ship HTML, CSS, or JavaScript
+**as subject matter** through a stored manifest — a lesson on the box model
+cannot put `<div>` in a prompt. That is a deliberate trade while there is no
+renderer, and those subjects are still teachable in conversation. Lifting it
+needs a reviewed, explicitly escaped inert-code channel and the renderer that
+would have to honour it.
+
+**One source of truth for the schema.** The JSON Schema the model sees and the
+validation the handler runs are generated from the same field declarations, so
+they cannot drift. The union of all 31 types is large — about 49 KB, of which
+the shapes every type shares are emitted once under `$defs` rather than 31
+times, cutting it from over 140 KB. That is the price of a schema that refuses
+exactly what the runtime refuses; a future PR could trade it for a per-type
+lookup tool if the prompt cost proves too high in practice.
+
+**Accessibility metadata describes the exercise, never the learner.**
+`accessibility.source` must be `explicit_request`, `confirmed_track`, or
+`profile_config` — the same three provenances the context layer treats as
+authoritative. There is no value meaning "inferred", so an exercise cannot
+encode a guess about somebody's needs. Preparing an exercise writes no context,
+creates no track, and proposes no memory candidate; exercise metadata never
+becomes a durable fact about a person.
+
+**Source references are described, not linked.** Title, author, publication
+date, citation label, an approved source identifier, and a note. No URLs, no
+paths, no credentials — this PR fetches nothing, so nothing may look
+fetchable.
 
 ## Identity
 
@@ -447,12 +533,17 @@ authorises storing a diagnosis.
 
 ## Roadmap
 
-Deliberately **not** here yet: the exercise runtime and manifest validator,
-card renderers, the FastAPI dashboard and Mini App, Telegram authentication,
-frontend code, Cloudflare tunnels, slash commands, managed asset import,
-image generation, progress dashboards, and any scheduler. Each lands in a
-later PR. The skill describes how the agent will use those capabilities and
-instructs it to fall back to chat until they exist.
+Deliberately **not** here yet: the exercise delivery runtime, card renderers,
+attempt and score storage, the FastAPI dashboard and Mini App, Telegram
+authentication, frontend code, Cloudflare tunnels, slash commands, managed
+asset import, image generation, progress dashboards, and any scheduler. Each
+lands in a later PR. The skill describes how the agent will use those
+capabilities and instructs it to fall back to chat until they exist.
+
+Manifests are validated and stored, but nothing reads them back to a learner
+yet: `learning_studio_prepare` is the data contract a renderer will later
+consume, written down now so that the wire format is settled before there is
+data in it.
 
 ## Development
 

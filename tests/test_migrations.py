@@ -50,18 +50,28 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def _build_v1_database() -> None:
-    """Create a database at schema version 1, as ``08e0719`` left it.
+def _build_database_at(version: int) -> None:
+    """Create a database at an older schema version, via the real migrations.
 
     Restores ``MIGRATIONS`` by hand rather than through monkeypatch, whose
     ``undo()`` would also revert the ``HERMES_HOME`` the storage fixture set.
     """
     saved = storage.MIGRATIONS
-    storage.MIGRATIONS = [m for m in saved if m.version == 1]
+    storage.MIGRATIONS = [m for m in saved if m.version <= version]
     try:
         storage.initialize()
     finally:
         storage.MIGRATIONS = saved
+
+
+def _build_v1_database() -> None:
+    """Create a database at schema version 1, as ``08e0719`` left it."""
+    _build_database_at(1)
+
+
+def _build_v2_database() -> None:
+    """Create a database at schema version 2 — the state PR 03 shipped."""
+    _build_database_at(2)
 
 
 def _seed_v1_rows(conn: sqlite3.Connection) -> None:
@@ -160,7 +170,7 @@ def test_migrations_are_contiguous_and_the_version_is_the_last_one():
     versions = [m.version for m in storage.MIGRATIONS]
 
     assert versions == list(range(1, len(versions) + 1))
-    assert storage.SCHEMA_VERSION == versions[-1] == 2
+    assert storage.SCHEMA_VERSION == versions[-1] == 3
 
 
 def test_migration_two_adds_the_column():
@@ -183,13 +193,14 @@ def test_a_v1_database_reports_version_1_without_the_column(hermes_home: Path):
         assert "consented_need" not in _columns(conn, "memory_candidates")
 
 
-def test_initialize_upgrades_a_v1_database_to_v2(hermes_home: Path):
+def test_initialize_upgrades_a_v1_database_to_the_current_version(hermes_home: Path):
+    """Migrations are cumulative: a v1 database runs 2 and 3 in one go."""
     _build_v1_database()
 
     storage.initialize()
 
     with storage.connect() as conn:
-        assert storage.read_schema_version(conn) == 2
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
         assert "consented_need" in _columns(conn, "memory_candidates")
 
 
@@ -201,7 +212,7 @@ def test_the_upgrade_is_idempotent(hermes_home: Path):
     storage.initialize()
 
     with storage.connect() as conn:
-        assert storage.read_schema_version(conn) == 2
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
         assert conn.execute("SELECT COUNT(*) AS n FROM schema_version").fetchone()["n"] == 1
 
 
@@ -336,11 +347,11 @@ def test_mismatched_consent_is_still_rejected_after_the_upgrade(hermes_home: Pat
 # ── A fresh database ──────────────────────────────────────────────────────
 
 
-def test_a_fresh_database_applies_both_migrations(hermes_home: Path):
+def test_a_fresh_database_applies_every_migration(hermes_home: Path):
     storage.initialize()
 
     with storage.connect() as conn:
-        assert storage.read_schema_version(conn) == 2
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
         assert "consented_need" in _columns(conn, "memory_candidates")
 
         objects = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
@@ -354,6 +365,9 @@ def test_a_fresh_database_applies_both_migrations(hermes_home: Path):
             "context_revisions",
             "objectives",
             "memory_candidates",
+            "experiences",
+            "experience_components",
+            "experience_component_evaluations",
         ):
             assert table in objects, f"{table} missing from a fresh database"
         for index in (
@@ -365,6 +379,10 @@ def test_a_fresh_database_applies_both_migrations(hermes_home: Path):
             "idx_revisions_owner",
             "idx_objectives_owner",
             "idx_candidates_owner",
+            "idx_objectives_identity",
+            "idx_experiences_owner",
+            "idx_experience_components_owner",
+            "idx_experience_evaluations_owner",
         ):
             assert index in objects, f"{index} missing from a fresh database"
 
@@ -462,5 +480,140 @@ def test_two_callers_upgrading_the_same_v1_database_both_succeed(hermes_home: Pa
 
     assert errors == [], f"concurrent upgrade failed: {errors}"
     with storage.connect() as conn:
-        assert storage.read_schema_version(conn) == 2
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
         assert "consented_need" in _columns(conn, "memory_candidates")
+
+
+# ── The exact v2 → v3 upgrade ─────────────────────────────────────────────
+
+
+def test_a_v2_database_reports_version_2_without_the_experience_tables(hermes_home: Path):
+    """The starting state PR 03 shipped, verified rather than assumed."""
+    _build_v2_database()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 2
+        objects = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert "experiences" not in objects
+
+
+def test_initialize_upgrades_a_v2_database_to_v3(hermes_home: Path):
+    _build_v2_database()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 3
+        objects = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert {"experiences", "experience_components", "experience_component_evaluations"} <= (
+            objects
+        )
+
+
+def test_the_v2_upgrade_preserves_existing_learning_data(hermes_home: Path):
+    _build_v1_database()
+    with storage.connect() as conn:
+        _seed_v1_rows(conn)
+    _build_v2_database()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        for table in ("learners", "tracks", "learning_contexts", "context_values", "objectives"):
+            count = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+            assert count == 1, f"{table} lost rows during the v2 to v3 upgrade"
+
+
+def test_a_v2_database_can_store_an_experience_after_upgrading(hermes_home: Path):
+    """The upgrade is judged by whether the new feature actually works."""
+    from tests.component_examples import manifest
+
+    _build_v2_database()
+
+    result = service.prepare_experience(principal=LEARNER, manifest=manifest())
+
+    assert result["ok"] is True
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM experiences").fetchone()["n"] == 1
+
+
+def test_migration_three_is_additive_only(hermes_home: Path):
+    """Every statement creates something; none rewrites what is already there.
+
+    Asserted on each statement's leading keyword rather than by searching the
+    text: ``ON DELETE CASCADE`` is a foreign-key clause, not a deletion, and a
+    substring search would flag it while missing a ``DROP`` written on the
+    second line of a statement.
+    """
+    third = next(m for m in storage.MIGRATIONS if m.version == 3)
+
+    verbs = {statement.strip().split()[0].upper() for statement in third.statements}
+    assert verbs == {"CREATE"}, f"migration 3 does more than create: {sorted(verbs)}"
+
+
+def test_earlier_migrations_are_unchanged_by_the_new_one(hermes_home: Path):
+    """An applied migration is immutable; version 3 must not have edited them."""
+    first = next(m for m in storage.MIGRATIONS if m.version == 1)
+    second = next(m for m in storage.MIGRATIONS if m.version == 2)
+
+    assert "experiences" not in " ".join(first.statements)
+    assert "experiences" not in " ".join(second.statements)
+
+
+def test_a_failing_migration_three_rolls_back_completely(hermes_home: Path, monkeypatch):
+    """Drives the production path with a real Migration whose SQL fails."""
+    _build_v2_database()
+    with storage.connect() as conn:
+        conn.execute(
+            "INSERT INTO learners"
+            " (id, profile_id, principal_digest, platform, created_at, updated_at)"
+            " VALUES ('L9', 'default', 'digest-9', 'telegram', 'now', 'now')"
+        )
+        conn.commit()
+
+    real = list(storage.MIGRATIONS)
+    monkeypatch.setattr(
+        storage,
+        "MIGRATIONS",
+        [
+            *real[:2],
+            storage.Migration(
+                version=3,
+                statements=(*real[2].statements, "THIS IS NOT VALID SQL"),
+            ),
+        ],
+    )
+
+    with pytest.raises(storage.MigrationError):
+        storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 2, "the version advanced despite failure"
+        objects = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert "experiences" not in objects, "a table survived a rolled-back migration"
+        assert conn.execute("SELECT COUNT(*) AS n FROM learners").fetchone()["n"] == 1
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_two_callers_upgrading_a_v2_database_both_succeed(hermes_home: Path):
+    _build_v2_database()
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def upgrade() -> None:
+        try:
+            barrier.wait(timeout=5)
+            storage.initialize()
+        except BaseException as exc:  # noqa: BLE001 - recorded and asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=upgrade) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == [], f"concurrent upgrade failed: {errors}"
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 3

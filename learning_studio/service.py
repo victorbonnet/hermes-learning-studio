@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
 import sqlite3
 import uuid
@@ -56,6 +57,8 @@ from .models import (
 NOT_FOUND_MESSAGE = "No such track for this learner."
 
 NOT_FOUND_OBJECTIVE_MESSAGE = "No such objective on that track for this learner."
+
+NOT_FOUND_EXPERIENCE_MESSAGE = "No such prepared exercise for this learner."
 
 #: Track states that accept no new context, objectives, or corrections. A
 #: learner who archived or withdrew a track has said they are done with it;
@@ -1485,6 +1488,297 @@ def _safe_echo(value: Any) -> str:
     """Echo a rejected statement back, truncated, so the agent can identify it."""
     text = str(value or "")
     return text[:80] + ("…" if len(text) > 80 else "")
+
+
+# ── Experiences ───────────────────────────────────────────────────────────
+
+#: Objectives a learner has finished with. Preparing new practice against one
+#: would quietly reopen something they closed.
+CLOSED_OBJECTIVE_STATUSES = (ObjectiveStatus.MET, ObjectiveStatus.RETIRED)
+
+
+def prepare_experience(
+    *,
+    principal: Principal,
+    manifest: Any,
+    track_id: str | None = None,
+    objective_id: str | None = None,
+    config: LearningStudioConfig | None = None,
+) -> dict[str, Any]:
+    """Validate a learning experience and store it, or store nothing at all.
+
+    The order is the point. The manifest is validated *before* the database is
+    opened, so a malformed exercise never creates a row, never creates a
+    learner, and never touches the filesystem. Ownership is then resolved from
+    the trusted principal — never from the manifest, which has no field for it
+    — and the whole write happens in one transaction.
+
+    Nothing here writes context, objectives, or memory candidates. Preparing an
+    exercise is not evidence about the learner, and an exercise that carries
+    accessibility metadata must not thereby become a durable fact about them.
+    """
+    from .manifest import ManifestError, build_manifest
+
+    config = config or load_config()
+
+    try:
+        validated = build_manifest(manifest)
+    except ManifestError as exc:
+        raise ValidationError(str(exc)) from exc
+
+    profile = principal.profile
+    storage.initialize(config)
+    with storage.connect(config) as conn, storage.transaction(conn):
+        learner_id = _get_or_create_learner(conn, principal)
+
+        resolved_track = _resolve_experience_track(conn, profile, learner_id, track_id)
+        resolved_objective = _resolve_experience_objective(
+            conn, profile, learner_id, resolved_track, objective_id
+        )
+
+        experience_id = _insert_experience(
+            conn,
+            profile=profile,
+            learner_id=learner_id,
+            track_id=resolved_track,
+            objective_id=resolved_objective,
+            manifest=validated,
+        )
+
+    return {
+        "ok": True,
+        "learner": principal.describe(),
+        "experience_id": experience_id,
+        "track_id": resolved_track,
+        "objective_id": resolved_objective,
+        "stored": True,
+        "experience": validated.learner_summary(),
+        # Said on every response because the agent's next move depends on it:
+        # something was *stored*, and nothing was started.
+        "delivery": (
+            "Stored only. No exercise has been launched, rendered, or opened, and there is "
+            "no runtime yet. Present it in conversation and say that is what you are doing."
+        ),
+        "answers_withheld": (
+            "Answer keys, rubrics, scoring rules, hints and feedback are stored server-side "
+            "and are deliberately absent from this response."
+        ),
+        "hermes_memory_updated": False,
+    }
+
+
+def _resolve_experience_track(
+    conn: sqlite3.Connection, profile: str, learner_id: str, track_id: Any
+) -> str | None:
+    """Confirm the caller owns the named track and that it still takes work."""
+    if track_id is None:
+        return None
+    row = _writable_track(conn, profile, learner_id, str(track_id))
+    return str(row["id"])
+
+
+def _resolve_experience_objective(
+    conn: sqlite3.Connection,
+    profile: str,
+    learner_id: str,
+    track_id: str | None,
+    objective_id: Any,
+) -> str | None:
+    """An objective is addressable only through the track that owns it."""
+    if objective_id is None:
+        return None
+    if track_id is None:
+        raise ValidationError(
+            "An objective belongs to a track, so objective_id needs the track_id it is on."
+        )
+    row = conn.execute(
+        "SELECT * FROM objectives"
+        " WHERE id = ? AND track_id = ? AND profile_id = ? AND learner_id = ?",
+        (str(objective_id), track_id, profile, learner_id),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(NOT_FOUND_OBJECTIVE_MESSAGE)
+    status = ObjectiveStatus(str(row["status"]))
+    if status in CLOSED_OBJECTIVE_STATUSES:
+        raise ValidationError(
+            f"That objective is {status.value}. Ask the learner before practising against an "
+            "objective they have finished with."
+        )
+    return str(row["id"])
+
+
+def _insert_experience(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    learner_id: str,
+    track_id: str | None,
+    objective_id: str | None,
+    manifest: Any,
+) -> str:
+    """Write the experience and every component inside the caller's transaction.
+
+    Each component's learner payload is re-checked immediately before it is
+    written. That is not belt-and-braces about validation — it is the last
+    point at which a hidden field could reach the learner-facing table, and a
+    check *here* fails the whole transaction rather than storing a row that a
+    later renderer would happily show.
+    """
+    from .manifest import dumps
+
+    experience_id = _new_id()
+    now = _now()
+    conn.execute(
+        "INSERT INTO experiences"
+        " (id, learner_id, profile_id, track_id, objective_id, manifest_schema_version,"
+        "  title, objective_behavior, objective_condition, objective_standard, instructions,"
+        "  ui_locale, content_locale, expected_duration_minutes, difficulty, accessibility,"
+        "  source_references, delivery, component_count, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            experience_id,
+            learner_id,
+            profile,
+            track_id,
+            objective_id,
+            manifest.schema_version,
+            manifest.title,
+            manifest.objective["behavior"],
+            manifest.objective["condition"],
+            manifest.objective["standard"],
+            manifest.instructions,
+            manifest.ui_locale,
+            manifest.content_locale,
+            manifest.expected_duration_minutes,
+            manifest.difficulty,
+            dumps(manifest.accessibility),
+            dumps(list(manifest.source_references)),
+            dumps(manifest.delivery),
+            manifest.component_count,
+            now,
+            now,
+        ),
+    )
+
+    for position, component in enumerate(manifest.components, start=1):
+        payload = component.learner_payload()
+        _assert_payload_is_safe(payload, component)
+        component_row_id = _new_id()
+        conn.execute(
+            "INSERT INTO experience_components"
+            " (id, experience_id, learner_id, profile_id, position, component_key,"
+            "  component_type, learner_payload, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                component_row_id,
+                experience_id,
+                learner_id,
+                profile,
+                position,
+                component.id,
+                component.type,
+                dumps(payload),
+                now,
+            ),
+        )
+        hidden = component.hidden()
+        if hidden:
+            conn.execute(
+                "INSERT INTO experience_component_evaluations"
+                " (component_id, experience_id, learner_id, profile_id, evaluation, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (component_row_id, experience_id, learner_id, profile, dumps(hidden), now),
+            )
+    return experience_id
+
+
+def _assert_payload_is_safe(payload: dict[str, Any], component: Any) -> None:
+    """Refuse to write a learner payload carrying anything evaluator-only."""
+    from .components import HIDDEN_KEYS, LEARNER_VISIBLE_KEYS
+
+    # Hidden keys are checked first: they are also "unexpected fields", but a
+    # leaked answer key and a misspelled property are not the same incident,
+    # and the message should say which one happened.
+    for hidden_key in HIDDEN_KEYS:
+        if hidden_key in payload:
+            raise ValidationError(
+                f"component '{component.id}' would store evaluator-only data where the "
+                "learner can read it"
+            )
+    stray = sorted(set(payload) - set(LEARNER_VISIBLE_KEYS))
+    if stray:
+        raise ValidationError(
+            f"component '{component.id}' produced a learner payload with unexpected "
+            f"field(s): {', '.join(stray)}"
+        )
+
+
+def get_experience(
+    *,
+    principal: Principal,
+    experience_id: str,
+    config: LearningStudioConfig | None = None,
+) -> dict[str, Any]:
+    """Read back a stored experience's learner-visible half.
+
+    No tool exposes this yet — the delivery runtime arrives later. It exists
+    now so that the storage guarantees this PR makes (ownership, ordering, and
+    an evaluator-free projection) are testable against the code a runtime will
+    actually call, rather than against a query written in a test.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            raise NotFoundError(NOT_FOUND_EXPERIENCE_MESSAGE)
+
+        row = conn.execute(
+            "SELECT * FROM experiences WHERE id = ? AND profile_id = ? AND learner_id = ?",
+            (str(experience_id), profile, learner_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(NOT_FOUND_EXPERIENCE_MESSAGE)
+
+        components = conn.execute(
+            "SELECT position, component_key, component_type, learner_payload"
+            " FROM experience_components"
+            " WHERE experience_id = ? AND profile_id = ? AND learner_id = ?"
+            " ORDER BY position",
+            (str(experience_id), profile, learner_id),
+        ).fetchall()
+
+    return {
+        "experience_id": str(row["id"]),
+        "track_id": row["track_id"],
+        "objective_id": row["objective_id"],
+        "schema_version": int(row["manifest_schema_version"]),
+        "title": str(row["title"]),
+        "objective": {
+            "behavior": str(row["objective_behavior"]),
+            "condition": str(row["objective_condition"]),
+            "standard": str(row["objective_standard"]),
+        },
+        "instructions": str(row["instructions"]),
+        "ui_locale": str(row["ui_locale"]),
+        "content_locale": row["content_locale"],
+        "expected_duration_minutes": int(row["expected_duration_minutes"]),
+        "difficulty": str(row["difficulty"]),
+        "accessibility": json.loads(str(row["accessibility"])),
+        "source_references": json.loads(str(row["source_references"])),
+        "delivery": json.loads(str(row["delivery"])),
+        "components": [
+            {
+                "position": int(component["position"]),
+                "component_id": str(component["component_key"]),
+                "type": str(component["component_type"]),
+                "payload": json.loads(str(component["learner_payload"])),
+            }
+            for component in components
+        ],
+    }
 
 
 # ── Input validation helpers ──────────────────────────────────────────────

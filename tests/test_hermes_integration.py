@@ -334,6 +334,7 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
     }
     assert sorted(registered) == [
         "learning_studio_get_context",
+        "learning_studio_prepare",
         "learning_studio_save_context",
     ]
 
@@ -376,6 +377,19 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
 
         fetched = json.loads(registry.dispatch("learning_studio_get_context", {}))
         assert fetched["confirmed_context"]["goal"]["value"] == "g"
+
+        from tests.component_examples import CANARY
+        from tests.component_examples import manifest as example_manifest
+
+        prepared = json.loads(
+            registry.dispatch("learning_studio_prepare", {"manifest": example_manifest()})
+        )
+        assert prepared["ok"] is True, prepared
+        assert prepared["stored"] is True
+        first_experience = prepared["experience_id"]
+        # The response travels back through the model, so it is the one place
+        # an answer key must never appear.
+        assert CANARY not in json.dumps(prepared)
     finally:
         session_context.clear_session_vars(tokens)
 
@@ -390,11 +404,52 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
             registry.dispatch("learning_studio_get_context", {"learner_key": "111111"})
         )
         assert impersonation["ok"] is False
+
+        # Nor reach the first learner's prepared exercise, by id or otherwise.
+        from learning_studio import service
+        from learning_studio.identity import resolve_principal
+
+        try:
+            service.get_experience(principal=resolve_principal(), experience_id=first_experience)
+        except service.NotFoundError:
+            pass
+        else:  # pragma: no cover - a failure here is the point of the test
+            raise AssertionError("a second principal read the first principal's exercise")
+
+        # A prepared exercise of their own is a different record entirely.
+        from tests.component_examples import manifest as example_manifest
+
+        own = json.loads(
+            registry.dispatch("learning_studio_prepare", {"manifest": example_manifest()})
+        )
+        assert own["ok"] is True, own
+        assert own["experience_id"] != first_experience
     finally:
         session_context.clear_session_vars(tokens)
 
     db = tmp_path / "live-profile" / "workspace" / "learning-studio" / "learning-studio.sqlite3"
     assert db.is_file(), "the real run did not write to the profile-scoped storage root"
+
+    # The database the real host produced must be at the current schema, with
+    # the two experiences the two principals prepared kept apart.
+    import sqlite3
+
+    with sqlite3.connect(db) as inspection:
+        version = inspection.execute("SELECT version FROM schema_version").fetchone()[0]
+        owners = inspection.execute(
+            "SELECT COUNT(DISTINCT learner_id) FROM experiences"
+        ).fetchone()[0]
+        payloads = " ".join(
+            str(row[0])
+            for row in inspection.execute("SELECT learner_payload FROM experience_components")
+        )
+
+    from learning_studio.storage import SCHEMA_VERSION
+    from tests.component_examples import CANARY
+
+    assert version == SCHEMA_VERSION
+    assert owners == 2, "the two principals' exercises were not stored separately"
+    assert CANARY not in payloads, "evaluator-only data reached the learner-facing table"
 
 
 def test_the_session_user_id_is_a_real_host_supplied_value():
