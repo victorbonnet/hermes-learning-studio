@@ -23,18 +23,27 @@ DIRECTORY_MODE = 0o700
 FILE_MODE = 0o600
 
 
+class PathResolutionError(RuntimeError):
+    """The active profile's storage root could not be resolved safely."""
+
+
 def hermes_home() -> Path:
     """Return the active Hermes home directory.
 
     Delegates to the host's ``get_hermes_home()``, which resolves the
-    context-local profile override before the ``HERMES_HOME`` env var — a
+    context-local profile override *before* the ``HERMES_HOME`` env var — a
     distinction that matters inside gateway and kanban worker sessions, where
-    the env var alone reflects the wrong profile.
+    the env var alone names the wrong profile.
 
-    The import is deliberately lazy and deliberately caught: this package must
-    stay importable outside a Hermes process (the test suite, ``uv build``,
-    a bare ``import learning_studio``). The fallback reads the same env var
-    the host reads, so the two agree in every context that sets it.
+    Two failure modes, treated differently on purpose:
+
+    - **The host is absent** (test suite, ``uv build``, a bare import). Fall
+      back to the documented env-var resolution; there is no profile to get
+      wrong.
+    - **The host is present but its resolver raised.** Fail closed. Falling
+      back to the environment here is precisely how one profile's data ends
+      up in another profile's database, and a loud error is recoverable in a
+      way that silent cross-profile writes are not.
     """
     try:
         from hermes_constants import get_hermes_home
@@ -42,9 +51,18 @@ def hermes_home() -> Path:
         return _hermes_home_from_env()
 
     try:
-        return Path(get_hermes_home())
-    except Exception:  # pragma: no cover - defensive: never fail path resolution
-        return _hermes_home_from_env()
+        resolved = get_hermes_home()
+    except Exception as exc:
+        raise PathResolutionError(
+            "The active Hermes profile could not be resolved, so the Learning Studio "
+            "cannot tell which profile's storage to use and has done nothing."
+        ) from exc
+
+    if not resolved:
+        raise PathResolutionError(
+            "Hermes reported no home directory for the active profile; nothing was stored."
+        )
+    return Path(resolved)
 
 
 def _hermes_home_from_env() -> Path:
@@ -80,8 +98,37 @@ def profile_id() -> str:
 
 
 def storage_root() -> Path:
-    """Return ``$HERMES_HOME/workspace/learning-studio``."""
-    return hermes_home().joinpath(*STORAGE_SUBPATH)
+    """Return ``$HERMES_HOME/workspace/learning-studio``, verified in place.
+
+    The verification matters because the path is only profile-safe if it
+    actually *resolves* inside the profile. A pre-existing symlink at
+    ``workspace/learning-studio`` — planted by another profile, an unpacked
+    archive, or a careless sync tool — would otherwise redirect every write
+    to somewhere the profile boundary does not cover.
+    """
+    home = hermes_home()
+    root = home.joinpath(*STORAGE_SUBPATH)
+    _reject_escape(home, root)
+    return root
+
+
+def _reject_escape(home: Path, root: Path) -> None:
+    """Refuse a storage root that resolves outside the active Hermes home."""
+    if not root.exists() and not root.is_symlink():
+        return
+    try:
+        resolved_root = root.resolve()
+        resolved_home = home.resolve()
+    except OSError as exc:  # pragma: no cover - unreadable path
+        raise PathResolutionError(
+            "The Learning Studio storage directory could not be verified; nothing was stored."
+        ) from exc
+
+    if resolved_root != resolved_home and resolved_home not in resolved_root.parents:
+        raise PathResolutionError(
+            "The Learning Studio storage directory resolves outside the active Hermes "
+            "profile and was refused. Remove or replace it; nothing was stored."
+        )
 
 
 def ensure_storage_root() -> Path:
@@ -95,6 +142,9 @@ def ensure_storage_root() -> Path:
     root = storage_root()
     root.mkdir(mode=DIRECTORY_MODE, parents=True, exist_ok=True)
     _restrict(root, DIRECTORY_MODE)
+    # Re-verify after creation: mkdir follows an existing symlink, so the
+    # check above and the directory that now exists are not the same claim.
+    _reject_escape(hermes_home(), root)
     return root
 
 

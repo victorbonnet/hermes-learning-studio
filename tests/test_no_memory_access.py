@@ -172,9 +172,13 @@ def test_registration_does_not_touch_memory(memory_blocked):
 def test_the_whole_write_and_read_cycle_does_not_touch_memory(memory_blocked, hermes_home: Path):
     """Registration, save, candidate generation, and read — the full path."""
     service = importlib.import_module("learning_studio.service")
+    identity = importlib.import_module("learning_studio.identity")
+    who = identity.Principal(
+        profile="default", platform="telegram", user_id="5005", source="gateway_session"
+    )
 
     service.save_context(
-        learner_key="user-5005",
+        principal=who,
         temporary_context={"subject": "anything"},
         track={"name": "T", "confirmed": True, "context": {"goal": "g"}},
         memory_candidates=[
@@ -186,7 +190,7 @@ def test_the_whole_write_and_read_cycle_does_not_touch_memory(memory_blocked, he
             }
         ],
     )
-    service.get_context(learner_key="user-5005", include_memory_candidates=True)
+    service.get_context(principal=who, include_memory_candidates=True)
 
     assert memory_blocked.attempts == []
 
@@ -204,9 +208,12 @@ def test_the_blocker_would_catch_a_real_import(memory_blocked):
 
 def test_saving_writes_only_inside_the_learning_studio_directory(hermes_home: Path):
     from learning_studio import service
+    from learning_studio.identity import Principal
 
     service.save_context(
-        learner_key="user-6006",
+        principal=Principal(
+            profile="default", platform="telegram", user_id="6006", source="gateway_session"
+        ),
         track={"name": "T", "confirmed": True, "context": {"goal": "g"}},
     )
 

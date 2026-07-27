@@ -14,14 +14,23 @@ from pathlib import Path
 import pytest
 
 from learning_studio import service
-
-ALICE = "user-1001"
-BOB = "user-2002"
+from learning_studio.identity import Principal
 
 
-def _make_track(learner_key: str, name: str) -> str:
+def _p(user_id: str, profile: str = "default") -> Principal:
+    """A distinct authenticated learner, as the gateway would report them."""
+    return Principal(
+        profile=profile, platform="telegram", user_id=user_id, source="gateway_session"
+    )
+
+
+ALICE = _p("1001")
+BOB = _p("2002")
+
+
+def _make_track(who: Principal, name: str) -> str:
     result = service.save_context(
-        learner_key=learner_key,
+        principal=who,
         track={"name": name, "confirmed": True, "context": {"goal": f"goal for {name}"}},
     )
     return result["outcome"]["track"]["track_id"]
@@ -34,8 +43,8 @@ def test_two_learners_in_one_profile_do_not_see_each_other(hermes_home: Path):
     _make_track(ALICE, "Alice track")
     _make_track(BOB, "Bob track")
 
-    alice = service.get_context(learner_key=ALICE)
-    bob = service.get_context(learner_key=BOB)
+    alice = service.get_context(principal=ALICE)
+    bob = service.get_context(principal=BOB)
 
     assert [t["name"] for t in alice["tracks"]] == ["Alice track"]
     assert [t["name"] for t in bob["tracks"]] == ["Bob track"]
@@ -46,7 +55,7 @@ def test_a_known_track_id_does_not_grant_another_learner_read_access(hermes_home
     _make_track(BOB, "Bob track")
 
     with pytest.raises(service.NotFoundError):
-        service.get_context(learner_key=BOB, track_id=alice_track)
+        service.get_context(principal=BOB, track_id=alice_track)
 
 
 def test_a_known_track_name_does_not_grant_another_learner_read_access(hermes_home: Path):
@@ -54,7 +63,7 @@ def test_a_known_track_name_does_not_grant_another_learner_read_access(hermes_ho
     _make_track(BOB, "Bob track")
 
     with pytest.raises(service.NotFoundError):
-        service.get_context(learner_key=BOB, track_name="Alice track")
+        service.get_context(principal=BOB, track_name="Alice track")
 
 
 def test_a_known_track_id_does_not_grant_another_learner_write_access(hermes_home: Path):
@@ -63,11 +72,11 @@ def test_a_known_track_id_does_not_grant_another_learner_write_access(hermes_hom
 
     with pytest.raises(service.NotFoundError):
         service.save_context(
-            learner_key=BOB,
+            principal=BOB,
             track={"track_id": alice_track, "context": {"goal": "hijacked"}},
         )
 
-    alice = service.get_context(learner_key=ALICE, track_id=alice_track)
+    alice = service.get_context(principal=ALICE, track_id=alice_track)
     assert alice["confirmed_context"]["goal"]["value"] == "goal for Alice track"
 
 
@@ -76,11 +85,9 @@ def test_another_learner_cannot_archive_or_withdraw_a_track(hermes_home: Path):
     _make_track(BOB, "Bob track")
 
     with pytest.raises(service.NotFoundError):
-        service.save_context(
-            learner_key=BOB, track={"track_id": alice_track, "status": "withdrawn"}
-        )
+        service.save_context(principal=BOB, track={"track_id": alice_track, "status": "withdrawn"})
 
-    alice = service.get_context(learner_key=ALICE, track_id=alice_track)
+    alice = service.get_context(principal=ALICE, track_id=alice_track)
     assert alice["track_selection"]["track_id"] == alice_track
     assert alice["tracks"][0]["status"] == "active"
 
@@ -91,7 +98,7 @@ def test_another_learner_cannot_attach_an_objective_to_a_foreign_track(hermes_ho
 
     with pytest.raises(service.NotFoundError):
         service.save_context(
-            learner_key=BOB,
+            principal=BOB,
             objectives=[
                 {
                     "track_id": alice_track,
@@ -102,7 +109,7 @@ def test_another_learner_cannot_attach_an_objective_to_a_foreign_track(hermes_ho
             ],
         )
 
-    alice = service.get_context(learner_key=ALICE, track_id=alice_track)
+    alice = service.get_context(principal=ALICE, track_id=alice_track)
     assert alice["objectives"] == []
 
 
@@ -112,7 +119,7 @@ def test_another_learner_cannot_correct_a_foreign_track(hermes_home: Path):
 
     with pytest.raises(service.NotFoundError):
         service.save_context(
-            learner_key=BOB,
+            principal=BOB,
             corrections=[
                 {"field": "goal", "value": "hijacked", "track_id": alice_track, "durable": True}
             ],
@@ -125,9 +132,9 @@ def test_an_unknown_id_and_a_foreign_id_give_the_same_answer(hermes_home: Path):
     _make_track(BOB, "Bob track")
 
     with pytest.raises(service.NotFoundError) as foreign:
-        service.get_context(learner_key=BOB, track_id=alice_track)
+        service.get_context(principal=BOB, track_id=alice_track)
     with pytest.raises(service.NotFoundError) as absent:
-        service.get_context(learner_key=BOB, track_id="0" * 32)
+        service.get_context(principal=BOB, track_id="0" * 32)
 
     assert str(foreign.value) == str(absent.value) == service.NOT_FOUND_MESSAGE
 
@@ -136,10 +143,10 @@ def test_the_error_message_names_no_learner_track_or_path(hermes_home: Path):
     alice_track = _make_track(ALICE, "Alice secret project")
 
     with pytest.raises(service.NotFoundError) as exc:
-        service.get_context(learner_key=BOB, track_id=alice_track)
+        service.get_context(principal=BOB, track_id=alice_track)
 
     message = str(exc.value)
-    for leak in (alice_track, "Alice", "secret", ALICE, str(hermes_home)):
+    for leak in (alice_track, "Alice", "secret", ALICE.user_id, str(hermes_home)):
         assert leak not in message
 
 
@@ -154,11 +161,11 @@ def test_a_second_profile_starts_empty(tmp_path: Path, monkeypatch):
     second.mkdir()
 
     monkeypatch.setenv("HERMES_HOME", str(first))
-    _make_track(ALICE, "Track in profile A")
-    assert len(service.get_context(learner_key=ALICE)["tracks"]) == 1
+    _make_track(_p("1001", profile="a"), "Track in profile A")
+    assert len(service.get_context(principal=_p("1001", profile="a"))["tracks"]) == 1
 
     monkeypatch.setenv("HERMES_HOME", str(second))
-    assert service.get_context(learner_key=ALICE)["tracks"] == []
+    assert service.get_context(principal=_p("1001", profile="b"))["tracks"] == []
 
 
 def test_a_track_id_from_another_profile_is_not_readable(tmp_path: Path, monkeypatch):
@@ -168,11 +175,11 @@ def test_a_track_id_from_another_profile_is_not_readable(tmp_path: Path, monkeyp
     second.mkdir()
 
     monkeypatch.setenv("HERMES_HOME", str(first))
-    track_id = _make_track(ALICE, "Track in profile A")
+    track_id = _make_track(_p("1001", profile="a"), "Track in profile A")
 
     monkeypatch.setenv("HERMES_HOME", str(second))
     with pytest.raises(service.NotFoundError):
-        service.get_context(learner_key=ALICE, track_id=track_id)
+        service.get_context(principal=_p("1001", profile="b"), track_id=track_id)
 
 
 def test_every_learner_owned_row_carries_its_profile_scope(hermes_home: Path):
@@ -181,7 +188,7 @@ def test_every_learner_owned_row_carries_its_profile_scope(hermes_home: Path):
 
     _make_track(ALICE, "Alice track")
     service.save_context(
-        learner_key=ALICE,
+        principal=ALICE,
         temporary_context={"subject": "anything"},
         objectives=None,
     )
@@ -213,7 +220,7 @@ def test_a_learner_may_hold_several_tracks(hermes_home: Path):
     _make_track(ALICE, "Second")
     _make_track(ALICE, "Third")
 
-    result = service.get_context(learner_key=ALICE)
+    result = service.get_context(principal=ALICE)
 
     assert sorted(t["name"] for t in result["tracks"]) == ["First", "Second", "Third"]
 
@@ -223,8 +230,8 @@ def test_a_second_track_never_overwrites_the_first(hermes_home: Path):
     second = _make_track(ALICE, "Second")
 
     assert first != second
-    one = service.get_context(learner_key=ALICE, track_id=first)
-    two = service.get_context(learner_key=ALICE, track_id=second)
+    one = service.get_context(principal=ALICE, track_id=first)
+    two = service.get_context(principal=ALICE, track_id=second)
     assert one["confirmed_context"]["goal"]["value"] == "goal for First"
     assert two["confirmed_context"]["goal"]["value"] == "goal for Second"
 
@@ -241,7 +248,7 @@ def test_several_active_tracks_make_selection_ambiguous_not_arbitrary(hermes_hom
     _make_track(ALICE, "First")
     _make_track(ALICE, "Second")
 
-    result = service.get_context(learner_key=ALICE)
+    result = service.get_context(principal=ALICE)
 
     assert result["track_selection"]["mode"] == "ambiguous"
     assert result["track_selection"]["track_id"] is None
@@ -252,7 +259,7 @@ def test_several_active_tracks_make_selection_ambiguous_not_arbitrary(hermes_hom
 def test_one_active_track_is_selected_without_asking(hermes_home: Path):
     track_id = _make_track(ALICE, "Only one")
 
-    result = service.get_context(learner_key=ALICE)
+    result = service.get_context(principal=ALICE)
 
     assert result["track_selection"]["mode"] == "single_active_track"
     assert result["track_selection"]["track_id"] == track_id
@@ -262,8 +269,8 @@ def test_archiving_removes_a_track_from_the_ambiguity_set(hermes_home: Path):
     first = _make_track(ALICE, "First")
     second = _make_track(ALICE, "Second")
 
-    service.save_context(learner_key=ALICE, track={"track_id": first, "status": "archived"})
+    service.save_context(principal=ALICE, track={"track_id": first, "status": "archived"})
 
-    result = service.get_context(learner_key=ALICE)
+    result = service.get_context(principal=ALICE)
     assert result["track_selection"]["track_id"] == second
     assert len(result["tracks"]) == 2, "archiving is not deletion"

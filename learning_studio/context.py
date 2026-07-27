@@ -38,6 +38,17 @@ from .models import (
     ResolvedValue,
 )
 
+#: How a stored value's authority differs from the same value in flight.
+#:
+#: ``explicit_request`` at the top of the precedence order means *the request
+#: being made right now*. Once saved it is last session's remark, and it must
+#: not outrank a correction the learner made afterwards, nor a track they have
+#: since confirmed. Saved, it carries the weight of a stated preference — above
+#: anything merely inferred, below anything durable.
+STORED_DEMOTION: dict[Provenance, Provenance] = {
+    Provenance.EXPLICIT_REQUEST: Provenance.CONFIRMED_PREFERENCE,
+}
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -56,12 +67,19 @@ class Candidate:
     def confirmed(self) -> bool:
         return self.provenance in CONFIRMED_PROVENANCES
 
+    @property
+    def effective_provenance(self) -> Provenance:
+        """The provenance that decides precedence, after stored demotion."""
+        if self.is_current:
+            return self.provenance
+        return STORED_DEMOTION.get(self.provenance, self.provenance)
+
     def _sort_key(self) -> tuple[Any, ...]:
-        # Precedence first; a live statement beats a stored one at equal
-        # precedence; then most recent; then source name so that two
+        # Effective precedence first; a live statement beats a stored one at
+        # equal precedence; then most recent; then source name so that two
         # otherwise identical candidates still order deterministically.
         return (
-            PRECEDENCE[self.provenance],
+            PRECEDENCE[self.effective_provenance],
             0 if self.is_current else 1,
             _descending(self.recorded_at),
             self.source,

@@ -1,14 +1,19 @@
 """Tool handlers.
 
 Handlers are the boundary between an LLM's arguments and this plugin's
-storage, so they hold to three rules:
+storage, so they hold to four rules:
 
 1. **Always return a JSON string.** Hermes' registry rejects anything else,
    and an exception escaping a handler becomes an opaque failure the agent
    cannot act on.
-2. **Fail closed, and explain.** Bad input produces a refusal that says what
-   was wrong, never a partial write.
-3. **Leak nothing.** Filesystem paths, SQL text, and raw exception strings
+2. **Identity comes from the host.** The caller is resolved from Hermes'
+   session context before anything else happens. No argument names a
+   learner, so no argument can impersonate one.
+3. **Validate against the advertised schema, at runtime.** Not every
+   provider enforces a schema before dispatch, so the same declarations the
+   schema is built from are re-checked here — before the database is opened,
+   so a malformed request cannot half-apply.
+4. **Leak nothing.** Filesystem paths, SQL text, and raw exception strings
    stay in the log. In particular an error must never reveal whether another
    learner's object exists — see :data:`service.NOT_FOUND_MESSAGE`.
 """
@@ -21,7 +26,10 @@ from typing import Any
 
 from . import service
 from .config import ConfigError
-from .schemas import GET_TOOL_NAME, SAVE_TOOL_NAME
+from .identity import IdentityError, resolve_principal
+from .paths import PathResolutionError
+from .schemas import GET_TOOL_NAME, SAVE_TOOL_NAME, TOOL_SCHEMAS
+from .validation import SchemaViolation, validate
 
 logger = logging.getLogger(__name__)
 
@@ -41,136 +49,78 @@ def _ok(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _params(raw: Any) -> dict[str, Any]:
+def _checked(raw: Any, tool_name: str) -> dict[str, Any]:
+    """Normalise and fully validate the incoming arguments."""
     if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise service.ValidationError("tool arguments must be an object")
-    return raw
+        args: dict[str, Any] = {}
+    elif isinstance(raw, dict):
+        args = raw
+    else:
+        raise SchemaViolation("arguments: must be an object")
+
+    validate(args, TOOL_SCHEMAS[tool_name]["parameters"])
+    return args
 
 
-def _reject_unknown(params: dict[str, Any], allowed: frozenset[str]) -> None:
-    """Enforce ``additionalProperties: false`` at runtime as well as in schema.
+def _run(tool_name: str, raw: Any, call) -> str:
+    """Shared entry path: validate, identify, dispatch, and never leak.
 
-    Providers do not all validate schemas before dispatch, so an unexpected
-    key has to be refused here too rather than silently ignored.
+    Order matters. Arguments are checked before identity, and identity before
+    storage, so an invalid request never reaches the database and an
+    unidentifiable caller never creates a record.
     """
-    unknown = set(params) - allowed
-    if unknown:
-        raise service.ValidationError(f"unknown argument(s): {', '.join(sorted(unknown))}")
-
-
-_GET_ARGS = frozenset(
-    {
-        "learner_key",
-        "track_id",
-        "track_name",
-        "current_request",
-        "include_memory_candidates",
-    }
-)
-
-_SAVE_ARGS = frozenset(
-    {
-        "learner_key",
-        "temporary_context",
-        "evidence_context",
-        "corrections",
-        "track",
-        "objectives",
-        "memory_candidates",
-        "remember_accessibility_needs",
-    }
-)
-
-
-def _bool(raw: Any, label: str) -> bool:
-    if raw is None:
-        return False
-    if not isinstance(raw, bool):
-        raise service.ValidationError(f"{label} must be true or false")
-    return raw
-
-
-def _list(raw: Any, label: str) -> list[Any]:
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise service.ValidationError(f"{label} must be an array")
-    if not all(isinstance(item, dict) for item in raw):
-        raise service.ValidationError(f"{label} entries must be objects")
-    return raw
-
-
-def _dict(raw: Any, label: str) -> dict[str, Any] | None:
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise service.ValidationError(f"{label} must be an object")
-    return raw
-
-
-def _optional_str(raw: Any, label: str) -> str | None:
-    if raw is None:
-        return None
-    if not isinstance(raw, str) or not raw.strip():
-        raise service.ValidationError(f"{label} must be a non-empty string")
-    return raw.strip()
+    try:
+        args = _checked(raw, tool_name)
+        principal = resolve_principal()
+        return _ok(call(principal, args))
+    except SchemaViolation as exc:
+        return _error(str(exc))
+    except IdentityError as exc:
+        return _error(str(exc))
+    except service.NotFoundError as exc:
+        return _error(str(exc))
+    except service.ServiceError as exc:
+        return _error(str(exc))
+    except (ConfigError, PathResolutionError) as exc:
+        # Safe to surface: these messages are written to describe the failure
+        # without naming a path, a profile, or another learner.
+        return _error(str(exc))
+    except Exception as exc:
+        logger.exception("%s failed: %s", tool_name, exc)
+        return _error(_INTERNAL_ERROR)
 
 
 def handle_get_context(params: Any = None, **_kwargs: Any) -> str:
     """Handler for ``learning_studio_get_context``."""
-    try:
-        args = _params(params)
-        _reject_unknown(args, _GET_ARGS)
-        payload = service.get_context(
-            learner_key=args.get("learner_key"),
-            track_id=_optional_str(args.get("track_id"), "track_id"),
-            track_name=_optional_str(args.get("track_name"), "track_name"),
-            current_request=_dict(args.get("current_request"), "current_request"),
-            include_memory_candidates=_bool(
-                args.get("include_memory_candidates"), "include_memory_candidates"
-            ),
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        return service.get_context(
+            principal=principal,
+            track_id=args.get("track_id"),
+            track_name=args.get("track_name"),
+            current_request=args.get("current_request"),
+            include_memory_candidates=bool(args.get("include_memory_candidates", False)),
         )
-        return _ok(payload)
-    except service.NotFoundError as exc:
-        return _error(str(exc))
-    except service.ServiceError as exc:
-        return _error(str(exc))
-    except ConfigError as exc:
-        return _error(f"Learning Studio configuration is invalid: {exc}")
-    except Exception as exc:
-        logger.exception("learning_studio_get_context failed: %s", exc)
-        return _error(_INTERNAL_ERROR)
+
+    return _run(GET_TOOL_NAME, params, call)
 
 
 def handle_save_context(params: Any = None, **_kwargs: Any) -> str:
     """Handler for ``learning_studio_save_context``."""
-    try:
-        args = _params(params)
-        _reject_unknown(args, _SAVE_ARGS)
-        payload = service.save_context(
-            learner_key=args.get("learner_key"),
-            temporary_context=_dict(args.get("temporary_context"), "temporary_context"),
-            evidence_context=_dict(args.get("evidence_context"), "evidence_context"),
-            corrections=_list(args.get("corrections"), "corrections"),
-            track=_dict(args.get("track"), "track"),
-            objectives=_list(args.get("objectives"), "objectives"),
-            memory_candidates=_list(args.get("memory_candidates"), "memory_candidates"),
-            remember_accessibility_needs=_bool(
-                args.get("remember_accessibility_needs"), "remember_accessibility_needs"
-            ),
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        return service.save_context(
+            principal=principal,
+            temporary_context=args.get("temporary_context"),
+            evidence_context=args.get("evidence_context"),
+            corrections=args.get("corrections") or [],
+            track=args.get("track"),
+            objectives=args.get("objectives") or [],
+            memory_candidates=args.get("memory_candidates") or [],
+            accessibility_consent=args.get("accessibility_consent"),
         )
-        return _ok(payload)
-    except service.NotFoundError as exc:
-        return _error(str(exc))
-    except service.ServiceError as exc:
-        return _error(str(exc))
-    except ConfigError as exc:
-        return _error(f"Learning Studio configuration is invalid: {exc}")
-    except Exception as exc:
-        logger.exception("learning_studio_save_context failed: %s", exc)
-        return _error(_INTERNAL_ERROR)
+
+    return _run(SAVE_TOOL_NAME, params, call)
 
 
 HANDLERS = {

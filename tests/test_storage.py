@@ -91,25 +91,39 @@ def test_migrations_are_applied_in_deterministic_order():
 
 
 def test_a_failing_migration_rolls_back_completely(hermes_home: Path, monkeypatch):
-    """A half-applied schema is worse than no schema at all."""
+    """A half-applied schema is worse than no schema at all.
 
-    def broken(conn: sqlite3.Connection) -> None:
-        conn.execute("CREATE TABLE canary (id TEXT PRIMARY KEY)")
-        raise sqlite3.OperationalError("simulated migration failure")
-
+    This drives the *production* execution path: a real ``Migration`` of real
+    statements, applied by ``initialize()``. An earlier version of this test
+    ran the DDL through a callback that used ``executescript``, which commits
+    before it runs — so the canary survived the rollback and the test still
+    passed. Migrations are statement lists now precisely so a migration
+    cannot escape its transaction, and this proves it.
+    """
     monkeypatch.setattr(
         storage,
         "MIGRATIONS",
-        [storage.Migration(version=1, apply=broken)],
+        [
+            storage.Migration(
+                version=1,
+                statements=(
+                    "CREATE TABLE canary (id TEXT PRIMARY KEY)",
+                    "CREATE INDEX idx_canary ON canary (id)",
+                    "THIS IS NOT VALID SQL",
+                ),
+            )
+        ],
     )
 
     with pytest.raises(storage.MigrationError):
         storage.initialize()
 
     with sqlite3.connect(storage.database_path()) as raw:
-        listing = raw.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {row[0] for row in listing}
-    assert "canary" not in tables, "failed migration left its table behind"
+        listing = raw.execute("SELECT name FROM sqlite_master")
+        objects = {row[0] for row in listing}
+    assert "canary" not in objects, "failed migration left its table behind"
+    assert "idx_canary" not in objects, "failed migration left its index behind"
+    assert "schema_version" not in objects, "the version advanced despite the failure"
 
 
 def test_a_database_newer_than_the_code_fails_loudly(hermes_home: Path):
@@ -127,8 +141,9 @@ def test_an_incompatible_database_is_not_recreated(hermes_home: Path):
     storage.initialize()
     with storage.connect() as conn:
         conn.execute(
-            "INSERT INTO learners (id, profile_id, learner_digest, created_at, updated_at)"
-            " VALUES ('l1', 'default', 'digest', '2026-01-01T00:00:00Z',"
+            "INSERT INTO learners"
+            " (id, profile_id, principal_digest, platform, created_at, updated_at)"
+            " VALUES ('l1', 'default', 'digest', 'telegram', '2026-01-01T00:00:00Z',"
             " '2026-01-01T00:00:00Z')"
         )
         conn.execute("UPDATE schema_version SET version = ?", (storage.SCHEMA_VERSION + 5,))

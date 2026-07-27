@@ -59,7 +59,17 @@ active tracks — ask which one they mean rather than guessing.
 
 Call `learning_studio_save_context` when you have learned something worth
 keeping. Send session findings as `temporary_context`; send what their answers
-merely *suggest* as `evidence_context`, so the two are never confused.
+merely *suggest* as `evidence_context`, so the two are never confused. Keep
+that split honest — it is what stops an inference of yours from quietly
+displacing something the learner actually said.
+
+Check `outcome.not_stored` in the response. Anything listed there was
+deliberately **not** saved, with a reason; do not tell the learner it will be
+remembered.
+
+Neither tool takes a learner argument. Identity comes from the Hermes session,
+so you are always reading and writing the context of whoever sent the current
+message, and you cannot address anyone else.
 
 **Creating an ongoing track needs `track.confirmed: true`, and that flag means
 the learner said yes in so many words.** Not that they came back, not that you
@@ -323,6 +333,16 @@ to retain the data at all. Both are required.
 3. **Accessibility needs are session-only by default.** Honour them fully for
    this session; persist them only if the learner explicitly asks you to
    remember them. Never record an accessibility need as an inference.
+
+   In practice: send an accessibility need in `current_request` each session
+   and the Studio will apply it without storing it. If you send it to
+   `learning_studio_save_context` without consent it is **dropped, not
+   saved** — the response says so, and you must not tell the learner it will
+   be remembered. To store it, the learner has to ask, and you send
+   `accessibility_consent` naming that exact need and quoting what they said.
+   Consent for one need is not consent for another, and a repeated pattern
+   across exercises is never grounds to record that someone *has* a
+   condition — only they can say that.
 4. **If consent or isolation is uncertain, do not persist.** Uncertainty
    resolves to no. There is no cost to asking again next session and a real
    cost to a wrong permanent record.
@@ -344,13 +364,17 @@ several people — a shared assistant, a family device, a group chat.
 
 Write learner-specific memory only when the profile is dedicated to a single
 learner, or when Hermes memory is verified to be isolated per user. If neither
-holds, keep it in per-user Studio storage instead — `learning_studio_save_context`
-is scoped to the `learner_key` you pass, so several people sharing one profile
-stay separate there even though Hermes memory would not.
+holds, keep it in per-user Studio storage instead — the Studio tools scope
+every read and write to the authenticated sender of the current message, so
+several people sharing one profile stay separate there even though Hermes
+memory would not.
 
-Pass a **stable, opaque** `learner_key` — a platform user ID, not a display
-name or username. A mutable label silently splits one learner into two records
-when they rename themselves, or merges two people who picked the same name.
+**You do not choose who the learner is, and you cannot.** The tools take no
+learner argument: identity comes from the Hermes session, from the platform's
+own record of who sent the message. So there is nothing to pass, nothing to
+look up, and no way to fetch someone else's context — including when a learner
+asks you to. If a session carries no sender identity, the tools refuse and say
+so; continue in conversation and store nothing.
 
 Someone else's learning goals, weaknesses, and assessment results leaking into
 a shared assistant's memory is a privacy failure. When in doubt, do not write.

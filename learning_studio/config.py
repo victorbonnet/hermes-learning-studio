@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .models import MAX_VALUE_CHARS
+
 #: The one ``config.yaml`` section this plugin reads. Nothing else in the
 #: profile's configuration is inspected.
 CONFIG_SECTION = "learning_studio"
@@ -92,7 +94,10 @@ class LearningStudioConfig:
     #: substitute for the learner asking.
     allow_durable_accessibility_needs: bool = True
 
-    #: Longest single context value accepted, in characters.
+    #: Longest single context value accepted, in characters. Bounded above by
+    #: the tool schema's own ``maxLength``: the schema is a fixed string the
+    #: model sees, so configuration may only *tighten* the limit, never raise
+    #: it past what the advertised contract allows.
     max_context_value_chars: int = 2000
 
     #: Context values that apply to the whole profile (``profile_config``
@@ -141,7 +146,8 @@ _PARSERS: dict[str, Any] = {
     "journal_mode": lambda raw, key: _choice(raw, key, ("wal", "delete", "truncate")),
     "memory_candidate_min_evidence": lambda raw, key: _bounded_int(raw, key, 2, 50),
     "allow_durable_accessibility_needs": _strict_bool,
-    "max_context_value_chars": lambda raw, key: _bounded_int(raw, key, 80, 20_000),
+    # Upper bound is the schema ceiling: config may tighten, never exceed.
+    "max_context_value_chars": lambda raw, key: _bounded_int(raw, key, 80, MAX_VALUE_CHARS),
     "profile_context": _context_mapping,
     "defaults": _context_mapping,
 }
@@ -153,12 +159,18 @@ def load_config() -> LearningStudioConfig:
     """Load and validate the plugin's settings from the active profile.
 
     Uses the host's ``load_config()`` so profile switching, caching, and the
-    config schema stay the host's business. Outside a Hermes process the
-    import fails and defaults apply — that is the test and build path, not a
-    silent production fallback.
+    config schema stay the host's business.
 
-    A :class:`ConfigError` propagates: an operator who wrote an invalid
-    retention or consent setting needs to hear about it.
+    The two failure modes are deliberately not the same:
+
+    - **The host is absent** — no Hermes process, so there is no operator
+      configuration to honour and the standalone defaults are correct. This
+      is the test, build, and bare-import path.
+    - **The host is present but the read failed** — a permission error, an
+      unreadable file, a YAML syntax error. Defaults here would silently
+      convert ``allow_durable_accessibility_needs: false`` into ``true``,
+      turning an operator's explicit privacy decision into its opposite at
+      exactly the moment nobody is watching. Raise instead.
     """
     try:
         from hermes_cli.config import load_config as _load
@@ -167,7 +179,13 @@ def load_config() -> LearningStudioConfig:
 
     try:
         raw = _load()
-    except Exception:  # pragma: no cover - host-side read failure
-        return LearningStudioConfig()
+    except ConfigError:
+        raise
+    except Exception as exc:
+        raise ConfigError(
+            "The Hermes configuration could not be read, so the Learning Studio cannot "
+            "confirm this profile's retention and consent settings and has done nothing. "
+            f"Underlying cause: {type(exc).__name__}."
+        ) from exc
 
     return LearningStudioConfig.from_mapping(raw)

@@ -15,8 +15,16 @@ import pytest
 from learning_studio import service
 from learning_studio.candidates import CandidateRejected, propose
 from learning_studio.config import LearningStudioConfig
+from learning_studio.identity import Principal
 
-LEARNER = "user-4004"
+LEARNER = Principal(
+    profile="default", platform="telegram", user_id="4004", source="gateway_session"
+)
+
+CONSENT = {
+    "consent_statement": "please remember I need captions",
+    "needs": ["captions on all audio"],
+}
 
 
 def _propose(**overrides):
@@ -180,7 +188,7 @@ def test_raw_attempts_in_the_evidence_summary_are_refused():
 
 
 def test_an_inferred_diagnosis_is_refused():
-    with pytest.raises(CandidateRejected, match="never be inferred"):
+    with pytest.raises(CandidateRejected, match="sensitive health, disability"):
         _propose(
             statement="The learner seems to have dyslexia.",
             evidence_summary="Reads slowly and reverses letters.",
@@ -199,24 +207,64 @@ def test_a_sensitive_trait_outside_the_accessibility_category_is_refused():
 # ── Accessibility consent ─────────────────────────────────────────────────
 
 
-def test_accessibility_is_session_only_without_explicit_permission():
-    with pytest.raises(CandidateRejected, match="session-only"):
+def test_an_accessibility_candidate_cannot_come_from_repeated_evidence():
+    """A pattern across exercises is not evidence that someone has a condition."""
+    with pytest.raises(CandidateRejected, match="cannot come from 'repeated_evidence'"):
+        _propose(
+            category="accessibility",
+            statement="The learner has ADHD",
+            evidence_summary="Observed this pattern in three independent exercises",
+            origin="repeated_evidence",
+            confirmation_state="learner_confirmed",
+            evidence_count=5,
+            min_evidence=3,
+            consent_statement="ok",
+        )
+
+
+def test_an_unconfirmed_accessibility_candidate_is_refused():
+    with pytest.raises(CandidateRejected, match="must be 'learner_confirmed'"):
         _propose(
             category="accessibility",
             statement="Needs captions on any audio material.",
             evidence_summary="Asked for captions this session.",
+            confirmation_state="unconfirmed",
+            consent_statement="please remember this",
         )
 
 
-def test_accessibility_is_accepted_when_the_learner_asked_to_be_remembered():
+def test_an_accessibility_candidate_without_a_consent_statement_is_refused():
+    """A generic yes elsewhere in the request is not consent for this fact."""
+    with pytest.raises(CandidateRejected, match="requires 'consent_statement'"):
+        _propose(
+            category="accessibility",
+            statement="Needs captions on any audio material.",
+            evidence_summary="Asked for this to be remembered.",
+            confirmation_state="learner_confirmed",
+        )
+
+
+def test_accessibility_is_accepted_when_confirmed_and_consented():
     candidate = _propose(
         category="accessibility",
         statement="Needs captions on any audio material.",
         evidence_summary="Asked for this to be remembered for future sessions.",
-        learner_permitted_accessibility=True,
+        confirmation_state="learner_confirmed",
+        consent_statement="yes, please remember I need captions",
     )
 
     assert candidate.category.value == "accessibility"
+    assert candidate.consent_reference == "yes, please remember I need captions"
+
+
+def test_a_sensitive_statement_cannot_be_relabelled_to_slip_past_the_scan():
+    """The structural gate, not the regex, is what enforces the boundary."""
+    with pytest.raises(CandidateRejected, match="sensitive health, disability"):
+        _propose(
+            category="durable_preference",
+            statement="Requires extra time because of their diagnosis.",
+            evidence_summary="Came up in conversation.",
+        )
 
 
 def test_a_privacy_refusal_can_be_recorded_as_a_narrow_preference():
@@ -235,7 +283,7 @@ def test_a_privacy_refusal_can_be_recorded_as_a_narrow_preference():
 
 def test_an_accepted_candidate_is_stored_and_returned(hermes_home: Path):
     result = service.save_context(
-        learner_key=LEARNER,
+        principal=LEARNER,
         memory_candidates=[
             {
                 "category": "durable_preference",
@@ -250,13 +298,13 @@ def test_an_accepted_candidate_is_stored_and_returned(hermes_home: Path):
     assert len(accepted) == 1
     assert accepted[0]["statement"] == "Prefers worked examples first."
 
-    stored = service.get_context(learner_key=LEARNER, include_memory_candidates=True)
+    stored = service.get_context(principal=LEARNER, include_memory_candidates=True)
     assert len(stored["memory_candidates"]) == 1
 
 
 def test_a_rejected_candidate_is_reported_with_its_reason_not_stored(hermes_home: Path):
     result = service.save_context(
-        learner_key=LEARNER,
+        principal=LEARNER,
         memory_candidates=[
             {
                 "category": "durable_preference",
@@ -271,13 +319,13 @@ def test_a_rejected_candidate_is_reported_with_its_reason_not_stored(hermes_home
     assert len(rejected) == 1
     assert "not a durable fact" in rejected[0]["reason"]
 
-    stored = service.get_context(learner_key=LEARNER, include_memory_candidates=True)
+    stored = service.get_context(principal=LEARNER, include_memory_candidates=True)
     assert stored["memory_candidates"] == []
 
 
 def test_one_bad_candidate_does_not_discard_the_good_ones(hermes_home: Path):
     result = service.save_context(
-        learner_key=LEARNER,
+        principal=LEARNER,
         memory_candidates=[
             {
                 "category": "durable_preference",
@@ -301,7 +349,7 @@ def test_one_bad_candidate_does_not_discard_the_good_ones(hermes_home: Path):
 
 def test_the_response_never_claims_hermes_memory_was_updated(hermes_home: Path):
     result = service.save_context(
-        learner_key=LEARNER,
+        principal=LEARNER,
         memory_candidates=[
             {
                 "category": "durable_preference",
@@ -316,61 +364,86 @@ def test_the_response_never_claims_hermes_memory_was_updated(hermes_home: Path):
     assert "does not read or write Hermes memory" in result["note"]
 
 
-def test_accessibility_needs_are_not_persisted_durably_by_default(hermes_home: Path):
-    created = service.save_context(learner_key=LEARNER, track={"name": "T", "confirmed": True})
-    track_id = created["outcome"]["track"]["track_id"]
+def test_accessibility_needs_are_never_written_to_storage_without_consent(hermes_home: Path):
+    """Session-only means absent from SQLite, not merely short-lived in it.
+
+    A row with a 72-hour TTL is a record. The whole point of "session-only"
+    is that no record exists.
+    """
+    from learning_studio import storage
 
     result = service.save_context(
-        learner_key=LEARNER,
-        corrections=[
-            {
-                "field": "accessibility_needs",
-                "value": ["captions on all audio"],
-                "track_id": track_id,
-                "durable": True,
-            }
-        ],
+        principal=LEARNER,
+        temporary_context={"accessibility_needs": ["ADHD accommodations"]},
     )
 
-    correction = result["outcome"]["corrections"][0]
-    assert correction["change"] == "session_only"
-    assert "explicitly asks" in correction["reason"]
+    with storage.connect() as conn:
+        values = conn.execute(
+            "SELECT COUNT(*) AS n FROM context_values WHERE field = 'accessibility_needs'"
+        ).fetchone()["n"]
+        revisions = conn.execute(
+            "SELECT COUNT(*) AS n FROM context_revisions WHERE field = 'accessibility_needs'"
+        ).fetchone()["n"]
 
-    confirmed = service.get_context(learner_key=LEARNER, track_id=track_id)["confirmed_context"]
-    assert "accessibility_needs" not in confirmed
+    assert values == 0, "an accessibility value was written to SQLite without consent"
+    assert revisions == 0, "an accessibility revision was written to SQLite without consent"
+    assert any(item["field"] == "accessibility_needs" for item in result["outcome"]["not_stored"])
 
 
-def test_accessibility_needs_are_still_honoured_for_the_session(hermes_home: Path):
-    """Refusing to store a need must not mean ignoring it."""
+def test_the_response_says_the_need_was_not_stored(hermes_home: Path):
+    """The agent must not believe it can read this back later."""
+    result = service.save_context(
+        principal=LEARNER, temporary_context={"accessibility_needs": ["captions on all audio"]}
+    )
+
+    reason = result["outcome"]["not_stored"][0]["reason"]
+    assert "NOT stored" in reason
+    assert "current_request" in reason
+
+
+def test_an_unstored_need_is_absent_from_a_later_read(hermes_home: Path):
     service.save_context(
-        learner_key=LEARNER,
-        temporary_context={"accessibility_needs": ["captions on all audio"]},
+        principal=LEARNER, temporary_context={"accessibility_needs": ["captions on all audio"]}
     )
 
-    result = service.get_context(learner_key=LEARNER)
+    result = service.get_context(principal=LEARNER)
 
+    assert "accessibility_needs" not in result["temporary_context"]
+
+
+def test_an_accessibility_need_is_honoured_through_the_current_request(hermes_home: Path):
+    """Refusing to store a need must not mean ignoring it."""
+    result = service.get_context(
+        principal=LEARNER, current_request={"accessibility_needs": ["captions on all audio"]}
+    )
+
+    resolved = result["resolved_context"]["accessibility_needs"]
+    assert resolved["value"] == ["captions on all audio"]
+    assert resolved["provenance"] == "explicit_request"
+
+
+def test_a_consented_need_is_stored(hermes_home: Path):
+    service.save_context(
+        principal=LEARNER,
+        temporary_context={"accessibility_needs": ["captions on all audio"]},
+        accessibility_consent=CONSENT,
+    )
+
+    result = service.get_context(principal=LEARNER)
     assert result["temporary_context"]["accessibility_needs"]["value"] == ["captions on all audio"]
 
 
-def test_accessibility_needs_persist_when_the_learner_asks(hermes_home: Path):
-    created = service.save_context(learner_key=LEARNER, track={"name": "T", "confirmed": True})
-    track_id = created["outcome"]["track"]["track_id"]
-
-    service.save_context(
-        learner_key=LEARNER,
-        corrections=[
-            {
-                "field": "accessibility_needs",
-                "value": ["captions on all audio"],
-                "track_id": track_id,
-                "durable": True,
-            }
-        ],
-        remember_accessibility_needs=True,
+def test_consent_for_one_need_does_not_store_a_different_one(hermes_home: Path):
+    """Permission is per-fact. A blanket yes was the defect being fixed."""
+    result = service.save_context(
+        principal=LEARNER,
+        temporary_context={"accessibility_needs": ["a screen reader"]},
+        accessibility_consent=CONSENT,
     )
 
-    confirmed = service.get_context(learner_key=LEARNER, track_id=track_id)["confirmed_context"]
-    assert confirmed["accessibility_needs"]["value"] == ["captions on all audio"]
+    assert any(item["field"] == "accessibility_needs" for item in result["outcome"]["not_stored"])
+    stored = service.get_context(principal=LEARNER)["temporary_context"]
+    assert "accessibility_needs" not in stored
 
 
 def test_an_operator_may_block_durable_accessibility_entirely(hermes_home: Path):
@@ -378,44 +451,32 @@ def test_an_operator_may_block_durable_accessibility_entirely(hermes_home: Path)
     config = LearningStudioConfig.from_mapping(
         {"learning_studio": {"allow_durable_accessibility_needs": False}}
     )
-    created = service.save_context(
-        learner_key=LEARNER, track={"name": "T", "confirmed": True}, config=config
-    )
-    track_id = created["outcome"]["track"]["track_id"]
 
-    result = service.save_context(
-        learner_key=LEARNER,
-        corrections=[
-            {
-                "field": "accessibility_needs",
-                "value": ["captions"],
-                "track_id": track_id,
-                "durable": True,
-            }
-        ],
-        remember_accessibility_needs=True,
-        config=config,
-    )
-
-    assert result["outcome"]["corrections"][0]["change"] == "session_only"
+    with pytest.raises(service.ConsentError, match="configured never to store"):
+        service.save_context(
+            principal=LEARNER,
+            temporary_context={"accessibility_needs": ["captions on all audio"]},
+            accessibility_consent=CONSENT,
+            config=config,
+        )
 
 
 def test_accessibility_is_dropped_from_a_bulk_track_context_write(hermes_home: Path):
     """The consent gate cannot be bypassed by bundling it with other fields."""
     result = service.save_context(
-        learner_key=LEARNER,
+        principal=LEARNER,
         track={
             "name": "T",
             "confirmed": True,
-            "context": {"goal": "stored", "accessibility_needs": ["not stored"]},
+            "context": {"goal": "stored", "accessibility_needs": ["not consented"]},
         },
     )
 
     track_id = result["outcome"]["track"]["track_id"]
-    confirmed = service.get_context(learner_key=LEARNER, track_id=track_id)["confirmed_context"]
+    confirmed = service.get_context(principal=LEARNER, track_id=track_id)["confirmed_context"]
     assert "goal" in confirmed
     assert "accessibility_needs" not in confirmed
-    assert any("session_only_field" in r for r in result["outcome"]["rejected"])
+    assert any(item["field"] == "accessibility_needs" for item in result["outcome"]["not_stored"])
 
 
 def test_the_evidence_threshold_follows_configuration(hermes_home: Path):
@@ -424,7 +485,7 @@ def test_the_evidence_threshold_follows_configuration(hermes_home: Path):
     )
 
     result = service.save_context(
-        learner_key=LEARNER,
+        principal=LEARNER,
         memory_candidates=[
             {
                 "category": "durable_preference",

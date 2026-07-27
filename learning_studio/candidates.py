@@ -55,6 +55,26 @@ class Origin(StrEnum):
     EXPLICIT_WITHDRAWAL = "explicit_withdrawal"
 
 
+#: Categories carrying information about someone's health, disability, or
+#: accommodations. These are gated structurally — by origin and by consent
+#: bound to the specific statement — and not merely by a text scan. A caller
+#: who rewords an inferred diagnosis to slip past a regex still cannot get it
+#: through, because the *origin* and the *confirmation state* are what decide.
+SENSITIVE_CATEGORIES: frozenset[Category] = frozenset({Category.ACCESSIBILITY})
+
+#: The only origins a sensitive candidate may have. Notably absent:
+#: ``repeated_evidence``. A pattern across exercises is an observation about
+#: performance; it is never grounds to record that someone *has* a condition.
+#: Only the learner can state that about themselves.
+SENSITIVE_ORIGINS: frozenset[Origin] = frozenset(
+    {
+        Origin.EXPLICIT_DURABLE_PREFERENCE,
+        Origin.EXPLICIT_CORRECTION,
+        Origin.EXPLICIT_WITHDRAWAL,
+    }
+)
+
+
 #: Origins a caller might reach for that must never yield a candidate. Named
 #: explicitly so the refusal is a documented rule with a reason attached,
 #: rather than an unexplained validation failure.
@@ -178,8 +198,17 @@ _SENSITIVE_TRAIT_RE = re.compile(
 )
 
 
-def _scan(text: str, label: str) -> None:
+def _scan(text: str, label: str, *, sensitive_allowed: bool = False) -> None:
+    """Reject material that must never reach a durable proposal.
+
+    ``sensitive_allowed`` relaxes only the *inferred-trait* pattern, and only
+    for a candidate that has already passed the structural consent gates in
+    :func:`_check_sensitive`. Everything else — credentials, tokens, raw
+    answers, transcripts — is refused unconditionally.
+    """
     for name, pattern, why in _FORBIDDEN_CONTENT:
+        if sensitive_allowed and name == "inferred_sensitive_trait":
+            continue
         if pattern.search(text):
             raise CandidateRejected(f"{label} rejected ({name}): {why}")
 
@@ -198,6 +227,10 @@ class MemoryCandidate:
     origin: Origin
     replaces: str | None = None
     track_id: str | None = None
+    evidence_count: int | None = None
+    #: For a sensitive candidate, what the learner actually consented to —
+    #: recorded so a later reader can tell consent from assumption.
+    consent_reference: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -209,8 +242,10 @@ class MemoryCandidate:
             "confirmation_state": self.confirmation_state.value,
             "recommended_action": self.recommended_action.value,
             "origin": self.origin.value,
+            "evidence_count": self.evidence_count,
             "replaces": self.replaces,
             "track_id": self.track_id,
+            "consent_reference": self.consent_reference,
         }
 
 
@@ -236,7 +271,7 @@ def propose(
     track_id: str | None = None,
     evidence_count: int = 1,
     min_evidence: int = 3,
-    learner_permitted_accessibility: bool = False,
+    consent_statement: Any = None,
 ) -> MemoryCandidate:
     """Validate a proposed candidate, or refuse it with a reason.
 
@@ -244,6 +279,13 @@ def propose(
     where it is checked against ``min_evidence`` — the point of that origin is
     that a pattern has recurred often enough to be worth *asking* the learner
     about, and a single observation has not.
+
+    ``consent_statement`` is the learner's own words about the *specific*
+    fact being proposed, and is required for anything in
+    :data:`SENSITIVE_CATEGORIES`. It replaced an earlier boolean flag, which
+    was the wrong shape: one ``True`` was accepted as blanket permission for
+    any sensitive statement the caller cared to attach to the same request.
+    Consent is per-fact or it is not consent.
     """
     if isinstance(origin, str) and origin in FORBIDDEN_ORIGINS:
         raise CandidateRejected(f"no memory candidate from '{origin}': {FORBIDDEN_ORIGINS[origin]}")
@@ -278,10 +320,20 @@ def propose(
             f"got {evidence_count}; keep it in temporary context until the pattern holds"
         )
 
-    for label, text in (("statement", statement), ("evidence_summary", evidence_summary)):
-        _scan(text, label)
+    consent_reference = _check_sensitive(
+        category=category,
+        origin=origin,
+        confirmation_state=confirmation_state,
+        statement=statement,
+        evidence=evidence_summary,
+        consent_statement=consent_statement,
+    )
 
-    _check_sensitive(category, statement, evidence_summary, learner_permitted_accessibility)
+    # Text scanning runs last and is defence in depth only. The structural
+    # gates above are what actually enforce the boundary; a regex can always
+    # be worded around, an origin cannot.
+    for label, text in (("statement", statement), ("evidence_summary", evidence_summary)):
+        _scan(text, label, sensitive_allowed=category in SENSITIVE_CATEGORIES)
 
     return MemoryCandidate(
         category=category,
@@ -294,32 +346,72 @@ def propose(
         origin=origin,
         replaces=replaces,
         track_id=track_id,
+        evidence_count=evidence_count if origin is Origin.REPEATED_EVIDENCE else None,
+        consent_reference=consent_reference,
     )
 
 
 def _check_sensitive(
-    category: Category, statement: str, evidence: str, learner_permitted: bool
-) -> None:
+    *,
+    category: Category,
+    origin: Origin,
+    confirmation_state: ConfirmationState,
+    statement: str,
+    evidence: str,
+    consent_statement: Any,
+) -> str | None:
     """Gate disability, diagnosis, and accessibility material on real consent.
 
-    Accessibility needs are honoured fully for the session either way; this
-    only governs whether they may become a durable proposal. A dedicated
-    profile is not consent, and neither is the agent's confidence.
+    Four independent conditions must all hold before such a fact may be
+    proposed, and each blocks a different way of getting it wrong:
+
+    1. **Category.** Sensitive material may only travel as an accessibility
+       candidate — it cannot be smuggled in as a "preference".
+    2. **Origin.** It must come from the learner saying so. Repeated
+       evidence, performance patterns, timings, and scores are observations
+       about work, never grounds to record that someone *has* a condition.
+    3. **Confirmation.** ``learner_confirmed`` only. An unconfirmed guess
+       about someone's health is the exact thing that must never become
+       durable.
+    4. **Consent, bound to this fact.** The learner's own words about *this*
+       statement, so permission for one thing is not permission for another.
+
+    Accessibility needs are honoured in full for the session regardless; this
+    governs only whether they may become a durable proposal.
     """
     combined = f"{statement}\n{evidence}"
     mentions_sensitive = bool(_SENSITIVE_TRAIT_RE.search(combined))
 
-    if category is Category.ACCESSIBILITY:
-        if not learner_permitted:
+    if category not in SENSITIVE_CATEGORIES:
+        if mentions_sensitive:
             raise CandidateRejected(
-                "accessibility needs stay session-only unless the learner explicitly asked "
-                "for them to be remembered; honour the need now and do not persist it"
+                "sensitive health, disability, or diagnosis material cannot be proposed under "
+                f"category '{category.value}'; only an accessibility candidate the learner "
+                "explicitly asked to be remembered may carry it"
             )
-        return
+        return None
 
-    if mentions_sensitive:
+    if origin not in SENSITIVE_ORIGINS:
+        allowed = ", ".join(sorted(o.value for o in SENSITIVE_ORIGINS))
         raise CandidateRejected(
-            "sensitive health, disability, or diagnosis material cannot be proposed under "
-            f"category '{category.value}'; only an accessibility candidate the learner "
-            "explicitly asked to be remembered may carry it"
+            f"an accessibility candidate cannot come from '{origin.value}'. A pattern across "
+            "exercises is an observation about performance, not evidence that someone has a "
+            f"condition — only the learner can state that. Allowed origins: {allowed}"
         )
+
+    if confirmation_state is not ConfirmationState.LEARNER_CONFIRMED:
+        raise CandidateRejected(
+            "an accessibility candidate must be 'learner_confirmed'. Confirm the fact with "
+            "the learner in their own words before proposing it; an unconfirmed inference "
+            "about someone's health must never become durable"
+        )
+
+    try:
+        reference = clean_text(consent_statement, "consent_statement", MAX_VALUE_CHARS)
+    except ValueError as exc:
+        raise CandidateRejected(
+            "an accessibility candidate requires 'consent_statement' recording what the "
+            f"learner actually agreed to remember about this specific fact ({exc})"
+        ) from exc
+
+    return reference

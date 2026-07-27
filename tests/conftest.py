@@ -75,3 +75,47 @@ def hermes_home(tmp_path: Path, monkeypatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     return home
+
+
+@pytest.fixture
+def principal():
+    """A trusted principal, as Hermes' session context would supply one.
+
+    Identity is never a tool argument, so tests construct it the way the
+    host does rather than passing a learner key around.
+    """
+    from learning_studio.identity import Principal
+
+    return Principal(
+        profile="default", platform="telegram", user_id="1001", source="gateway_session"
+    )
+
+
+@pytest.fixture
+def other_principal():
+    """A second authenticated learner in the same profile."""
+    from learning_studio.identity import Principal
+
+    return Principal(
+        profile="default", platform="telegram", user_id="2002", source="gateway_session"
+    )
+
+
+@pytest.fixture
+def gateway_session(monkeypatch):
+    """Bind Hermes session vars the way a platform adapter does.
+
+    Yields a setter so a test can switch which authenticated user is
+    speaking, which is the only supported way to change learner identity.
+    """
+    import os
+
+    def bind(platform: str = "telegram", user_id: str = "1001", chat_id: str = "chat-1") -> None:
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", platform)
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", user_id)
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", chat_id)
+
+    bind()
+    yield bind
+    for name in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_USER_ID", "HERMES_SESSION_CHAT_ID"):
+        os.environ.pop(name, None)

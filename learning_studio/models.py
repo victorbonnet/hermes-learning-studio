@@ -137,38 +137,10 @@ class ChangeReason(StrEnum):
 
 MAX_VALUE_CHARS = 2000
 MAX_NAME_CHARS = 120
-MAX_LEARNER_KEY_CHARS = 256
 #: Objectives are one sentence each — behaviour, condition, standard.
 OBJECTIVE_TEXT_MAX = 500
 
-#: Learner keys are opaque identifiers supplied by the caller. Printable,
-#: bounded, no control characters — enough to accept a platform user id or a
-#: UUID while rejecting a pasted transcript or a newline-injection attempt.
-_LEARNER_KEY_RE = re.compile(r"^[\w.:@+\-]{1,256}$")
-
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-
-
-def validate_learner_key(raw: Any) -> str:
-    """Validate a caller-supplied learner identity.
-
-    Rejects ambiguity rather than normalising it: a blank or whitespace-only
-    key would otherwise collapse several learners into one record, which is
-    the isolation failure this whole module exists to prevent.
-    """
-    if not isinstance(raw, str):
-        raise ValueError("learner_key must be a string")
-    key = raw.strip()
-    if not key:
-        raise ValueError("learner_key must not be empty")
-    if len(key) > MAX_LEARNER_KEY_CHARS:
-        raise ValueError(f"learner_key must be at most {MAX_LEARNER_KEY_CHARS} characters")
-    if not _LEARNER_KEY_RE.match(key):
-        raise ValueError(
-            "learner_key must be an opaque stable identifier "
-            "(letters, digits, and . : @ + _ - only)"
-        )
-    return key
 
 
 def clean_text(raw: Any, label: str, max_chars: int) -> str:

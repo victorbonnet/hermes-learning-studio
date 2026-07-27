@@ -187,11 +187,20 @@ not-yours return the same message, because distinguishing them would turn a
 track ID into an oracle for whether another learner exists. Adversarial tests
 try exactly that, with valid IDs belonging to someone else.
 
-**Learner identities are never stored.** The caller's `learner_key` is
-converted to a salted HMAC digest with a per-database salt; the raw key never
-reaches disk. Someone who obtains the database file learns that *some*
-learners exist, not who they are. All primary keys are opaque generated
-tokens, so nothing keys on a label a learner can change.
+**Learner identifiers are not stored in the clear.** The principal is
+converted to a salted HMAC digest with a per-database salt, so the platform ID
+stays out of logs, backups, and a glance at the file, and precomputed tables
+are useless against it.
+
+This is *not* a claim that identity is unrecoverable. The salt lives in the
+same database as the digests, so anyone holding the file can brute-force the
+low-entropy space of platform user IDs offline. Resisting that needs a pepper
+stored separately, with its own lifecycle and rotation story, and this plugin
+does not mint secrets on a user's behalf. The digest is a lookup key; it is
+never an authorisation check.
+
+All primary keys are opaque generated tokens, so nothing keys on a label a
+learner can change.
 
 **Migrations are all-or-nothing, and never destructive.** Each migration runs
 in its own transaction and rolls back completely on failure, because a
@@ -280,10 +289,9 @@ shared between them.
 
 ## Tools
 
-Two tools, both in the `plugin_learning_studio` toolset. Both are scoped to a
-caller-supplied `learner_key` — an opaque, stable identifier such as a
-platform user ID, never a display name — so several people sharing one Hermes
-profile stay separate.
+Two tools, both in the `plugin_learning_studio` toolset. Neither takes a
+learner argument: identity is resolved from the Hermes session, so a call
+always reads and writes the context of whoever sent the current message.
 
 ### `learning_studio_get_context`
 
@@ -310,6 +318,40 @@ refused and why.
 means no durable track is created — the context is kept as temporary instead.
 Repetition, agent confidence, and prior sessions are not confirmation, and no
 code path treats them as such.
+
+`outcome.not_stored` lists anything deliberately dropped, with a reason.
+
+## Identity
+
+The tools take no `learner_key`, `user_id`, or any other argument naming a
+person, and a request containing one is refused. Identity comes from Hermes'
+own session context:
+
+```python
+from gateway.session_context import get_session_env
+
+get_session_env("HERMES_SESSION_PLATFORM")  # e.g. "telegram"
+get_session_env("HERMES_SESSION_USER_ID")  # the platform's sender ID
+```
+
+The gateway binds those from the platform payload — for Telegram, the
+message's `from.id` — before the agent runs, in a `contextvars.ContextVar`
+that model output cannot reach. Hermes core trusts the same mechanism for
+approval decisions.
+
+The learner scope is `(profile, platform, sender ID)`, so the same numeric ID
+on two platforms is two people, and one person keeps one record across their
+DM and a group chat.
+
+**Anonymous multi-user sessions are refused.** If a gateway session is active
+but carries no sender ID, the tools store nothing and say why, rather than
+pooling strangers into a shared record. With no gateway at all — CLI, cron —
+the profile is the principal, which is Hermes' own single-operator model.
+
+A tool argument cannot override any of this, because there is no such
+argument. That is the point: the previous design accepted a caller-supplied
+`learner_key`, which meant anyone who could persuade the agent to pass a
+guessed platform ID could read that person's record.
 
 ## Learning context
 
@@ -359,8 +401,14 @@ score, raw attempts, or session state — and it may never carry raw answers,
 transcripts, session identifiers, tokens, credentials, or an inferred
 disability or diagnosis.
 
-Accessibility needs are **session-only by default**: honoured in full for the
-session, stored durably only when the learner explicitly asks.
+Accessibility needs are **session-only by default**, and session-only means
+absent from the database rather than merely short-lived in it. Send them in
+`current_request` to have them applied without being stored. Storing one
+requires `accessibility_consent` naming that exact need and quoting what the
+learner said — consent for one need is not consent for another, and a
+sensitive candidate additionally requires `confirmation_state:
+learner_confirmed` and an origin that is the learner stating it. Repeated
+evidence can never produce a diagnosis or disability candidate.
 
 ## Roadmap
 

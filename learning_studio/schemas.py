@@ -33,18 +33,6 @@ SAVE_TOOL_NAME = "learning_studio_save_context"
 
 _MAX_ITEMS = 25
 
-_LEARNER_KEY = {
-    "type": "string",
-    "minLength": 1,
-    "maxLength": 256,
-    "description": (
-        "Opaque, stable identifier for this learner within the current Hermes profile "
-        "(for example a platform user ID). Must not be a display name, username, or any "
-        "other label the learner can change. One profile may serve several people, so "
-        "this is what separates them."
-    ),
-}
-
 _TRACK_ID = {
     "type": "string",
     "minLength": 1,
@@ -80,18 +68,17 @@ def context_object(description: str) -> dict[str, Any]:
 GET_CONTEXT_SCHEMA: dict[str, Any] = {
     "name": GET_TOOL_NAME,
     "description": (
-        "Retrieve what is known about a learner: their temporary (unconfirmed) context, "
-        "the durable context of a confirmed learning track, and a resolved view that "
-        "applies the precedence rules with provenance for every value. Returns only this "
-        "learner's data, within the active Hermes profile. Call this before planning a "
-        "session so you do not re-ask what the learner already told you."
+        "Retrieve what is known about the person you are talking to: their temporary "
+        "(unconfirmed) context, the durable context of a confirmed learning track, and a "
+        "resolved view applying the precedence rules with provenance for every value. "
+        "Call this before planning a session so you do not re-ask what they already told "
+        "you. The learner is identified from the Hermes session, not from any argument - "
+        "there is deliberately no way to ask about a different person."
     ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["learner_key"],
         "properties": {
-            "learner_key": _LEARNER_KEY,
             "track_id": _TRACK_ID,
             "track_name": {
                 "type": "string",
@@ -178,8 +165,8 @@ _TRACK = {
             ),
         },
         "context": context_object(
-            "Durable context for this track. Accessibility needs are not accepted here; "
-            "they stay session-only unless the learner explicitly asks otherwise."
+            "Durable context for this track. Accessibility needs are dropped unless the "
+            "same call carries accessibility_consent naming that specific need."
         ),
     },
 }
@@ -281,21 +268,50 @@ _MEMORY_CANDIDATE = {
     },
 }
 
+_ACCESSIBILITY_CONSENT = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["consent_statement", "needs"],
+    "description": (
+        "Send this ONLY when the learner has explicitly asked you to remember a specific "
+        "accessibility need. Without it, accessibility needs are honoured for the current "
+        "request and never written to storage. Never infer it, and never reuse consent "
+        "given for one need to store a different one."
+    ),
+    "properties": {
+        "consent_statement": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_VALUE_CHARS,
+            "description": "What the learner actually said when agreeing, in their words.",
+        },
+        "needs": {
+            "type": "array",
+            "maxItems": MAX_LIST_ITEMS,
+            "items": {"type": "string", "minLength": 1, "maxLength": MAX_VALUE_CHARS},
+            "description": (
+                "The exact needs they agreed to have remembered. Only values listed here "
+                "may be stored; anything else is dropped."
+            ),
+        },
+    },
+}
+
+
 SAVE_CONTEXT_SCHEMA: dict[str, Any] = {
     "name": SAVE_TOOL_NAME,
     "description": (
-        "Save what you have learned about a learner. Temporary context is kept as "
-        "unconfirmed conversational evidence and expires; an ongoing track is durable and "
-        "requires explicit learner confirmation. Also validates memory candidates — "
-        "proposals for you to weigh. This tool never reads or writes Hermes memory, and "
-        "the response always says so."
+        "Save what you have learned about the person you are talking to. Temporary "
+        "context is kept as unconfirmed conversational evidence and expires; an ongoing "
+        "track is durable and requires explicit learner confirmation. Also validates "
+        "memory candidates — proposals for you to weigh. The learner is identified from "
+        "the Hermes session, not from any argument. This tool never reads or writes "
+        "Hermes memory, and the response always says so."
     ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["learner_key"],
         "properties": {
-            "learner_key": _LEARNER_KEY,
             "temporary_context": context_object(
                 "What the learner has said this session. Stored as unconfirmed temporary "
                 "context that expires; it never becomes a track on its own."
@@ -321,14 +337,7 @@ SAVE_CONTEXT_SCHEMA: dict[str, Any] = {
                 "maxItems": _MAX_ITEMS,
                 "items": _MEMORY_CANDIDATE,
             },
-            "remember_accessibility_needs": {
-                "type": "boolean",
-                "description": (
-                    "Set only when the learner has explicitly asked you to remember an "
-                    "accessibility need. Otherwise such needs are honoured for this "
-                    "session and never stored. Never infer this."
-                ),
-            },
+            "accessibility_consent": _ACCESSIBILITY_CONSENT,
         },
     },
 }

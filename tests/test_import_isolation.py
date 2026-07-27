@@ -121,9 +121,7 @@ def test_the_tools_run_without_optional_deps(without_optional_deps, tmp_path, mo
     module.register(ctx)
     handler = next(t.handler for t in ctx.tools if t.name == "learning_studio_save_context")
 
-    result = json.loads(
-        handler({"learner_key": "user-8008", "temporary_context": {"subject": "anything"}})
-    )
+    result = json.loads(handler({"temporary_context": {"subject": "anything"}}))
 
     assert result["ok"] is True
 

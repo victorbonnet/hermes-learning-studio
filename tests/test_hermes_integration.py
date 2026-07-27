@@ -26,6 +26,46 @@ import pytest
 HERMES_SRC_ENV = "HERMES_AGENT_SRC"
 
 
+@pytest.fixture(autouse=True)
+def _restore_process_state():
+    """Undo everything importing Hermes does to this process.
+
+    These tests deliberately put a Hermes checkout on ``sys.path`` and import
+    real host modules. Left in place, those imports change the behaviour of
+    every later test in the session: ``learning_studio.paths`` starts
+    resolving through the real ``hermes_constants``, host code scaffolds
+    profile files such as ``SOUL.md`` into the temporary home, and the
+    filesystem-isolation test then fails for a reason that has nothing to do
+    with this plugin.
+
+    The isolation assertion is right and stays as it is; the pollution is the
+    bug. So the snapshot below is thorough on purpose: module table, import
+    path, and the host's own tool registry.
+    """
+    saved_modules = dict(sys.modules)
+    saved_path = list(sys.path)
+
+    yield
+
+    for name in [n for n in sys.modules if n not in saved_modules]:
+        del sys.modules[name]
+    sys.modules.update(saved_modules)
+    sys.path[:] = saved_path
+
+    # The real registry is a process-global singleton; tools registered by a
+    # test would otherwise still be there for the next one.
+    registry = saved_modules.get("tools.registry")
+    if registry is not None:  # pragma: no cover - only when the host was loaded
+        try:
+            from learning_studio import TOOLSET_NAME
+
+            for name, entry in list(registry.registry._tools.items()):
+                if entry.toolset == TOOLSET_NAME:
+                    del registry.registry._tools[name]
+        except Exception:
+            pass
+
+
 def _hermes_src() -> Path:
     raw = os.environ.get(HERMES_SRC_ENV)
     if not raw:
@@ -69,6 +109,33 @@ def _load_module(name: str, path: Path, src: Path):
         del sys.modules[name]
         raise
     return module
+
+
+def _load_session_context(src: Path):
+    """Import ``gateway.session_context`` under its real dotted name.
+
+    It has to be the real name, not an alias: ``learning_studio.identity``
+    does ``from gateway.session_context import get_session_env``, so a copy
+    loaded under another name would hold different ContextVars and the test
+    would bind identity somewhere the plugin never looks.
+
+    A synthetic parent package is installed first so importing the submodule
+    does not execute ``gateway/__init__.py``, which pulls in third-party
+    dependencies a bare checkout does not have.
+    """
+    import types
+
+    if "gateway.session_context" in sys.modules:
+        return sys.modules["gateway.session_context"]
+
+    if "gateway" not in sys.modules:
+        parent = types.ModuleType("gateway")
+        parent.__path__ = [str(src / "gateway")]
+        sys.modules["gateway"] = parent
+
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    return importlib.import_module("gateway.session_context")
 
 
 @pytest.fixture
@@ -237,7 +304,8 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
 
     The fake context mirrors the host, but only the host proves the plugin
     actually loads. This drives the real ``PluginContext`` and the real tool
-    registry, in an isolated HERMES_HOME.
+    registry, in an isolated HERMES_HOME, with identity supplied the way the
+    gateway supplies it.
     """
     import json
 
@@ -269,23 +337,75 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
         "learning_studio_save_context",
     ]
 
-    saved = json.loads(
-        registry.dispatch(
-            "learning_studio_save_context",
-            {
-                "learner_key": "user-live-1",
-                "track": {"name": "Live track", "confirmed": True, "context": {"goal": "g"}},
-            },
-        )
-    )
-    assert saved["ok"] is True
-    assert saved["outcome"]["track"]["status"] == "created"
-    assert saved["hermes_memory_updated"] is False
+    session_context = _load_session_context(src)
 
-    fetched = json.loads(
-        registry.dispatch("learning_studio_get_context", {"learner_key": "user-live-1"})
-    )
-    assert fetched["confirmed_context"]["goal"]["value"] == "g"
+    def as_user(user_id: str):
+        """Bind a platform identity exactly as the gateway does per message."""
+        return session_context.set_session_vars(
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id=user_id,
+            user_name="ignored-label",
+            session_key=f"telegram:{user_id}",
+        )
+
+    # ── First authenticated learner ──────────────────────────────────────
+    tokens = as_user("111111")
+    try:
+        saved = json.loads(
+            registry.dispatch(
+                "learning_studio_save_context",
+                {"track": {"name": "Live track", "confirmed": True, "context": {"goal": "g"}}},
+            )
+        )
+        assert saved["ok"] is True, saved
+        assert saved["outcome"]["track"]["status"] == "created"
+        assert saved["hermes_memory_updated"] is False
+
+        fetched = json.loads(registry.dispatch("learning_studio_get_context", {}))
+        assert fetched["confirmed_context"]["goal"]["value"] == "g"
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    # ── Second authenticated learner, same profile ───────────────────────
+    tokens = as_user("222222")
+    try:
+        other = json.loads(registry.dispatch("learning_studio_get_context", {}))
+        assert other["tracks"] == [], "a second principal saw the first principal's track"
+
+        # And cannot reach it by naming the first learner in arguments.
+        impersonation = json.loads(
+            registry.dispatch("learning_studio_get_context", {"learner_key": "111111"})
+        )
+        assert impersonation["ok"] is False
+    finally:
+        session_context.clear_session_vars(tokens)
 
     db = tmp_path / "live-profile" / "workspace" / "learning-studio" / "learning-studio.sqlite3"
     assert db.is_file(), "the real run did not write to the profile-scoped storage root"
+
+
+def test_the_session_user_id_is_a_real_host_supplied_value():
+    """The identity this plugin trusts must come from the platform payload.
+
+    If Hermes ever stopped binding ``user_id`` from the message source, this
+    plugin's isolation guarantee would quietly become a guess.
+    """
+    src = _hermes_src()
+    run_source = (src / "gateway" / "run.py").read_text(encoding="utf-8")
+
+    assert "user_id=str(context.source.user_id)" in run_source, (
+        "the gateway no longer binds user_id from the message source — "
+        "learning_studio.identity must be re-verified"
+    )
+
+
+def test_session_context_exposes_the_variables_identity_depends_on():
+    src = _hermes_src()
+    session_context = _load_session_context(src)
+
+    assert hasattr(session_context, "get_session_env")
+    assert hasattr(session_context, "session_context_engaged")
+    for name in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_USER_ID"):
+        assert name in session_context._VAR_MAP, f"{name} is no longer a session variable"
