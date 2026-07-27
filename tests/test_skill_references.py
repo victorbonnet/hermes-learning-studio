@@ -1,9 +1,11 @@
 """The skill must be one skill with a discoverable, well-formed reference set.
 
-Hermes exposes references through ``skill_view(name, path)`` — level 2 of its
-progressive-disclosure model. That only works if the paths written in SKILL.md
-resolve relative to the skill directory, so the tests here treat the links as
-an API surface rather than as prose.
+The agent reaches a reference by joining the substituted ``${HERMES_SKILL_DIR}``
+to a path written in SKILL.md and calling ``read_file`` — *not* through
+``skill_view``, whose ``file_path`` is silently ignored for plugin-namespaced
+skills (see ``tests/test_hermes_integration.py``). Every advertised path
+therefore has to resolve relative to the skill directory, so the tests here
+treat the links as an API surface rather than as prose.
 """
 
 from __future__ import annotations
@@ -75,7 +77,7 @@ def reference_links(skill_md: str) -> list[str]:
 
 def test_references_directory_exists(skill_dir: Path):
     assert (skill_dir / "references").is_dir(), (
-        "the skill must ship a references/ directory for skill_view(name, path)"
+        "the skill must ship a references/ directory under ${HERMES_SKILL_DIR}"
     )
 
 
@@ -95,7 +97,7 @@ def test_reference_is_not_a_stub(references: dict[str, str], name: str):
 
 
 def test_every_linked_reference_resolves(skill_dir: Path, skill_md: str):
-    """A broken path is a dead end: skill_view() has nothing to open."""
+    """A broken path is a dead end: read_file() has nothing to open."""
     for target in reference_links(skill_md):
         assert (skill_dir / target).is_file(), (
             f"SKILL.md links '{target}', which does not exist relative to the skill directory"

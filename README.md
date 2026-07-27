@@ -91,8 +91,8 @@ installable **Python package**, which drives the layout:
 │   └── skills/
 │       └── adaptive-learning/
 │           ├── SKILL.md        # The orchestration workflow
-│           └── references/     # Loaded on demand via skill_view(name, path)
-└── tests/                      # Unit tests against a fake plugin context
+│           └── references/     # Loaded on demand via read_file + HERMES_SKILL_DIR
+└── tests/                      # Unit tests (fake context) + opt-in Hermes integration
 ```
 
 The decisions that shape this foundation:
