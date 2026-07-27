@@ -1147,3 +1147,11 @@ def test_the_failing_tests_identity_did_not_leak():
 
     assert os.environ.get("HERMES_SESSION_USER_ID") is None
     assert resolve_principal().platform == "local"
+
+
+def test_a_first_time_learner_still_gets_the_requested_keys(hermes_home, gateway_session):
+    """Response shape must not depend on whether the learner exists yet."""
+    result = json.loads(tools.handle_get_context({"include_memory_candidates": True}))
+
+    assert result["ok"] is True
+    assert result["memory_candidates"] == []

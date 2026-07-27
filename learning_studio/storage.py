@@ -79,8 +79,10 @@ def database_path() -> Path:
 # - Identifiers are opaque generated tokens. Nothing keys on a username, a
 #   display name, or any other label a learner can change.
 #
-# This branch has never been released, so version 1 is redefined in place
-# rather than shipping a v2 migration for a schema that exists nowhere.
+# Migrations are append-only. Version 1 is frozen as the commit that first
+# created it left it: a database that recorded version 1 will never re-run
+# migration 1, so editing it cannot change what is already on disk — it only
+# makes the recorded version a lie. Schema changes go in a new migration.
 
 _MIGRATION_001 = (
     """
@@ -265,11 +267,7 @@ _MIGRATION_001 = (
                                'add', 'replace', 'remove', 'no_action'
                            )),
         replaces           TEXT,
-        -- The learner's words when agreeing, and the canonical need that
-        -- consent authorised. Both are kept so a later reader can audit why
-        -- a sensitive candidate was allowed to exist at all.
         consent_reference  TEXT,
-        consented_need     TEXT,
         created_at         TEXT NOT NULL,
         updated_at         TEXT NOT NULL,
         FOREIGN KEY (learner_id, profile_id)
@@ -282,9 +280,30 @@ _MIGRATION_001 = (
 )
 
 
+# Version 2 adds the consent binding for sensitive candidates.
+#
+# The deletion comes first, and is the point of the migration rather than
+# housekeeping. Version 1 accepted an accessibility candidate on the strength
+# of *any* consent statement, so a v1 database can hold rows where "remember I
+# need captions" was taken as authorisation to record a diagnosis. Those rows
+# have no verifiable consent scope, and there is no honest way to give them
+# one: parsing ``consent_reference`` would be inventing consent, and matching
+# prose would be guessing about someone's health. Keeping them would carry the
+# defect forward into a schema that promises every sensitive row is bound to a
+# need the learner named.
+#
+# So they are removed. Non-sensitive candidates are untouched and simply get a
+# NULL binding, which is what "this row is not sensitive" means here.
+_MIGRATION_002 = (
+    "DELETE FROM memory_candidates WHERE category = 'accessibility'",
+    "ALTER TABLE memory_candidates ADD COLUMN consented_need TEXT",
+)
+
+
 #: Ordered, contiguous from 1. The list order is the application order.
 MIGRATIONS: list[Migration] = [
     Migration(version=1, statements=_MIGRATION_001),
+    Migration(version=2, statements=_MIGRATION_002),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

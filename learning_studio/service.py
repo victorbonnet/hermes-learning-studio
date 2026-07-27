@@ -678,7 +678,7 @@ def get_context(
             # known learner would have been denied.
             if track_id or track_name:
                 raise NotFoundError(NOT_FOUND_MESSAGE)
-            return _empty_context(principal, request, config)
+            return _empty_context(principal, request, config, include_memory_candidates)
 
         tracks = _list_tracks(conn, profile, learner_id)
         selection = _select_track(conn, profile, learner_id, tracks, track_id, track_name)
@@ -728,8 +728,16 @@ def get_context(
 
 
 def _empty_context(
-    principal: Principal, request: dict[str, Any], config: LearningStudioConfig
+    principal: Principal,
+    request: dict[str, Any],
+    config: LearningStudioConfig,
+    include_memory_candidates: bool = False,
 ) -> dict[str, Any]:
+    """The shape a caller gets on someone's first session.
+
+    Keys must not depend on whether the learner happens to exist yet: a
+    caller that asked for memory candidates gets the key either way, empty.
+    """
     pool = candidates_from_request(request)
     pool += candidates_from_config(config.profile_context, config.defaults)
     resolved = resolve(pool)
@@ -744,6 +752,7 @@ def _empty_context(
         "resolved_context": {field: value.to_json() for field, value in sorted(resolved.items())},
         "objectives": [],
         "precedence": [p.value for p in Provenance],
+        **({"memory_candidates": []} if include_memory_candidates else {}),
     }
 
 
