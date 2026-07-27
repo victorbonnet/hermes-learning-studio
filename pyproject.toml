@@ -45,9 +45,12 @@ Issues = "https://github.com/victorbonnet/hermes-learning-studio/issues"
 learning-studio = "learning_studio"
 
 [project.optional-dependencies]
-# PyYAML is a test-only dependency: it parses plugin.yaml and SKILL.md
-# frontmatter in the suite. The plugin itself never imports it.
-dev = ["pytest>=8.0", "PyYAML>=6.0", "ruff>=0.6"]
+# Test-only dependencies. PyYAML parses plugin.yaml and SKILL.md frontmatter;
+# jsonschema checks the advertised tool schema against a real JSON Schema
+# implementation, so "the schema and the runtime agree" is verified rather
+# than asserted. The plugin itself imports neither, and `dependencies` above
+# stays empty.
+dev = ["pytest>=8.0", "PyYAML>=6.0", "ruff>=0.6", "jsonschema>=4.20"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["learning_studio"]

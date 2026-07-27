@@ -73,6 +73,26 @@ def test_the_new_modules_exist_to_be_scanned():
         ("private key", "-----BEGIN RSA PRIVATE KEY-----"),
         ("aws key", "The key AKIAIOSFODNN7EXAMPLE is used here"),
         ("jwt", "Present eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc"),
+        # Bypasses found in review. Each was accepted by the first version.
+        ("css without a semicolon", "Apply body { color: red } to the page"),
+        ("css shorthand block", "The rule is {margin: 0 auto}"),
+        ("bare hostname", "Visit www.example.invalid/path for more"),
+        ("bare domain and path", "See example.com/reference for the table"),
+        ("mailto uri", "Email mailto:someone@example.invalid with questions"),
+        ("ftp uri", "Fetch ftp:files.example.invalid"),
+        ("file uri", "Open file:notes.txt to continue"),
+        ("relative dot path", "Open ./secret.txt and read the first line"),
+        ("single-segment absolute path", "Open /secret.txt for the answer"),
+        ("home file path", "It is in ~/notes.txt somewhere"),
+        ("unc path", "Copy it from \\\\server\\share"),
+        ("basic authorization", "Send Authorization: Basic dXNlcjpwYXNzd29yZA=="),
+        ("bare basic credential", "Use Basic YWxhZGRpbjpvcGVuc2VzYW1l as the header"),
+        ("project-scoped token", "Use sk-proj-ABCDEFGHIJKLMNOPQRSTUV to connect"),
+        ("github fine-grained token", "Use github_pat_ABCDEFGHIJKLMNOPQRSTUVWX here"),
+        ("gitlab token", "Use glpat-ABCDEFGHIJKLMNOPQRST for CI"),
+        ("google api key", "Use AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ012345 for maps"),
+        ("slack app token", "Use xapp-1-ABCDEFGHIJKLMNOP for the socket"),
+        ("huggingface token", "Use hf_ABCDEFGHIJKLMNOPQRSTUVWXYZ01 to download"),
     ],
 )
 def test_unsafe_content_is_refused_in_a_prompt(label: str, text: str):
@@ -93,6 +113,18 @@ def test_unsafe_content_is_refused_in_a_prompt(label: str, text: str):
         "Give the date as 12/05/2026",
         "Explain what makes a password strong",
         "Discuss why the data: numbers alone rarely settle an argument",
+        # Near misses for the rules added after review. Each of these is
+        # ordinary educational prose and must keep working.
+        "Set A = {x : x > 0} contains the positive reals",
+        "Node.js and Deno both run JavaScript outside a browser",
+        "The .org suffix was originally for organisations",
+        "Press /help to list the available commands",
+        "Write the file: notes.md, then continue",
+        "Note: see the appendix for the full derivation",
+        "In 2019 the ratio was 2/3, and by 2021 it was 3/4",
+        "The basic idea is that pressure and volume vary inversely",
+        "A secret ballot is one where nobody can see how you voted",
+        "Compare the mean and the median of the data set",
     ],
 )
 def test_ordinary_content_is_not_mistaken_for_an_attack(text: str):

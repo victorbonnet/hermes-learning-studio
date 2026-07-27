@@ -170,7 +170,7 @@ def test_migrations_are_contiguous_and_the_version_is_the_last_one():
     versions = [m.version for m in storage.MIGRATIONS]
 
     assert versions == list(range(1, len(versions) + 1))
-    assert storage.SCHEMA_VERSION == versions[-1] == 3
+    assert storage.SCHEMA_VERSION == versions[-1] == 4
 
 
 def test_migration_two_adds_the_column():
@@ -497,13 +497,13 @@ def test_a_v2_database_reports_version_2_without_the_experience_tables(hermes_ho
         assert "experiences" not in objects
 
 
-def test_initialize_upgrades_a_v2_database_to_v3(hermes_home: Path):
+def test_initialize_upgrades_a_v2_database_to_the_current_version(hermes_home: Path):
     _build_v2_database()
 
     storage.initialize()
 
     with storage.connect() as conn:
-        assert storage.read_schema_version(conn) == 3
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
         objects = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
         assert {"experiences", "experience_components", "experience_component_evaluations"} <= (
             objects
@@ -616,4 +616,308 @@ def test_two_callers_upgrading_a_v2_database_both_succeed(hermes_home: Path):
 
     assert errors == [], f"concurrent upgrade failed: {errors}"
     with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+
+
+# ── The exact v3 → v4 upgrade ─────────────────────────────────────────────
+
+
+def _build_v3_database() -> None:
+    """Create a database at schema version 3 — the state this PR first had."""
+    _build_database_at(3)
+
+
+def _store_experience_under_v3():
+    """Prepare a real experience while the database is still at version 3."""
+    from tests.component_examples import example, manifest
+
+    saved = storage.MIGRATIONS
+    storage.MIGRATIONS = [m for m in saved if m.version <= 3]
+    try:
+        storage.initialize()
+        return service.prepare_experience(
+            principal=LEARNER,
+            manifest=manifest(
+                [example("multiple_choice", id="one"), example("short_answer", id="two")]
+            ),
+        )
+    finally:
+        storage.MIGRATIONS = saved
+
+
+def test_a_v3_database_reports_version_3(hermes_home: Path):
+    _build_v3_database()
+
+    with storage.connect() as conn:
         assert storage.read_schema_version(conn) == 3
+
+
+def test_initialize_upgrades_a_v3_database_to_the_current_version(hermes_home: Path):
+    _build_v3_database()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+
+
+def test_the_v3_upgrade_preserves_experiences_and_their_order(hermes_home: Path):
+    prepared = _store_experience_under_v3()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        experience = conn.execute("SELECT * FROM experiences").fetchone()
+        components = conn.execute(
+            "SELECT position, component_key FROM experience_components ORDER BY position"
+        ).fetchall()
+        evaluations = conn.execute(
+            "SELECT COUNT(*) AS n FROM experience_component_evaluations"
+        ).fetchone()["n"]
+
+    assert experience["id"] == prepared["experience_id"]
+    assert [(row["position"], row["component_key"]) for row in components] == [
+        (1, "one"),
+        (2, "two"),
+    ]
+    assert evaluations == 2
+
+
+def test_the_v3_upgrade_keeps_the_learner_and_evaluator_halves_apart(hermes_home: Path):
+    from tests.component_examples import CANARY
+
+    _store_experience_under_v3()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        payloads = " ".join(
+            str(row["learner_payload"])
+            for row in conn.execute("SELECT learner_payload FROM experience_components")
+        )
+        evaluations = " ".join(
+            str(row["evaluation"])
+            for row in conn.execute("SELECT evaluation FROM experience_component_evaluations")
+        )
+
+    assert CANARY not in payloads
+    assert CANARY in evaluations
+
+
+def test_the_v3_upgrade_repairs_an_objective_from_another_track(hermes_home: Path):
+    """A row v3 allowed and v4 forbids keeps the experience, loses the link."""
+    _store_experience_under_v3()
+
+    with storage.connect() as conn:
+        experience = conn.execute("SELECT * FROM experiences").fetchone()
+        now = "2026-01-01T00:00:00+00:00"
+        conn.execute(
+            "INSERT INTO tracks (id, learner_id, profile_id, name, status, confirmed_at,"
+            " created_at, updated_at) VALUES ('TA', ?, ?, 'A', 'active', ?, ?, ?)",
+            (experience["learner_id"], experience["profile_id"], now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO tracks (id, learner_id, profile_id, name, status, confirmed_at,"
+            " created_at, updated_at) VALUES ('TB', ?, ?, 'B', 'active', ?, ?, ?)",
+            (experience["learner_id"], experience["profile_id"], now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO objectives (id, track_id, learner_id, profile_id, behavior, condition,"
+            " standard, status, created_at, updated_at)"
+            " VALUES ('OA', 'TA', ?, ?, 'b', 'c', 's', 'active', ?, ?)",
+            (experience["learner_id"], experience["profile_id"], now, now),
+        )
+        # The mismatch v3 could not prevent: track B, objective from track A.
+        conn.execute(
+            "UPDATE experiences SET track_id = 'TB', objective_id = 'OA' WHERE id = ?",
+            (experience["id"],),
+        )
+        conn.commit()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        repaired = conn.execute("SELECT * FROM experiences").fetchone()
+
+    assert repaired is not None, "the experience was destroyed rather than repaired"
+    assert repaired["track_id"] == "TB"
+    assert repaired["objective_id"] is None
+
+
+def test_the_v3_upgrade_drops_an_unattributable_evaluator_row(hermes_home: Path):
+    _store_experience_under_v3()
+
+    with storage.connect() as conn:
+        # v3 constrained only ``component_id``, so an evaluator row could name
+        # any experience at all. Rewrite one to name a nonexistent one.
+        stray = conn.execute(
+            "SELECT * FROM experience_components ORDER BY position DESC LIMIT 1"
+        ).fetchone()
+        conn.execute(
+            "UPDATE experience_component_evaluations SET experience_id = 'no-such-experience'"
+            " WHERE component_id = ?",
+            (stray["id"],),
+        )
+        conn.commit()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        ids = {
+            row["component_id"]
+            for row in conn.execute("SELECT component_id FROM experience_component_evaluations")
+        }
+
+    assert stray["id"] not in ids, "an unattributable evaluator row survived the upgrade"
+    assert len(ids) == 1, "the valid evaluator row was lost too"
+
+
+def test_the_v3_upgrade_is_idempotent(hermes_home: Path):
+    _store_experience_under_v3()
+
+    storage.initialize()
+    storage.initialize()
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+        assert conn.execute("SELECT COUNT(*) AS n FROM experiences").fetchone()["n"] == 1
+
+
+def test_migration_four_uses_no_executescript_and_only_ordinary_statements(hermes_home: Path):
+    """Statements, so the rebuild runs inside the caller's transaction."""
+    fourth = next(m for m in storage.MIGRATIONS if m.version == 4)
+
+    assert all(isinstance(statement, str) for statement in fourth.statements)
+    assert "executescript" not in " ".join(fourth.statements).lower()
+
+
+def test_earlier_migrations_were_not_edited_by_the_rebuild(hermes_home: Path):
+    """Migrations 1 to 3 are applied history and must stay byte-for-byte."""
+    for version in (1, 2, 3):
+        body = " ".join(next(m for m in storage.MIGRATIONS if m.version == version).statements)
+        assert "_v4" not in body, f"migration {version} was edited by the v4 rebuild"
+
+
+def test_a_failing_migration_four_rolls_back_completely(hermes_home: Path, monkeypatch):
+    prepared = _store_experience_under_v3()
+
+    real = list(storage.MIGRATIONS)
+    monkeypatch.setattr(
+        storage,
+        "MIGRATIONS",
+        [
+            *real[:3],
+            storage.Migration(version=4, statements=(*real[3].statements, "THIS IS NOT SQL")),
+        ],
+    )
+
+    with pytest.raises(storage.MigrationError):
+        storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 3, "the version advanced despite failure"
+        experience = conn.execute("SELECT * FROM experiences").fetchone()
+        components = conn.execute("SELECT COUNT(*) AS n FROM experience_components").fetchone()
+        objects = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
+
+    assert experience["id"] == prepared["experience_id"], "the experience was lost"
+    assert components["n"] == 2
+    assert not any(name.endswith("_v4") for name in objects), "a scratch table survived"
+
+
+def test_two_callers_upgrading_a_v3_database_both_succeed(hermes_home: Path):
+    _store_experience_under_v3()
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def upgrade() -> None:
+        try:
+            barrier.wait(timeout=5)
+            storage.initialize()
+        except BaseException as exc:  # noqa: BLE001 - recorded and asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=upgrade) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == [], f"concurrent upgrade failed: {errors}"
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+        assert conn.execute("SELECT COUNT(*) AS n FROM experiences").fetchone()["n"] == 1
+
+
+def test_an_experience_still_prepares_after_the_v3_upgrade(hermes_home: Path):
+    from tests.component_examples import manifest
+
+    _store_experience_under_v3()
+    storage.initialize()
+
+    result = service.prepare_experience(principal=LEARNER, manifest=manifest())
+
+    assert result["ok"] is True
+
+
+# ── A newer database is refused before it is touched ──────────────────────
+
+
+def test_an_unsupported_newer_database_is_left_byte_for_byte_unchanged(hermes_home: Path):
+    """The reported reproduction: refusal used to happen *after* WAL was set.
+
+    ``connect`` applies the configured journal mode, which is persistent, so a
+    database from a future version was converted and only then rejected. The
+    compatibility question is now asked through a read-only handle first.
+    """
+    storage.initialize()
+    database = storage.database_path()
+
+    with sqlite3.connect(database) as conn:
+        conn.execute("PRAGMA journal_mode = DELETE")
+        conn.execute("UPDATE schema_version SET version = 99")
+        conn.commit()
+
+    def journal_mode() -> str:
+        probe = sqlite3.connect(database)
+        try:
+            return str(probe.execute("PRAGMA journal_mode").fetchone()[0])
+        finally:
+            probe.close()
+
+    before_mode = journal_mode()
+    before_files = sorted(path.name for path in database.parent.iterdir())
+    before_bytes = database.read_bytes()
+
+    with pytest.raises(storage.IncompatibleSchemaError):
+        storage.initialize()
+
+    assert journal_mode() == before_mode == "delete", "the journal mode was changed"
+    assert sorted(path.name for path in database.parent.iterdir()) == before_files
+    assert database.read_bytes() == before_bytes, "the refused database was modified"
+
+
+def test_a_refused_database_gains_no_wal_or_shm_files(hermes_home: Path):
+    storage.initialize()
+    database = storage.database_path()
+    with sqlite3.connect(database) as conn:
+        conn.execute("PRAGMA journal_mode = DELETE")
+        conn.execute("UPDATE schema_version SET version = 99")
+        conn.commit()
+
+    with pytest.raises(storage.IncompatibleSchemaError):
+        storage.initialize()
+
+    stray = sorted(p.name for p in database.parent.iterdir() if p.name != database.name)
+    assert stray == []
+
+
+def test_a_supported_database_is_still_configured_normally(hermes_home: Path):
+    """The guard must not stop an ordinary database from being set up."""
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1

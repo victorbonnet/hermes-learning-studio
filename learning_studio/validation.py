@@ -8,9 +8,11 @@ therefore re-checked here, against the same declarations the schema is built
 from, so the two cannot drift.
 
 The checker is a small subset of JSON Schema — objects, arrays, strings,
-numbers, integers, booleans, enums, constants, bounds, local ``$ref``, and
-``oneOf`` — because that is all the tool surface uses, and a full
-implementation would be a dependency this plugin does not want.
+numbers, integers, booleans, enums, constants, patterns, bounds, local
+``$ref``, and ``oneOf`` — because that is all the tool surface uses, and a
+full implementation would be a dependency this plugin does not want. The
+advertised schema is checked against a real JSON Schema implementation in the
+test suite, where a development dependency costs nobody anything.
 
 Two of those need a word. **Local references** exist because the component
 registry states the shapes every type shares once under ``$defs`` instead of
@@ -22,6 +24,7 @@ match any accepted form" is not an error message, it is a shrug.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -182,6 +185,10 @@ def _validate_string(value: Any, schema: dict[str, Any], path: str) -> None:
     enum = schema.get("enum")
     if enum is not None and value not in enum:
         _fail(path, f"must be one of: {', '.join(map(str, enum))}")
+
+    pattern = schema.get("pattern")
+    if pattern is not None and not re.search(pattern, value):
+        _fail(path, f"must match {pattern}")
 
     minimum = schema.get("minLength")
     if minimum is not None and len(value.strip()) < minimum:

@@ -1533,7 +1533,15 @@ def prepare_experience(
 
         resolved_track = _resolve_experience_track(conn, profile, learner_id, track_id)
         resolved_objective = _resolve_experience_objective(
-            conn, profile, learner_id, resolved_track, objective_id
+            conn, profile, learner_id, resolved_track, objective_id, validated
+        )
+        _authorise_accommodations(
+            conn,
+            profile=profile,
+            learner_id=learner_id,
+            track_id=resolved_track,
+            accessibility=validated.accessibility,
+            config=config,
         )
 
         experience_id = _insert_experience(
@@ -1583,8 +1591,17 @@ def _resolve_experience_objective(
     learner_id: str,
     track_id: str | None,
     objective_id: Any,
+    manifest: Any,
 ) -> str | None:
-    """An objective is addressable only through the track that owns it."""
+    """An objective is addressable only through the track that owns it.
+
+    And the experience must be *about* it. Verifying ownership while storing
+    whatever objective text the caller supplied would let an experience claim
+    to assess "add fractions, unaided, 4 of 5" while actually being a French
+    translation drill — a record that reads as evidence of progress against
+    something it never tested. The stored objective is authoritative, so the
+    manifest has to agree with it exactly.
+    """
     if objective_id is None:
         return None
     if track_id is None:
@@ -1604,7 +1621,165 @@ def _resolve_experience_objective(
             f"That objective is {status.value}. Ask the learner before practising against an "
             "objective they have finished with."
         )
+
+    mismatched = [
+        part
+        for part in ("behavior", "condition", "standard")
+        if _comparable(manifest.objective[part]) != _comparable(str(row[part]))
+    ]
+    if mismatched:
+        raise ValidationError(
+            "The objective in the manifest does not match the stored objective this "
+            f"experience is attached to: {', '.join(mismatched)} differ(s). Send the stored "
+            "objective's wording, or leave objective_id out for a one-off exercise."
+        )
     return str(row["id"])
+
+
+def _comparable(text: str) -> str:
+    """Case- and whitespace-insensitive form, for objective agreement."""
+    return " ".join(str(text).split()).casefold()
+
+
+# ── Accessibility provenance ──────────────────────────────────────────────
+
+
+def _authorise_accommodations(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    learner_id: str,
+    track_id: str | None,
+    accessibility: dict[str, Any],
+    config: LearningStudioConfig,
+) -> None:
+    """Check the claimed source actually says what the manifest claims it says.
+
+    A ``source`` string written by a model is a claim, not authorisation — the
+    same reasoning that removed ``learner_key``. So each requested
+    accommodation is looked up in the *named* source: a confirmed track's own
+    context, the learner's explicitly stated session context, or the
+    operator's configuration. A source that says nothing authorises nothing.
+
+    Matching is exact on the canonical form of a recorded need, with no fuzzy,
+    substring, or semantic step anywhere. That is the same rule PR 03 applies
+    to accessibility consent, and for the same reason: a comparison loose
+    enough to turn one need into another is a comparison that decides
+    something about somebody's health on its own.
+    """
+    if not accessibility:
+        return
+
+    requested = list(accessibility.get("accommodations", ()))
+    if not requested:
+        return
+
+    source = str(accessibility.get("source", ""))
+    available = _recorded_needs(
+        conn,
+        profile=profile,
+        learner_id=learner_id,
+        track_id=track_id,
+        source=source,
+        config=config,
+    )
+    missing = sorted(set(requested) - available)
+    if missing:
+        raise ConsentError(
+            f"This experience claims {', '.join(missing)} came from {source}, but nothing "
+            f"recorded there says so. Accessibility metadata is only stored when the named "
+            "source already holds that exact need: save it with "
+            "learning_studio_save_context first, or leave accessibility off the manifest and "
+            "honour the need in conversation instead."
+        )
+
+
+def _recorded_needs(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    learner_id: str,
+    track_id: str | None,
+    source: str,
+    config: LearningStudioConfig,
+) -> set[str]:
+    """The accessibility needs one specific source records for this learner."""
+    from .models import normalize_need
+
+    def canonical(values: Any) -> set[str]:
+        items = values if isinstance(values, list) else [values]
+        out: set[str] = set()
+        for item in items:
+            try:
+                out.add(normalize_need(item))
+            except ValueError:  # pragma: no cover - stored values are validated
+                continue
+        return out
+
+    if source == Provenance.PROFILE_CONFIG.value:
+        return canonical(config.profile_context.get("accessibility_needs", []))
+
+    if source == Provenance.CONFIRMED_TRACK.value:
+        if track_id is None:
+            return set()
+        context = _track_context(conn, profile, learner_id, track_id)
+        if context is None:
+            return set()
+        return _needs_in_context(conn, profile, learner_id, str(context["id"]), CONFIRMED_SOURCES)
+
+    if source == Provenance.EXPLICIT_REQUEST.value:
+        context = _temporary_context(conn, profile, learner_id)
+        if context is None or _is_expired(context):
+            return set()
+        return _needs_in_context(conn, profile, learner_id, str(context["id"]), EXPLICIT_SOURCES)
+
+    return set()  # pragma: no cover - the enum admits nothing else
+
+
+#: Provenances that count as the learner having confirmed a need on a track,
+#: and as their having asked for one outright. Both are drawn from PR 03's
+#: vocabulary rather than restated, so the precedence rules stay one thing.
+CONFIRMED_SOURCES: frozenset[str] = frozenset(
+    {
+        Provenance.CONFIRMED_TRACK.value,
+        Provenance.EXPLICIT_REQUEST.value,
+        Provenance.EXPLICIT_CORRECTION.value,
+        Provenance.CONFIRMED_PREFERENCE.value,
+    }
+)
+
+EXPLICIT_SOURCES: frozenset[str] = frozenset(
+    {Provenance.EXPLICIT_REQUEST.value, Provenance.EXPLICIT_CORRECTION.value}
+)
+
+
+def _needs_in_context(
+    conn: sqlite3.Connection,
+    profile: str,
+    learner_id: str,
+    context_id: str,
+    provenances: frozenset[str],
+) -> set[str]:
+    """Recorded accessibility needs in one context, from trusted provenances."""
+    from .models import normalize_need
+
+    rows = conn.execute(
+        "SELECT value, provenance FROM context_values"
+        " WHERE context_id = ? AND field = 'accessibility_needs'"
+        "   AND profile_id = ? AND learner_id = ?",
+        (context_id, profile, learner_id),
+    ).fetchall()
+
+    found: set[str] = set()
+    for row in rows:
+        if str(row["provenance"]) not in provenances:
+            continue
+        for item in decode_value("accessibility_needs", str(row["value"])):
+            try:
+                found.add(normalize_need(item))
+            except ValueError:  # pragma: no cover - stored values are validated
+                continue
+    return found
 
 
 def _insert_experience(

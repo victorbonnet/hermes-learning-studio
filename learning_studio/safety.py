@@ -69,6 +69,11 @@ _INVISIBLE_RE = re.compile(
 
 #: Every rule, as ``(regex, explanation)``. Ordered so the most specific and
 #: most actionable message wins for a string that trips several.
+#:
+#: Each rule is deliberately lexical. Nothing here fetches, opens, resolves,
+#: decodes, or normalises a match into an executable form — a validator that
+#: had to *run* something to decide whether it was safe would be the exact
+#: hazard it exists to prevent.
 _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"<[a-zA-Z/!?]"),
@@ -94,6 +99,29 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\b[a-z][a-z0-9+.-]*:\s*//", re.IGNORECASE),
         "must not contain a URL; describe the source instead of linking to it",
     ),
+    # Schemes with no authority component, which the ``://`` rule above cannot
+    # see. Each requires a non-space immediately after the colon so ordinary
+    # prose — "the file: notes.md", "Note: see below" — is not caught.
+    (
+        re.compile(
+            r"\b(?:mailto|ftp|ftps|file|tel|sms|ws|wss|ssh|sftp|git|smb|nfs|ldap|irc|"
+            r"magnet|gopher|blob|about|chrome|view-source):(?=\S)",
+            re.IGNORECASE,
+        ),
+        "must not contain a URI; describe the source instead of linking to it",
+    ),
+    # A bare web locator is still a locator. Restricted to a leading ``www.``
+    # or a small set of well-known suffixes so that "Node.js" and "e.g." are
+    # not mistaken for hosts.
+    (
+        re.compile(
+            r"\bwww\.[a-z0-9-]+\.[a-z]{2,}|"
+            r"\b[a-z0-9][a-z0-9-]{1,}\.(?:com|net|org|io|dev|app|edu|gov|mil|info|biz|xyz|"
+            r"me|co|ai|sh)\b(?:/\S*)?",
+            re.IGNORECASE,
+        ),
+        "must not contain a web address",
+    ),
     (
         re.compile(r"&(?:#x?[0-9a-f]+|lt|gt|quot|apos|amp|nbsp);", re.IGNORECASE),
         "must not contain HTML character references",
@@ -102,16 +130,27 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"@import\b|\bexpression\s*\(|\burl\s*\(", re.IGNORECASE),
         "must not contain stylesheet syntax",
     ),
+    # A declaration block, with or without the trailing semicolon. The
+    # property name must be at least two characters so that set-builder
+    # notation such as ``{x : x > 0}`` is left alone.
     (
-        re.compile(r"\{[^{}]*[a-z-]+\s*:\s*[^{};]+;[^{}]*\}", re.IGNORECASE),
+        re.compile(r"\{[^{}]*[a-z-]{2,}\s*:\s*[^{};]+;?\s*\}", re.IGNORECASE),
         "must not contain a stylesheet rule",
     ),
     (
-        re.compile(r"(?:^|[\s\"'(\[/\\])\.\.[/\\]|%2e%2e", re.IGNORECASE),
+        re.compile(r"(?:^|[\s\"'(\[/\\])\.{1,2}[/\\]|%2e%2e", re.IGNORECASE),
         "must not contain a relative path",
     ),
+    # Three shapes of absolute path: a multi-segment POSIX path, a
+    # single-segment one carrying a file extension, and the Windows and UNC
+    # forms. The extension requirement is what lets "/help" and "3 / 4"
+    # through while still refusing "/secret.txt".
     (
-        re.compile(r"(?:^|\s)~?/[A-Za-z0-9._-]+/|(?:^|\s)[A-Za-z]:[\\/]|\\\\[A-Za-z0-9]"),
+        re.compile(
+            r"(?:^|\s)~?/[A-Za-z0-9._-]+/|"
+            r"(?:^|\s)~?/[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,8}\b|"
+            r"(?:^|\s)[A-Za-z]:[\\/]|\\\\[A-Za-z0-9]"
+        ),
         "must not contain a filesystem path",
     ),
     (
@@ -128,30 +167,89 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         "must not contain a credential",
     ),
     (
-        re.compile(r"\bbearer\s+[A-Za-z0-9._~+/-]{16,}", re.IGNORECASE),
-        "must not contain an authorization header",
+        re.compile(
+            r"\b(?:proxy-)?authorization\s*:\s*(?:basic|bearer|digest|negotiate)\b|"
+            r"\b(?:bearer|basic)\s+[A-Za-z0-9+/._~-]{12,}={0,2}",
+            re.IGNORECASE,
+        ),
+        "must not contain authorization material",
     ),
+    # Prefixed token shapes in current circulation. Deliberately a list of
+    # *shapes*: no real credential appears here, and none is needed to match
+    # one.
     (
         re.compile(
-            r"\b(?:sk|pk|rk)-[A-Za-z0-9]{16,}|\bAKIA[0-9A-Z]{16}\b|"
-            r"\bgh[pousr]_[A-Za-z0-9]{20,}|\bxox[baprs]-[A-Za-z0-9-]{10,}|"
+            r"\b(?:sk|pk|rk)[-_](?:[A-Za-z0-9]{1,10}[-_])?[A-Za-z0-9]{16,}|"
+            r"\bAKIA[0-9A-Z]{16}\b|"
+            r"\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|"
+            r"\bglpat-[A-Za-z0-9_-]{16,}|\bnpm_[A-Za-z0-9]{20,}|"
+            r"\bhf_[A-Za-z0-9]{20,}|\bdop_v1_[a-f0-9]{32,}|\bshp(?:at|ss)_[a-f0-9]{20,}|"
+            r"\bxox[baprs]-[A-Za-z0-9-]{10,}|\bxapp-[0-9]-[A-Za-z0-9-]{10,}|"
+            r"\bAIza[0-9A-Za-z_-]{30,}|\bya29\.[0-9A-Za-z_-]{20,}|"
+            r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}|"
             r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."
         ),
         "must not contain a secret-looking value",
     ),
 )
 
+#: Vocabulary that describes a *person* rather than a component. Applied only
+#: to accessibility text, where a diagnosis, a disability label, or a sentence
+#: about the learner has no legitimate place — an exercise records what it
+#: needs in order to be usable, never a fact about who is using it.
+#:
+#: Not applied to prompts or content, where these words are ordinary subject
+#: matter: a biology item may well ask about glaucoma.
+_SENSITIVE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"\b(?:adhd|add|asd|autis(?:m|tic)|aspergers?|dyslexi[ac]|dyspraxi[ac]|"
+            r"dyscalculi[ac]|dysgraphi[ac]|blindness|deafness|glaucoma|cataracts?|"
+            r"epilep(?:sy|tic)|tourettes?|cerebral palsy|down syndrome|ptsd|"
+            r"anxiety disorder|bipolar|schizophreni[ac]|dementia|alzheimers?)\b",
+            re.IGNORECASE,
+        ),
+        "must not name a diagnosis or condition",
+    ),
+    (
+        re.compile(
+            r"\b(?:diagnos(?:is|ed|es|tic)|disabilit(?:y|ies)|disabled|impairment|"
+            r"impaired|neurodiver(?:gent|se)|special needs|learning difficult(?:y|ies))\b",
+            re.IGNORECASE,
+        ),
+        "must not describe a disability",
+    ),
+    (
+        re.compile(
+            r"\b(?:the\s+)?(?:learner|student|pupil|user|they|he|she)\s+"
+            r"(?:has|have|is|are|was|were|cannot|can't|suffers?|struggles?|needs?|"
+            r"requires?|finds?)\b",
+            re.IGNORECASE,
+        ),
+        "must describe the component, not the learner",
+    ),
+)
+
+# The three lexical patterns below are published as strings and compiled from
+# those same strings. The advertised JSON Schema emits the string; the runtime
+# uses the compiled form. That is what makes "the schema and the validator
+# agree" a fact about the code rather than a claim in a comment.
+
 #: Opaque identifiers the author supplies (component ids, option ids, asset
 #: references). Lowercase, bounded, and shaped so that nothing path-like,
 #: scheme-like, or traversal-like can be spelled with one.
-_IDENTIFIER_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$|^[a-z0-9]$")
+IDENTIFIER_PATTERN = r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
 
 #: A conservative BCP-47 subset: language, optional script, optional region.
-_LOCALE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?$")
+LOCALE_PATTERN = r"^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?$"
 
 #: ``2026``, ``2026-07``, or ``2026-07-27``. Enough for provenance, and not a
 #: free-text field pretending to be a date.
-_DATE_RE = re.compile(r"^[0-9]{4}(?:-[0-9]{2}(?:-[0-9]{2})?)?$")
+DATE_PATTERN = r"^[0-9]{4}(?:-[0-9]{2}(?:-[0-9]{2})?)?$"
+
+_IDENTIFIER_RE = re.compile(IDENTIFIER_PATTERN)
+_LOCALE_RE = re.compile(LOCALE_PATTERN)
+_DATE_RE = re.compile(DATE_PATTERN)
 
 
 def safe_text(
@@ -241,6 +339,47 @@ def serialized_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
+def reject_learner_description(raw: str, label: str) -> str:
+    """Refuse accessibility text that describes a person rather than a component.
+
+    Applied on top of :func:`safe_text`, and only to accessibility fields.
+    "Alt text: a cross-section of the heart" is what belongs there; "the
+    learner has ADHD" is a health record, and an exercise is not the place to
+    keep one — nor is a diagnosis something an agent may infer and write down.
+    """
+    for pattern, explanation in _SENSITIVE_RULES:
+        if pattern.search(raw):
+            raise UnsafeContent(f"{label} {explanation}")
+    return raw
+
+
+def tokens(text: str) -> list[str]:
+    """Word tokens of *text*, casefolded, for answer-leak comparison.
+
+    Punctuation and case are discarded so that "acetyl-CoA" and "Acetyl CoA"
+    are the same sequence, and so that a full stop cannot hide a leak.
+    """
+    return re.findall(r"\w+", unicodedata.normalize("NFC", text).casefold(), flags=re.UNICODE)
+
+
+def contains_token_sequence(haystack: list[str], needle: list[str]) -> bool:
+    """True when *needle* appears in *haystack* as a contiguous token run.
+
+    Token-boundary rather than substring, in both directions: a two-character
+    answer such as ``Na`` must not match inside "national", and a multi-word
+    answer must appear in order and intact rather than as scattered words.
+    """
+    if not needle or len(needle) > len(haystack):
+        return False
+    first = needle[0]
+    span = len(needle)
+    return any(
+        haystack[index : index + span] == needle
+        for index, token in enumerate(haystack)
+        if token == first
+    )
+
+
 def normalised_for_comparison(text: str) -> str:
-    """Casefolded, whitespace-collapsed form, for answer-leak comparisons."""
+    """Casefolded, whitespace-collapsed form, for exact-equality comparisons."""
     return " ".join(text.split()).casefold()

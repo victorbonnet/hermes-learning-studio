@@ -400,18 +400,62 @@ def test_a_word_count_minimum_above_the_maximum_is_rejected():
 
 
 def test_rubric_scoring_without_a_rubric_is_rejected():
-    payload = example("multiple_choice")
+    """``code_response`` may be marked against a rubric — but only a real one."""
+    payload = example("code_response")
     payload["evaluation"]["scoring"] = {"mode": "rubric"}
+    del payload["evaluation"]["rubric"]
 
     with pytest.raises(ComponentError, match="no rubric is defined"):
         build_component(payload, "component")
 
 
-def test_numeric_scoring_on_a_selection_component_is_rejected():
-    payload = example("multiple_choice")
-    payload["evaluation"]["scoring"] = {"mode": "numeric", "tolerance": 0.1}
+@pytest.mark.parametrize(
+    ("component_type", "mode"),
+    [
+        ("multiple_choice", "ordered"),
+        ("multiple_choice", "self_check"),
+        ("multiple_choice", "numeric"),
+        ("short_answer", "ordered"),
+        ("short_answer", "set"),
+        ("flashcard", "exact"),
+        ("timeline", "exact"),
+        ("matching", "ordered"),
+        ("free_response", "normalised"),
+        ("hotspot", "numeric"),
+    ],
+)
+def test_a_scoring_mode_that_cannot_mark_this_component_is_rejected(component_type, mode):
+    """An ordered score over a single-answer question grades nothing."""
+    payload = example(component_type)
+    payload.setdefault("evaluation", {})["scoring"] = {"mode": mode}
 
-    with pytest.raises(ComponentError, match="does not apply"):
+    with pytest.raises(ComponentError, match="scoring.mode"):
+        build_component(payload, "component")
+
+
+@pytest.mark.parametrize("component_type", COMPONENT_TYPES)
+def test_every_declared_scoring_mode_is_accepted(component_type: str):
+    """The positive half: each type accepts every mode its spec declares."""
+    spec = SPEC_BY_TYPE[component_type]
+    for mode in spec.scoring_modes:
+        payload = example(component_type)
+        payload.setdefault("evaluation", {})["scoring"] = {"mode": mode}
+        if mode == "rubric":
+            payload["evaluation"].setdefault(
+                "rubric",
+                [{"criterion": "c", "levels": [{"label": "l", "descriptor": "d", "points": 1}]}],
+            )
+        assert build_component(payload, "component").type == component_type
+
+
+def test_a_self_report_component_refuses_a_rubric_outright():
+    """Not merely discouraged: the field does not exist for these types."""
+    payload = example("confidence_rating")
+    payload["evaluation"]["rubric"] = [
+        {"criterion": "c", "levels": [{"label": "l", "descriptor": "d", "points": 1}]}
+    ]
+
+    with pytest.raises(ComponentError, match="rubric"):
         build_component(payload, "component")
 
 
@@ -420,7 +464,7 @@ def test_a_self_report_component_cannot_be_marked():
     payload = example("confidence_rating")
     payload["evaluation"]["scoring"] = {"mode": "exact"}
 
-    with pytest.raises(ComponentError, match="self_check"):
+    with pytest.raises(ComponentError, match="scoring.mode"):
         build_component(payload, "component")
 
 
@@ -613,3 +657,213 @@ def test_deep_copying_an_example_does_not_share_state():
 
     assert EXAMPLES["multiple_choice"]["content"]["options"][0]["text"] != "changed"
     assert copy.deepcopy(EXAMPLES) == EXAMPLES
+
+
+# ── Answer duplication, for every keyed text component ────────────────────
+
+
+@pytest.mark.parametrize(
+    ("component_type", "overrides"),
+    [
+        (
+            "short_answer",
+            {"prompt": "Type Paris. The answer is Paris.", "answer": {"accepted": ["Paris"]}},
+        ),
+        (
+            "typed_recall",
+            {"content": {"cue": "Type H2O"}, "answer": {"accepted": ["H2O"]}},
+        ),
+        (
+            "typed_recall",
+            {"content": {"cue": "The symbol is Na"}, "answer": {"accepted": ["Na"]}},
+        ),
+        (
+            "short_answer",
+            {"prompt": "The value is 42. What is it?", "answer": {"accepted": ["42"]}},
+        ),
+        (
+            "translation",
+            {
+                "content": {
+                    "source_text": "Ainda nao sei. It means I still do not know.",
+                    "source_locale": "pt-BR",
+                    "target_locale": "en",
+                },
+                "answer": {"accepted": ["I still do not know"]},
+            },
+        ),
+        (
+            "diagram",
+            {
+                "prompt": "Which component is a rheostat in this circuit?",
+                "answer": {"accepted": ["a rheostat"]},
+            },
+        ),
+    ],
+)
+def test_an_answer_repeated_in_the_visible_half_is_rejected(component_type, overrides):
+    """Short answers included: ``H2O`` and ``Na`` are exactly what gets leaked."""
+    with pytest.raises(ComponentError, match="shows its own answer"):
+        build(component_type, **overrides)
+
+
+def test_an_answer_leaked_through_component_accessibility_text_is_rejected():
+    """The whole recursive visible half is compared, not only the prompt."""
+    with pytest.raises(ComponentError, match="shows its own answer"):
+        build(
+            "short_answer",
+            accessibility={"caption": "Remember: the answer is Paris"},
+            answer={"accepted": ["Paris"]},
+        )
+
+
+def test_an_answer_leaked_through_a_content_label_is_rejected():
+    payload = example("table_grid")
+    payload["content"]["rows"][0]["header"] = "Mitosis produces two daughter cells"
+    payload["answer"]["cells"][0]["accepted"] = ["two daughter cells"]
+
+    with pytest.raises(ComponentError, match="shows its own answer"):
+        build_component(payload, "component")
+
+
+def test_a_short_answer_is_not_matched_inside_a_longer_word():
+    """Token boundaries, not substrings: ``Na`` is not hiding in "national"."""
+    component = build(
+        "typed_recall",
+        content={"cue": "The national symbol for this element"},
+        answer={"accepted": ["Na"]},
+    )
+
+    assert component.type == "typed_recall"
+
+
+def test_a_multi_word_answer_scattered_across_the_prompt_is_allowed():
+    """The tokens must appear together and in order to count as a leak."""
+    component = build(
+        "short_answer",
+        prompt="Which cycle follows glycolysis, and where does it occur?",
+        answer={"accepted": ["the citric acid cycle, in the mitochondrial matrix"]},
+    )
+
+    assert component.type == "short_answer"
+
+
+def test_a_selection_component_may_show_its_option_text():
+    """Its key is an opaque option id; showing the options is the format."""
+    component = build("multiple_choice")
+
+    assert any("matrix" in option["text"].lower() for option in component.content["options"])
+
+
+def test_a_grid_may_prefill_a_value_another_cell_expects():
+    """Two cells of a comparison can honestly hold the same value."""
+    payload = example("table_grid")
+    payload["content"]["rows"].append({"id": "binary", "header": "Binary fission"})
+    payload["content"]["prefilled_cells"] = [
+        {"row_id": "binary", "column_id": "daughters", "text": "2"}
+    ]
+
+    component = build_component(payload, "component")
+
+    assert component.type == "table_grid"
+
+
+# ── Feedback, sets, blanks and grids ──────────────────────────────────────
+
+
+def test_feedback_for_an_option_that_does_not_exist_is_rejected():
+    payload = example("multiple_choice")
+    payload["evaluation"]["feedback"]["per_option"] = [{"option_id": "ghost", "text": "no"}]
+
+    with pytest.raises(ComponentError, match="which options does not declare"):
+        build_component(payload, "component")
+
+
+def test_two_feedback_entries_for_the_same_option_are_rejected():
+    payload = example("multiple_choice")
+    payload["evaluation"]["feedback"]["per_option"] = [
+        {"option_id": "cytosol", "text": "one"},
+        {"option_id": "cytosol", "text": "two"},
+    ]
+
+    with pytest.raises(ComponentError, match="feedback twice"):
+        build_component(payload, "component")
+
+
+def test_per_option_feedback_on_a_component_without_options_is_rejected():
+    payload = example("short_answer")
+    payload["evaluation"].setdefault("feedback", {})["per_option"] = [
+        {"option_id": "anything", "text": "no"}
+    ]
+
+    with pytest.raises(ComponentError, match="has no options"):
+        build_component(payload, "component")
+
+
+def test_a_repeated_id_in_a_set_answer_is_rejected():
+    with pytest.raises(ComponentError, match="more than once"):
+        build("multi_select", answer={"option_ids": ["lifejackets", "lifejackets"]})
+
+
+def test_a_placeholder_naming_an_undeclared_blank_is_rejected():
+    payload = example("fill_blank")
+    payload["content"]["text"] = "Complete {{ghost}}."
+
+    with pytest.raises(ComponentError, match="which blanks does not declare"):
+        build_component(payload, "component")
+
+
+def test_a_declared_blank_with_no_gap_in_the_passage_is_rejected():
+    payload = example("fill_blank")
+    payload["content"]["text"] = "A passage with no gap in it at all."
+
+    with pytest.raises(ComponentError, match="no gap for blank"):
+        build_component(payload, "component")
+
+
+def test_a_repeated_placeholder_is_rejected():
+    payload = example("fill_blank")
+    payload["content"]["text"] = "A {{boundary}} boundary is a {{boundary}} boundary."
+
+    with pytest.raises(ComponentError, match="repeats placeholder"):
+        build_component(payload, "component")
+
+
+def test_a_prefilled_cell_naming_an_unknown_row_is_rejected():
+    payload = example("table_grid")
+    payload["content"]["prefilled_cells"] = [
+        {"row_id": "ghost", "column_id": "daughters", "text": "2"}
+    ]
+
+    with pytest.raises(ComponentError, match="which rows does not declare"):
+        build_component(payload, "component")
+
+
+def test_a_prefilled_cell_naming_an_unknown_column_is_rejected():
+    payload = example("table_grid")
+    payload["content"]["prefilled_cells"] = [
+        {"row_id": "mitosis", "column_id": "ghost", "text": "2"}
+    ]
+
+    with pytest.raises(ComponentError, match="which columns does not declare"):
+        build_component(payload, "component")
+
+
+def test_a_grid_cell_left_with_neither_a_value_nor_an_answer_is_rejected():
+    """An empty box nothing will ever mark is not a question."""
+    payload = example("table_grid")
+    payload["content"]["columns"].append({"id": "chromosomes", "header": "Chromosome number"})
+
+    with pytest.raises(ComponentError, match="unaccounted for"):
+        build_component(payload, "component")
+
+
+def test_the_same_cell_prefilled_twice_is_rejected():
+    payload = example("table_grid")
+    payload["content"]["prefilled_cells"] = [
+        {"row_id": "mitosis", "column_id": "daughters", "text": "2"},
+        {"row_id": "mitosis", "column_id": "daughters", "text": "two"},
+    ]
+
+    with pytest.raises(ComponentError, match="fills the same cell twice"):
+        build_component(payload, "component")

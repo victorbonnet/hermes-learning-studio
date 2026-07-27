@@ -74,10 +74,11 @@ def test_the_schema_is_json_serialisable():
 #: The advertised schema rides in every request that offers this tool, so its
 #: size is a running cost, not a one-off. The union of 31 fully inlined types
 #: is over 140 KB; sharing the common shapes under ``$defs`` brings it to
-#: roughly 49 KB. This ceiling is deliberately close to that, so a change that
-#: undoes the sharing — or adds a description at 31 use sites instead of one —
-#: fails here rather than quietly costing every session.
-MAX_SCHEMA_BYTES = 60_000
+#: roughly 55 KB, patterns and per-type scoring enums included. This ceiling is
+#: deliberately close to that, so a change that undoes the sharing — or adds a
+#: description at 31 use sites instead of one — fails here rather than quietly
+#: costing every session.
+MAX_SCHEMA_BYTES = 62_000
 
 
 def test_the_advertised_schema_stays_affordable():

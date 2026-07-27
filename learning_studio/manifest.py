@@ -32,11 +32,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from .components import (
+    SPEC_BY_TYPE,
     Bool,
     Component,
     ComponentError,
+    Date,
     Enum,
+    EnumList,
     Field,
+    Ident,
     Int,
     Locale,
     Obj,
@@ -47,7 +51,7 @@ from .components import (
     validate_object,
 )
 from .models import OBJECTIVE_TEXT_MAX, Provenance
-from .safety import UnsafeContent, safe_date, safe_identifier, serialized_size
+from .safety import UnsafeContent, serialized_size
 
 #: The manifest format's own version, independent of the database schema
 #: version. A stored experience records the format it was written in, so a
@@ -76,7 +80,33 @@ DIFFICULTIES: tuple[str, ...] = ("introductory", "intermediate", "advanced", "ex
 
 DELIVERY_MODES: tuple[str, ...] = ("practice", "assessment", "review")
 
-READING_LEVELS: tuple[str, ...] = ("standard", "plain", "simplified")
+#: What an exercise may declare it needs, as a closed vocabulary.
+#:
+#: Every one of these describes the *exercise*: what it must provide in order
+#: to be usable. None of them describes a person, and there is deliberately no
+#: free-text field beside them — a box to type in is a box someone will type a
+#: diagnosis into, and this metadata is neither consented to nor appropriate
+#: for one. The same tokens are what a learner's accessibility needs are
+#: recorded as, so authorisation is an exact match rather than a judgement.
+ACCOMMODATIONS: tuple[str, ...] = (
+    "captions",
+    "transcript",
+    "text_alternatives",
+    "visual_description",
+    "keyboard_only",
+    "reduced_motion",
+    "no_time_limit",
+    "extended_time",
+    "plain_language",
+)
+
+#: Accommodations that constrain how components must be built, and the check
+#: that decides whether the experience can actually deliver them.
+KEYBOARD_ONLY = "keyboard_only"
+CAPTIONS = "captions"
+TRANSCRIPT = "transcript"
+TEXT_ALTERNATIVES = "text_alternatives"
+VISUAL_DESCRIPTION = "visual_description"
 
 #: Where accessibility metadata on an exercise may come from, as PR 03's
 #: provenance vocabulary. Built from :class:`Provenance` so the two cannot
@@ -119,11 +149,10 @@ _SOURCE_REFERENCE = ObjList(
     members=(
         Text("title", required=True, max_chars=CITATION_MAX),
         Text("author", max_chars=TITLE_MAX, description="Author or organisation."),
-        Text("published_on", max_chars=10, description="YYYY, YYYY-MM, or YYYY-MM-DD."),
+        Date("published_on", description="YYYY, YYYY-MM, or YYYY-MM-DD."),
         Text("citation", max_chars=CITATION_MAX, description="A stable citation label."),
-        Text(
+        Ident(
             "source_id",
-            max_chars=64,
             description="An approved source identifier, if this profile has one.",
         ),
         Text("note", max_chars=NOTE_MAX, multiline=True),
@@ -133,8 +162,10 @@ _SOURCE_REFERENCE = ObjList(
 _ACCESSIBILITY = Obj(
     "accessibility",
     description=(
-        "What this experience needs in order to be usable. Describes the exercise, "
-        "never the learner: no diagnosis, no disability, no inference."
+        "What this experience must provide in order to be usable. Describes the "
+        "exercise, never the learner: there is no field for a diagnosis, a disability, "
+        "or anything else about who is studying, and the accommodations are a fixed "
+        "list rather than free text."
     ),
     members=(
         Enum(
@@ -142,18 +173,18 @@ _ACCESSIBILITY = Obj(
             required=True,
             choices=ACCESSIBILITY_SOURCES,
             description=(
-                "Where this came from. Only an explicit request, a confirmed track, or "
-                "operator configuration. Never your own inference."
+                "Where this came from. Only an explicit request the learner made, a "
+                "confirmed track, or operator configuration - and the claim is checked "
+                "against that source, so a label alone authorises nothing. Never your "
+                "own inference."
             ),
         ),
-        Bool("text_alternatives_required"),
-        Bool("captions_required"),
-        Bool("visual_description_required"),
-        Bool("keyboard_only"),
-        Bool("reduced_motion"),
-        Bool("no_time_limit"),
-        Enum("reading_level", choices=READING_LEVELS),
-        Text("notes", max_chars=NOTE_MAX, multiline=True),
+        EnumList(
+            "accommodations",
+            required=True,
+            choices=ACCOMMODATIONS,
+            description="Each one must already be recorded for this learner by the named source.",
+        ),
     ),
 )
 
@@ -302,10 +333,10 @@ def build_manifest(raw: Any) -> Manifest:
     components = _build_components(raw.get("components"))
     validate_branching(components)
 
-    references = tuple(
-        _validated_reference(reference, index)
-        for index, reference in enumerate(validated.get("source_references", []))
-    )
+    accessibility = validated.get("accessibility", {})
+    validate_accessibility_support(tuple(accessibility.get("accommodations", ())), components)
+
+    references = tuple(validated.get("source_references", []))
 
     manifest = Manifest(
         schema_version=validated["schema_version"],
@@ -317,7 +348,7 @@ def build_manifest(raw: Any) -> Manifest:
         expected_duration_minutes=validated["expected_duration_minutes"],
         difficulty=validated["difficulty"],
         source_references=references,
-        accessibility=validated.get("accessibility", {}),
+        accessibility=accessibility,
         delivery=validated.get("delivery", {}),
         components=components,
     )
@@ -371,82 +402,192 @@ def _build_components(raw: Any) -> tuple[Component, ...]:
     return tuple(components)
 
 
-def _validated_reference(reference: dict[str, Any], index: int) -> dict[str, Any]:
-    """Second pass over a source reference, for its two shaped fields.
-
-    ``published_on`` and ``source_id`` arrive as bounded safe text, which
-    stops markup and credentials; this narrows them further to a date and to
-    an identifier, so neither can carry prose that a later reader would be
-    tempted to treat as a locator.
-    """
-    out = dict(reference)
-    where = f"manifest.source_references[{index}]"
-    try:
-        if "published_on" in out:
-            out["published_on"] = safe_date(out["published_on"], f"{where}.published_on")
-        if "source_id" in out:
-            out["source_id"] = safe_identifier(out["source_id"], f"{where}.source_id")
-    except UnsafeContent as exc:
-        raise ManifestError(str(exc)) from exc
-    return out
+#: The terminal state of an experience: the learner has finished it. Modelled
+#: explicitly so that "can this component still reach the end?" is a question
+#: with an answer rather than an assumption about the last index.
+COMPLETE = object()
 
 
 def validate_branching(components: tuple[Component, ...]) -> None:
-    """Refuse branches that dangle, loop on themselves, or cannot be escaped.
+    """Refuse branches that dangle, repeat, loop on themselves, or trap.
 
-    Three separate failures, each with its own reason:
+    Four failures, each with its own reason:
 
     - **Dangling.** A branch to a component that is not in this manifest ends
       the experience somewhere undefined.
     - **Self-reference.** A component that branches to itself is a loop with
       no other exit.
-    - **Unescapable cycle.** ``always`` is unconditional, so a cycle made only
-      of ``always`` edges never terminates whatever the learner does. Cycles
-      through ``correct``/``incorrect`` are left alone on purpose: "get it
-      wrong, go back and try again" is a legitimate retry loop, and the
-      learner's own answer is the way out.
+    - **Ambiguous.** Two branches for the same outcome, or an ``always``
+      branch beside a conditional one, leave it undecided where the learner
+      goes.
+    - **Unescapable.** A set of components from which *no* sequence of learner
+      outcomes ever reaches the end. That is the check that matters, and it is
+      the one the first version of this got wrong: it looked only at
+      unconditional edges, so two components that sent each other back and
+      forth on both ``correct`` and ``incorrect`` passed.
+
+    A retry loop is still legal, because it has a way out. "Get this wrong and
+    go back" branches only on ``incorrect``; answering correctly falls through
+    to the next component, and falling through is a modelled transition here,
+    not an assumption.
     """
     known = {component.id for component in components}
-
-    always_edges: dict[str, str] = {}
     for component in components:
-        conditions = [condition for condition, _ in component.branch_targets()]
-        if conditions.count("always") > 1:
+        _check_branch_shape(component, known)
+    _reject_traps(components)
+
+
+def _check_branch_shape(component: Component, known: set[str]) -> None:
+    seen: set[str] = set()
+    for condition, target in component.branch_targets():
+        if condition in seen:
             raise ManifestError(
-                f"component '{component.id}' declares more than one unconditional branch"
+                f"component '{component.id}' declares more than one '{condition}' branch, so "
+                "where the learner goes on that outcome is undecided"
             )
-        if "always" in conditions and len(conditions) > 1:
+        seen.add(condition)
+        if target not in known:
             raise ManifestError(
-                f"component '{component.id}' mixes an unconditional branch with conditional "
-                "ones, so the conditional branches could never be taken"
+                f"component '{component.id}' branches to '{target}', which is not a "
+                "component of this experience"
             )
-        for condition, target in component.branch_targets():
-            if target not in known:
+        if target == component.id:
+            raise ManifestError(f"component '{component.id}' branches to itself")
+
+    if "always" in seen and len(seen) > 1:
+        raise ManifestError(
+            f"component '{component.id}' mixes an unconditional branch with conditional "
+            "ones, so the conditional branches could never be taken"
+        )
+
+
+def _transitions(components: tuple[Component, ...]) -> dict[str, set[Any]]:
+    """Every state each component can move to, over all learner outcomes.
+
+    Three kinds of transition, and the third is the one that is easy to
+    forget: when a component declares no branch for an outcome, that outcome
+    falls through to the next component in order — or, from the last one, to
+    completion.
+    """
+    order = [component.id for component in components]
+    moves: dict[str, set[Any]] = {}
+    for index, component in enumerate(components):
+        branches = dict(component.branch_targets())
+        targets: set[Any] = set(branches.values())
+        unconditional = "always" in branches
+        covered = {"correct", "incorrect"} <= set(branches)
+        if not unconditional and not covered:
+            targets.add(order[index + 1] if index + 1 < len(order) else COMPLETE)
+        moves[component.id] = targets
+    return moves
+
+
+def _reject_traps(components: tuple[Component, ...]) -> None:
+    """Every component must be able to reach the end by some route.
+
+    Computed as reachability *backwards* from completion: whatever cannot
+    reach it is, by definition, a set the learner can enter and never leave —
+    whichever answers they give.
+    """
+    moves = _transitions(components)
+    reaches_end = {COMPLETE}
+    changed = True
+    while changed:
+        changed = False
+        for component_id, targets in moves.items():
+            if component_id not in reaches_end and targets & reaches_end:
+                reaches_end.add(component_id)
+                changed = True
+
+    trapped = [c.id for c in components if c.id not in reaches_end]
+    if trapped:
+        raise ManifestError(
+            f"component(s) {', '.join(trapped)} can never reach the end of the experience: "
+            "whatever the learner answers, the branches lead back into the same group. "
+            "Leave at least one outcome unbranched so it falls through."
+        )
+
+
+# ── Accessibility the experience can actually deliver ──────────────────────
+
+#: The field that marks a managed asset wherever it appears in content.
+_ASSET_MARKER = "asset_ref"
+
+
+def validate_accessibility_support(
+    accommodations: tuple[str, ...], components: tuple[Component, ...]
+) -> None:
+    """Refuse an experience that cannot honour what it declares.
+
+    A manifest claiming ``keyboard_only`` while containing a hotspot with no
+    keyboard alternative is worse than one that claims nothing: it tells a
+    future runtime, and the learner, that the exercise is usable when it is
+    not. The claim is checked against the components rather than trusted.
+    """
+    required = set(accommodations)
+    for component in components:
+        access = component.accessibility
+        spec = SPEC_BY_TYPE[component.type]
+        assets = _component_assets(component)
+
+        if (
+            KEYBOARD_ONLY in required
+            and spec.pointer_interaction
+            and not access.get("keyboard_alternative")
+        ):
+            raise ManifestError(
+                f"component '{component.id}' is answered by pointing or dragging, but this "
+                "experience declares keyboard_only. Give it "
+                "accessibility.keyboard_alternative describing how to answer with a "
+                "keyboard, or use a component that does not need a pointer."
+            )
+
+        if assets:
+            if (CAPTIONS in required or TRANSCRIPT in required) and not (
+                access.get("caption") or access.get("transcript_required")
+            ):
                 raise ManifestError(
-                    f"component '{component.id}' branches to '{target}', which is not a "
-                    "component of this experience"
+                    f"component '{component.id}' carries an asset, but this experience "
+                    "declares captions or a transcript and the component provides neither."
                 )
-            if target == component.id:
-                raise ManifestError(f"component '{component.id}' branches to itself")
-            if condition == "always":
-                always_edges[component.id] = target
-
-    _reject_cycles(always_edges)
-
-
-def _reject_cycles(edges: dict[str, str]) -> None:
-    """Walk each unconditional chain; a repeat visit is a closed loop."""
-    for start in edges:
-        seen = {start}
-        node = start
-        while node in edges:
-            node = edges[node]
-            if node in seen:
+            if VISUAL_DESCRIPTION in required and not (
+                all(asset.get("long_description") for asset in assets)
+                or access.get("long_description")
+            ):
                 raise ManifestError(
-                    f"the unconditional branches starting at '{start}' form a loop with no "
-                    "way out; a learner would never reach the end"
+                    f"component '{component.id}' carries an asset, but this experience "
+                    "declares visual_description and the component has no long description."
                 )
-            seen.add(node)
+        elif (
+            TEXT_ALTERNATIVES in required and spec.family == "visual" and not access.get("alt_text")
+        ):
+            raise ManifestError(
+                f"component '{component.id}' is a visual component with no asset and no "
+                "accessibility.alt_text, but this experience declares text_alternatives."
+            )
+
+
+def _component_assets(component: Component) -> list[dict[str, Any]]:
+    """Every managed asset in the visible half, however deeply nested.
+
+    Found by structure rather than by field name: ``image_choice`` carries one
+    asset per option, and a check that only looked at ``content.image`` would
+    have declared that component caption-free and let the claim stand.
+    """
+    found: list[dict[str, Any]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if _ASSET_MARKER in node:
+                found.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(component.content)
+    return found
 
 
 # ── Schema ────────────────────────────────────────────────────────────────

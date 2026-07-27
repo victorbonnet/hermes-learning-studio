@@ -25,6 +25,36 @@ import pytest
 
 HERMES_SRC_ENV = "HERMES_AGENT_SRC"
 
+#: This repository's fixtures, loaded under a name nothing can shadow.
+#:
+#: ``from tests.component_examples import ...`` cannot be used here. Hermes
+#: ships its own top-level ``tests`` package, and these tests put the Hermes
+#: checkout on ``sys.path`` — so after the first Hermes module is loaded,
+#: ``tests`` may resolve to *theirs*, and the import fails with
+#: ``ModuleNotFoundError: No module named 'tests.component_examples'``. The
+#: failure depends on what else has been imported first, which makes it a test
+#: that passes alone and fails in the suite. Loading the file by path under a
+#: private name removes the ambiguity entirely.
+_FIXTURES_MODULE = "_learning_studio_component_examples"
+
+
+def fixtures():
+    """The component examples, imported without going through ``tests``."""
+    if _FIXTURES_MODULE in sys.modules:
+        return sys.modules[_FIXTURES_MODULE]
+
+    path = Path(__file__).resolve().parent / "component_examples.py"
+    spec = importlib.util.spec_from_file_location(_FIXTURES_MODULE, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_FIXTURES_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # pragma: no cover - a broken fixture file
+        del sys.modules[_FIXTURES_MODULE]
+        raise
+    return module
+
 
 @pytest.fixture(autouse=True)
 def _restore_process_state():
@@ -144,6 +174,94 @@ def skill_preprocessing():
     return _load_module(
         "_hermes_skill_preprocessing", src / "agent" / "skill_preprocessing.py", src
     )
+
+
+# ── Fixture loading survives Hermes shadowing the `tests` package ──────────
+
+
+def test_fixtures_load_without_going_through_the_tests_package():
+    """Runs without a Hermes checkout, because the collision does not need one.
+
+    A ``tests`` package that does not contain ``component_examples`` is put
+    where an import would find it — which is exactly what a Hermes checkout on
+    ``sys.path`` does. The path-based loader must be unaffected.
+    """
+    import types
+
+    shadow = types.ModuleType("tests")
+    shadow.__path__ = []  # a package with no modules in it
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "tests" or name.startswith("tests.")
+    }
+    # The cached copy has to go too, or the import below would be answered
+    # from ``sys.modules`` and the shadowing would never be exercised.
+    for name in saved:
+        del sys.modules[name]
+    sys.modules["tests"] = shadow
+    sys.modules.pop(_FIXTURES_MODULE, None)
+    try:
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("tests.component_examples")
+
+        module = fixtures()
+
+        assert module.CANARY
+        assert module.manifest()["schema_version"] == 1
+    finally:
+        sys.modules.pop(_FIXTURES_MODULE, None)
+        sys.modules.pop("tests", None)
+        sys.modules.update(saved)
+
+
+def test_fixtures_load_with_a_foreign_tests_package_on_the_path(tmp_path: Path):
+    """The real shape of the collision, without needing a Hermes checkout.
+
+    A directory holding its own ``tests`` package is put at the front of
+    ``sys.path``, which is exactly what ``_load_module`` does with the Hermes
+    checkout. An import of ``tests.component_examples`` then resolves into
+    *that* package and fails; the path-based loader is unaffected.
+    """
+    foreign = tmp_path / "hermes-checkout"
+    (foreign / "tests").mkdir(parents=True)
+    (foreign / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (foreign / "tests" / "test_gateway.py").write_text("", encoding="utf-8")
+
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "tests" or name.startswith("tests.")
+    }
+    saved_path = list(sys.path)
+    for name in saved_modules:
+        del sys.modules[name]
+    sys.path.insert(0, str(foreign))
+    sys.modules.pop(_FIXTURES_MODULE, None)
+    try:
+        shadowed = importlib.import_module("tests")
+        assert Path(shadowed.__file__).parent == foreign / "tests", (
+            "the foreign package did not take precedence, so this proves nothing"
+        )
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("tests.component_examples")
+
+        assert fixtures().manifest()["schema_version"] == 1
+    finally:
+        sys.path[:] = saved_path
+        sys.modules.pop(_FIXTURES_MODULE, None)
+        for name in [n for n in sys.modules if n == "tests" or n.startswith("tests.")]:
+            del sys.modules[name]
+        sys.modules.update(saved_modules)
+
+
+def test_the_fixture_loader_is_idempotent():
+    """Called twice, it returns the same module rather than reloading it."""
+    sys.modules.pop(_FIXTURES_MODULE, None)
+    try:
+        assert fixtures() is fixtures()
+    finally:
+        sys.modules.pop(_FIXTURES_MODULE, None)
 
 
 # ── The mechanism SKILL.md tells the agent to use actually works ───────────
@@ -378,18 +496,17 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
         fetched = json.loads(registry.dispatch("learning_studio_get_context", {}))
         assert fetched["confirmed_context"]["goal"]["value"] == "g"
 
-        from tests.component_examples import CANARY
-        from tests.component_examples import manifest as example_manifest
+        examples = fixtures()
 
         prepared = json.loads(
-            registry.dispatch("learning_studio_prepare", {"manifest": example_manifest()})
+            registry.dispatch("learning_studio_prepare", {"manifest": examples.manifest()})
         )
         assert prepared["ok"] is True, prepared
         assert prepared["stored"] is True
         first_experience = prepared["experience_id"]
         # The response travels back through the model, so it is the one place
         # an answer key must never appear.
-        assert CANARY not in json.dumps(prepared)
+        assert examples.CANARY not in json.dumps(prepared)
     finally:
         session_context.clear_session_vars(tokens)
 
@@ -417,10 +534,8 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
             raise AssertionError("a second principal read the first principal's exercise")
 
         # A prepared exercise of their own is a different record entirely.
-        from tests.component_examples import manifest as example_manifest
-
         own = json.loads(
-            registry.dispatch("learning_studio_prepare", {"manifest": example_manifest()})
+            registry.dispatch("learning_studio_prepare", {"manifest": fixtures().manifest()})
         )
         assert own["ok"] is True, own
         assert own["experience_id"] != first_experience
@@ -445,11 +560,10 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
         )
 
     from learning_studio.storage import SCHEMA_VERSION
-    from tests.component_examples import CANARY
 
     assert version == SCHEMA_VERSION
     assert owners == 2, "the two principals' exercises were not stored separately"
-    assert CANARY not in payloads, "evaluator-only data reached the learner-facing table"
+    assert fixtures().CANARY not in payloads, "evaluator-only data reached the learner-facing table"
 
 
 def test_the_session_user_id_is_a_real_host_supplied_value():

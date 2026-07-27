@@ -76,10 +76,7 @@ def test_a_manifest_may_carry_every_optional_field():
             ],
             accessibility={
                 "source": "explicit_request",
-                "captions_required": True,
-                "reading_level": "plain",
-                "no_time_limit": True,
-                "notes": "The learner asked for captions this session.",
+                "accommodations": ["captions", "no_time_limit"],
             },
             delivery={"mode": "practice", "allow_back": True, "time_limit_seconds": 0},
         )
@@ -87,7 +84,7 @@ def test_a_manifest_may_carry_every_optional_field():
 
     assert built.content_locale == "pt-BR"
     assert built.source_references[0]["citation"] == "Netter 2019, plate 214"
-    assert built.accessibility["reading_level"] == "plain"
+    assert built.accessibility["accommodations"] == ["captions", "no_time_limit"]
 
 
 def test_a_manifest_carries_no_field_that_names_a_learner():
@@ -320,13 +317,13 @@ def test_a_branch_to_itself_is_rejected():
 
 
 def test_an_unconditional_cycle_is_rejected():
-    """``always`` edges ignore the learner, so a loop of them never ends."""
+    """``always`` edges ignore the learner, so a loop of them never ends."""  # noqa: D401
     components = [
         branching("multiple_choice", "one", branching=[{"on": "always", "go_to": "two"}]),
         branching("short_answer", "two", branching=[{"on": "always", "go_to": "one"}]),
     ]
 
-    with pytest.raises(ManifestError, match="loop with no way out"):
+    with pytest.raises(ManifestError, match="can never reach the end"):
         build_manifest(manifest(components))
 
 
@@ -337,7 +334,7 @@ def test_a_longer_unconditional_cycle_is_also_rejected():
         branching("true_false", "three", branching=[{"on": "always", "go_to": "one"}]),
     ]
 
-    with pytest.raises(ManifestError, match="loop with no way out"):
+    with pytest.raises(ManifestError, match="can never reach the end"):
         build_manifest(manifest(components))
 
 
@@ -368,7 +365,7 @@ def test_two_unconditional_branches_are_rejected():
         example("short_answer", id="two"),
     ]
 
-    with pytest.raises(ManifestError, match="more than one unconditional branch"):
+    with pytest.raises(ManifestError, match="more than one 'always' branch"):
         build_manifest(manifest(components))
 
 
@@ -451,12 +448,20 @@ def test_too_many_source_references_are_rejected():
 
 def test_accessibility_metadata_must_declare_where_it_came_from():
     with pytest.raises(ManifestError, match="source"):
-        build_manifest(manifest(accessibility={"captions_required": True}))
+        build_manifest(manifest(accessibility={"accommodations": ["captions"]}))
+
+
+def test_accessibility_metadata_must_name_what_it_asks_for():
+    with pytest.raises(ManifestError, match="accommodations"):
+        build_manifest(manifest(accessibility={"source": "explicit_request"}))
 
 
 @pytest.mark.parametrize("source", ACCESSIBILITY_SOURCES)
-def test_the_three_authoritative_sources_are_accepted(source: str):
-    built = build_manifest(manifest(accessibility={"source": source, "keyboard_only": True}))
+def test_the_three_authoritative_sources_parse(source: str):
+    """Shape only. Whether the source *says* this is checked against storage."""
+    built = build_manifest(
+        manifest(accessibility={"source": source, "accommodations": ["plain_language"]})
+    )
 
     assert built.accessibility["source"] == source
 
@@ -494,14 +499,34 @@ def test_the_accepted_sources_are_derived_from_the_provenance_vocabulary():
 def test_an_unknown_accessibility_field_is_rejected():
     with pytest.raises(ManifestError, match="diagnosis"):
         build_manifest(
-            manifest(accessibility={"source": "explicit_request", "diagnosis": "dyslexia"})
+            manifest(
+                accessibility={
+                    "source": "explicit_request",
+                    "accommodations": ["captions"],
+                    "diagnosis": "dyslexia",
+                }
+            )
         )
 
 
-def test_an_invalid_reading_level_is_rejected():
-    with pytest.raises(ManifestError, match="reading_level"):
+def test_there_is_no_free_text_field_in_accessibility_metadata():
+    """The structural half of "never persist a diagnosis": no box to type in."""
+    from learning_studio.manifest import manifest_members
+
+    accessibility = next(m for m in manifest_members() if m.name == "accessibility")
+
+    assert sorted(m.name for m in accessibility.members) == ["accommodations", "source"]
+
+
+@pytest.mark.parametrize(
+    "accommodation", ["dyslexia", "adhd", "screen reader", "extra help", "SOURCE"]
+)
+def test_an_accommodation_outside_the_vocabulary_is_rejected(accommodation: str):
+    with pytest.raises(ManifestError, match="must be one of"):
         build_manifest(
-            manifest(accessibility={"source": "explicit_request", "reading_level": "easy"})
+            manifest(
+                accessibility={"source": "explicit_request", "accommodations": [accommodation]}
+            )
         )
 
 
@@ -515,3 +540,184 @@ def test_component_accessibility_metadata_is_learner_visible():
     built = build_manifest(manifest([component]))
 
     assert built.components[0].learner_payload()["accessibility"]["no_time_limit"] is True
+
+
+# ── Branch termination: every route must be able to end ───────────────────
+
+
+def branched(component_type: str, component_id: str, *branches: tuple[str, str]):
+    payload = example(component_type, id=component_id)
+    payload.setdefault("evaluation", {})["branching"] = [
+        {"on": condition, "go_to": target} for condition, target in branches
+    ]
+    return payload
+
+
+def test_a_two_condition_cycle_that_no_answer_escapes_is_rejected():
+    """The reported reproduction: both outcomes branch, in both directions.
+
+    Nothing the learner answers moves them on. The first version of this check
+    looked only at unconditional edges and let it through.
+    """
+    components = [
+        branched("multiple_choice", "a", ("correct", "b"), ("incorrect", "b")),
+        branched("short_answer", "b", ("correct", "a"), ("incorrect", "a")),
+    ]
+
+    with pytest.raises(ManifestError, match="can never reach the end"):
+        build_manifest(manifest(components))
+
+
+def test_a_longer_closed_cycle_is_rejected():
+    components = [
+        branched("multiple_choice", "a", ("correct", "b"), ("incorrect", "b")),
+        branched("short_answer", "b", ("correct", "c"), ("incorrect", "c")),
+        branched("true_false", "c", ("correct", "a"), ("incorrect", "a")),
+    ]
+
+    with pytest.raises(ManifestError, match="can never reach the end"):
+        build_manifest(manifest(components))
+
+
+def test_a_cycle_mixing_an_unconditional_branch_with_a_covered_one_is_rejected():
+    components = [
+        branched("multiple_choice", "a", ("always", "b")),
+        branched("short_answer", "b", ("correct", "a"), ("incorrect", "a")),
+    ]
+
+    with pytest.raises(ManifestError, match="can never reach the end"):
+        build_manifest(manifest(components))
+
+
+def test_a_cycle_with_one_way_out_is_allowed():
+    """One outcome leaving the loop is all it takes to be finishable."""
+    components = [
+        branched("multiple_choice", "a", ("correct", "c"), ("incorrect", "b")),
+        branched("short_answer", "b", ("correct", "a"), ("incorrect", "a")),
+        example("true_false", id="c"),
+    ]
+
+    assert build_manifest(manifest(components)).component_count == 3
+
+
+def test_a_retry_loop_that_falls_through_on_a_correct_answer_is_allowed():
+    """Only ``incorrect`` is branched, so ``correct`` falls through to the next."""
+    components = [
+        branched("multiple_choice", "a", ("incorrect", "b")),
+        branched("short_answer", "b", ("incorrect", "a")),
+    ]
+
+    assert build_manifest(manifest(components)).component_count == 2
+
+
+def test_default_sequential_progression_needs_no_branches_at_all():
+    components = [example("true_false", id=f"item-{index}") for index in range(4)]
+
+    assert build_manifest(manifest(components)).component_count == 4
+
+
+@pytest.mark.parametrize("condition", ["correct", "incorrect", "always"])
+def test_two_branches_for_the_same_outcome_are_rejected(condition: str):
+    components = [
+        branched("multiple_choice", "a", (condition, "b"), (condition, "c")),
+        example("short_answer", id="b"),
+        example("true_false", id="c"),
+    ]
+
+    with pytest.raises(ManifestError, match=f"more than one '{condition}' branch"):
+        build_manifest(manifest(components))
+
+
+def test_a_branch_forward_past_a_component_is_allowed():
+    components = [
+        branched("multiple_choice", "a", ("correct", "c")),
+        example("short_answer", id="b"),
+        example("true_false", id="c"),
+    ]
+
+    assert build_manifest(manifest(components)).component_count == 3
+
+
+# ── The declared accessibility contract must be deliverable ───────────────
+
+
+def accessible(*accommodations: str) -> dict:
+    return {"source": "explicit_request", "accommodations": list(accommodations)}
+
+
+@pytest.mark.parametrize(
+    "component_type", ["hotspot", "labeling", "sentence_order", "matching", "timeline"]
+)
+def test_keyboard_only_with_a_pointer_component_and_no_alternative_is_rejected(
+    component_type: str,
+):
+    """Claiming an exercise is keyboard-operable does not make it so."""
+    with pytest.raises(ManifestError, match="keyboard"):
+        build_manifest(
+            manifest([example(component_type)], accessibility=accessible("keyboard_only"))
+        )
+
+
+@pytest.mark.parametrize("component_type", ["hotspot", "labeling", "sequence_order"])
+def test_keyboard_only_is_accepted_when_the_component_offers_an_alternative(
+    component_type: str,
+):
+    component = example(
+        component_type,
+        accessibility={"keyboard_alternative": "Type the number of the item instead."},
+    )
+
+    built = build_manifest(manifest([component], accessibility=accessible("keyboard_only")))
+
+    assert built.component_count == 1
+
+
+def test_keyboard_only_is_accepted_for_components_that_need_no_pointer():
+    built = build_manifest(
+        manifest([example("short_answer")], accessibility=accessible("keyboard_only"))
+    )
+
+    assert built.component_count == 1
+
+
+@pytest.mark.parametrize("component_type", ["image_choice", "diagram", "hotspot"])
+def test_captions_without_a_caption_on_an_asset_component_is_rejected(component_type: str):
+    with pytest.raises(ManifestError, match="captions or a transcript"):
+        build_manifest(manifest([example(component_type)], accessibility=accessible("captions")))
+
+
+def test_captions_are_accepted_when_the_component_carries_one():
+    component = example(
+        "diagram", accessibility={"caption": "A series circuit with three components."}
+    )
+
+    built = build_manifest(manifest([component], accessibility=accessible("captions")))
+
+    assert built.component_count == 1
+
+
+def test_visual_description_without_a_long_description_is_rejected():
+    with pytest.raises(ManifestError, match="long description"):
+        build_manifest(
+            manifest([example("hotspot")], accessibility=accessible("visual_description"))
+        )
+
+
+def test_visual_description_is_accepted_when_the_asset_carries_one():
+    component = example("hotspot")
+    component["content"]["image"]["long_description"] = (
+        "A cross-section of the heart with the four chambers and the conduction system."
+    )
+
+    built = build_manifest(manifest([component], accessibility=accessible("visual_description")))
+
+    assert built.component_count == 1
+
+
+def test_an_accommodation_with_no_component_consequence_is_simply_recorded():
+    """``reduced_motion`` constrains a renderer, not a component's contents."""
+    built = build_manifest(
+        manifest([example("hotspot")], accessibility=accessible("reduced_motion"))
+    )
+
+    assert built.accessibility["accommodations"] == ["reduced_motion"]

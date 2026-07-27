@@ -387,20 +387,51 @@ needs a reviewed, explicitly escaped inert-code channel and the renderer that
 would have to honour it.
 
 **One source of truth for the schema.** The JSON Schema the model sees and the
-validation the handler runs are generated from the same field declarations, so
-they cannot drift. The union of all 31 types is large — about 49 KB, of which
-the shapes every type shares are emitted once under `$defs` rather than 31
-times, cutting it from over 140 KB. That is the price of a schema that refuses
-exactly what the runtime refuses; a future PR could trade it for a per-type
-lookup tool if the prompt cost proves too high in practice.
+validation the handler runs are generated from the same field declarations —
+identifier, locale and date patterns are published as strings and compiled from
+those same strings, and each component type advertises exactly the scoring
+modes it accepts. `tests/test_schema_parity.py` checks representative invalid
+values against a real JSON Schema implementation *and* the runtime, so the
+agreement is verified rather than claimed. Cross-field rules JSON Schema cannot
+express — an answer that references an option, an objective that must match a
+stored one — stay the runtime's job, and the schema describes them rather than
+pretending to enforce them.
 
-**Accessibility metadata describes the exercise, never the learner.**
-`accessibility.source` must be `explicit_request`, `confirmed_track`, or
-`profile_config` — the same three provenances the context layer treats as
-authoritative. There is no value meaning "inferred", so an exercise cannot
-encode a guess about somebody's needs. Preparing an exercise writes no context,
-creates no track, and proposes no memory candidate; exercise metadata never
-becomes a durable fact about a person.
+The union of all 31 types is large — about 55 KB, of which the shapes every
+type shares are emitted once under `$defs` rather than 31 times, cutting it
+from over 140 KB. That is the price of a schema that refuses what the runtime
+refuses; a future PR could trade it for a per-type lookup tool if the prompt
+cost proves too high in practice.
+
+**Accessibility metadata is authorised, not asserted.** An experience declares
+`accommodations` from a closed vocabulary — captions, transcript, text
+alternatives, visual description, keyboard-only, reduced motion, no time limit,
+extended time, plain language — and names the `source` each came from. The
+source is then *checked*: `confirmed_track` against that track's confirmed
+context, `profile_config` against the operator's configuration,
+`explicit_request` against what the learner has actually recorded. A model can
+write the label but cannot manufacture the thing it points at, which is the
+same reasoning that removed `learner_key`. Matching is exact on the canonical
+form, with no fuzzy, substring, or semantic step — the rule the context layer
+already applies to consent.
+
+There is deliberately **no free-text accessibility field** on the manifest. A
+box to type in is a box a diagnosis eventually gets typed into, and this
+metadata is neither consented to nor an appropriate place for one. Component
+alt text and captions are free text, and are refused if they describe a person
+rather than the component: a diagnosis, a disability label, or a sentence about
+the learner cannot be stored. The same vocabulary stays legal in prompts and
+content, because an exercise about glaucoma is an exercise about glaucoma.
+
+**A declared accommodation must be deliverable.** `keyboard_only` alongside a
+hotspot, labelling, matching, or drag-ordering component is refused unless that
+component supplies a keyboard alternative; `captions` and `visual_description`
+require the corresponding metadata on every asset-bearing component. Telling a
+learner an exercise is usable when it is not is worse than claiming nothing.
+
+Preparing an exercise writes no context, creates no track, and proposes no
+memory candidate; exercise metadata never becomes a durable fact about a
+person.
 
 **Source references are described, not linked.** Title, author, publication
 date, citation label, an approved source identifier, and a note. No URLs, no

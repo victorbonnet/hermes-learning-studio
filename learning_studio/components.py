@@ -34,15 +34,22 @@ answer, and there is no code path here that could — see
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from typing import Any
 
 from .safety import (
+    DATE_PATTERN,
+    IDENTIFIER_PATTERN,
+    LOCALE_PATTERN,
     UnsafeContent,
-    normalised_for_comparison,
+    contains_token_sequence,
+    reject_learner_description,
+    safe_date,
     safe_identifier,
     safe_locale,
     safe_text,
+    tokens,
 )
 
 
@@ -155,9 +162,17 @@ class Field:
 class Text(Field):
     max_chars: int = TEXT_MAX
     multiline: bool = False
+    #: Refuse vocabulary that describes a person rather than the component.
+    #: Set on accessibility fields, where a diagnosis has no place; left off
+    #: for prompts and content, where the same words are ordinary subject
+    #: matter — a biology item may legitimately ask about glaucoma.
+    about_the_component: bool = False
 
     def validate(self, value: Any, path: str) -> Any:
-        return safe_text(value, path, max_chars=self.max_chars, multiline=self.multiline)
+        text = safe_text(value, path, max_chars=self.max_chars, multiline=self.multiline)
+        if self.about_the_component:
+            reject_learner_description(text, path)
+        return text
 
     def schema(self) -> dict[str, Any]:
         return self._described({"type": "string", "minLength": 1, "maxLength": self.max_chars})
@@ -169,7 +184,17 @@ class Ident(Field):
         return safe_identifier(value, path)
 
     def schema(self) -> dict[str, Any]:
-        return self._described({"type": "string", "minLength": 1, "maxLength": 64})
+        # The advertised pattern is the same string the validator compiles, so
+        # an identifier the schema accepts is one the runtime accepts.
+        return self._described(
+            {"type": "string", "minLength": 1, "maxLength": 64, "pattern": IDENTIFIER_PATTERN}
+        )
+
+    def emit(self) -> dict[str, Any]:
+        """Always a reference. Identifiers appear well over a hundred times in
+        the union, and the pattern that makes the schema and the runtime agree
+        is longer than the reference that stands in for it."""
+        return {"$ref": f"#/$defs/{self.ref or IDENTIFIER_DEF}"}
 
 
 @dataclass(frozen=True)
@@ -178,7 +203,22 @@ class Locale(Field):
         return safe_locale(value, path)
 
     def schema(self) -> dict[str, Any]:
-        return self._described({"type": "string", "minLength": 2, "maxLength": 16})
+        return self._described(
+            {"type": "string", "minLength": 2, "maxLength": 16, "pattern": LOCALE_PATTERN}
+        )
+
+
+@dataclass(frozen=True)
+class Date(Field):
+    """``YYYY``, ``YYYY-MM``, or ``YYYY-MM-DD`` — never free text."""
+
+    def validate(self, value: Any, path: str) -> Any:
+        return safe_date(value, path)
+
+    def schema(self) -> dict[str, Any]:
+        return self._described(
+            {"type": "string", "minLength": 4, "maxLength": 10, "pattern": DATE_PATTERN}
+        )
 
 
 @dataclass(frozen=True)
@@ -240,6 +280,37 @@ class Enum(Field):
 
     def schema(self) -> dict[str, Any]:
         return self._described({"type": "string", "enum": list(self.choices)})
+
+
+@dataclass(frozen=True)
+class EnumList(Field):
+    """A set drawn from a fixed vocabulary — never free text.
+
+    Used where the alternative would be a description of a person. A closed
+    vocabulary is what makes "this exercise needs captions" storable and "the
+    learner has a hearing impairment" unwritable.
+    """
+
+    choices: tuple[str, ...] = ()
+
+    def validate(self, value: Any, path: str) -> Any:
+        items = _as_list(value, path, len(self.choices))
+        element = Enum("item", choices=self.choices)
+        chosen = [element.validate(item, f"{path}[{i}]") for i, item in enumerate(items)]
+        duplicates = sorted({item for item in chosen if chosen.count(item) > 1})
+        if duplicates:
+            raise ComponentError(f"{path} repeats {', '.join(duplicates)}")
+        return chosen
+
+    def schema(self) -> dict[str, Any]:
+        return self._described(
+            {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": len(self.choices),
+                "items": {"type": "string", "enum": list(self.choices)},
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -406,6 +477,10 @@ def shared(name: str, field: Field) -> Field:
     return replace(field, ref=name)
 
 
+#: The name every :class:`Ident` resolves to.
+IDENTIFIER_DEF = "identifier"
+
+
 def shared_definitions() -> dict[str, Any]:
     """The ``$defs`` block every reference above resolves against."""
     return {name: field.schema() for name, field in sorted(_SHARED.items())}
@@ -438,6 +513,17 @@ def _labelled(name: str, *, text: str = "text", max_chars: int = TEXT_MAX, **kwa
     )
 
 
+shared(
+    IDENTIFIER_DEF,
+    Ident(
+        "identifier",
+        description=(
+            "An opaque label, unique where it is used: lowercase letters, digits, "
+            "'-' and '_', up to 64 characters."
+        ),
+    ),
+)
+
 _ASSET = shared(
     "managed_asset",
     Obj(
@@ -445,8 +531,13 @@ _ASSET = shared(
         description="A managed asset, by opaque identifier. Never a URL or a path.",
         members=(
             Ident("asset_ref", required=True),
-            Text("alt_text", required=True, max_chars=TEXT_MAX),
-            Text("long_description", max_chars=PASSAGE_MAX, multiline=True),
+            Text("alt_text", required=True, max_chars=TEXT_MAX, about_the_component=True),
+            Text(
+                "long_description",
+                max_chars=PASSAGE_MAX,
+                multiline=True,
+                about_the_component=True,
+            ),
         ),
     ),
 )
@@ -486,12 +577,18 @@ shared("text_answer", Obj("answer", required=True, members=_ACCEPTED_MEMBERS))
 #: Note what is absent: nothing here describes the learner. It describes what
 #: the component needs in order to be usable.
 COMPONENT_ACCESSIBILITY: tuple[Field, ...] = (
-    Text("alt_text", max_chars=TEXT_MAX, description="Text alternative for non-text content."),
-    Text("caption", max_chars=TEXT_MAX),
-    Text("long_description", max_chars=PASSAGE_MAX, multiline=True),
+    Text(
+        "alt_text",
+        max_chars=TEXT_MAX,
+        about_the_component=True,
+        description="Text alternative for non-text content.",
+    ),
+    Text("caption", max_chars=TEXT_MAX, about_the_component=True),
+    Text("long_description", max_chars=PASSAGE_MAX, multiline=True, about_the_component=True),
     Text(
         "keyboard_alternative",
         max_chars=TEXT_MAX,
+        about_the_component=True,
         description="How to answer without dragging or pointing.",
     ),
     Bool("transcript_required"),
@@ -571,8 +668,17 @@ class ComponentSpec:
     #: rubric is not an exercise, it is a prompt with no way to close the loop.
     requires_rubric: bool = False
     #: True for self-report components, where a rubric would be a category
-    #: error: nobody grades how confident someone says they feel.
+    #: error: nobody grades how confident someone says they feel, so a rubric
+    #: is refused outright rather than merely discouraged.
     self_report: bool = False
+    #: The scoring modes that make sense for this type. Anything else is a
+    #: category error — an ordered score over a single-answer question grades
+    #: nothing — and is refused by the schema and the runtime alike.
+    scoring_modes: tuple[str, ...] = ()
+    #: True when answering needs pointing, dragging, or placing. Used to check
+    #: an experience that claims keyboard-only operation can actually deliver
+    #: it.
+    pointer_interaction: bool = False
     refs: tuple[Ref, ...] = ()
     #: Name of a shared ``$defs`` entry holding this type's answer object, for
     #: the shapes several types have in common. The members in ``answer`` are
@@ -587,6 +693,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     # ── Selection ─────────────────────────────────────────────────────────
     ComponentSpec(
         type="multiple_choice",
+        scoring_modes=("exact",),
         family="selection",
         summary="One correct option among several.",
         content=(
@@ -598,6 +705,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="multi_select",
+        scoring_modes=("set",),
         family="selection",
         summary="Several correct options among many.",
         content=(
@@ -612,6 +720,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="true_false",
+        scoring_modes=("exact",),
         family="selection",
         summary="A single claim to accept or reject.",
         content=(Text("statement", required=True, max_chars=PROMPT_MAX, multiline=True),),
@@ -619,6 +728,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="classification",
+        scoring_modes=("set",),
+        pointer_interaction=True,
         family="selection",
         summary="Put each item in exactly one category.",
         content=(
@@ -645,6 +756,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     # ── Text input ────────────────────────────────────────────────────────
     ComponentSpec(
         type="fill_blank",
+        scoring_modes=("exact", "normalised", "numeric"),
+        leak_paths=("blanks[].accepted",),
         family="text_input",
         summary="Complete the gaps in a passage.",
         content=(
@@ -676,10 +789,11 @@ SPECS: tuple[ComponentSpec, ...] = (
             Bool("accent_sensitive"),
         ),
         refs=(Ref("blanks[].blank_id", "blanks", mode="permutation"),),
-        leak_paths=("blanks[].accepted",),
     ),
     ComponentSpec(
         type="short_answer",
+        scoring_modes=("exact", "normalised", "numeric"),
+        leak_paths=("accepted",),
         family="text_input",
         summary="A short produced answer, graded against accepted forms.",
         content=(Int("max_words", minimum=1, maximum=200),),
@@ -688,6 +802,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="free_response",
+        scoring_modes=("rubric",),
         family="text_input",
         summary="Extended writing, judged against a rubric.",
         content=(
@@ -699,6 +814,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="translation",
+        scoring_modes=("exact", "normalised"),
+        leak_paths=("accepted",),
         family="text_input",
         summary="Render a passage in another language.",
         content=(
@@ -711,6 +828,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="error_correction",
+        scoring_modes=("exact", "normalised"),
+        leak_paths=("corrections[].correct",),
         family="text_input",
         summary="Find and fix what is wrong in a given passage.",
         content=(
@@ -732,6 +851,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="code_response",
+        scoring_modes=("rubric", "exact", "normalised"),
+        leak_paths=("reference_solution",),
         family="text_input",
         summary="Write code, collected and compared as text. Never executed.",
         content=(
@@ -748,6 +869,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     # ── Ordering and matching ─────────────────────────────────────────────
     ComponentSpec(
         type="sentence_order",
+        scoring_modes=("ordered",),
+        pointer_interaction=True,
         family="ordering",
         summary="Arrange fragments into a well-formed whole.",
         content=(_labelled("tokens", required=True, max_items=MAX_ITEMS, max_chars=LABEL_MAX),),
@@ -756,6 +879,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="sequence_order",
+        scoring_modes=("ordered",),
+        pointer_interaction=True,
         family="ordering",
         summary="Put steps into the order they must happen in.",
         content=(_labelled("steps", required=True, max_items=MAX_ITEMS),),
@@ -764,6 +889,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="matching",
+        scoring_modes=("set",),
+        pointer_interaction=True,
         family="ordering",
         summary="Pair each item on the left with one on the right.",
         content=(
@@ -786,6 +913,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="categorization",
+        scoring_modes=("set",),
+        pointer_interaction=True,
         family="ordering",
         summary="Group items, where an item may belong to more than one group.",
         content=(
@@ -813,6 +942,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     # ── Recall ────────────────────────────────────────────────────────────
     ComponentSpec(
         type="flashcard",
+        scoring_modes=("self_check",),
+        leak_paths=("back",),
         family="recall",
         summary="A prompt and its reverse, self-graded after an attempt.",
         content=(
@@ -823,20 +954,21 @@ SPECS: tuple[ComponentSpec, ...] = (
             Text("back", required=True, max_chars=TEXT_MAX, multiline=True),
             Text("mnemonic", max_chars=TEXT_MAX),
         ),
-        leak_paths=("back",),
     ),
     ComponentSpec(
         type="typed_recall",
+        scoring_modes=("exact", "normalised"),
+        leak_paths=("accepted",),
         family="recall",
         summary="Retrieve from memory and type it, graded against accepted forms.",
         content=(Text("cue", required=True, max_chars=TEXT_MAX),),
         answer=_ACCEPTED_MEMBERS,
         answer_ref="text_answer",
-        leak_paths=("accepted",),
     ),
     # ── Visual and diagrammatic ───────────────────────────────────────────
     ComponentSpec(
         type="image_observation",
+        scoring_modes=("rubric",),
         family="visual",
         summary="Describe what an image shows, judged against a rubric.",
         content=(
@@ -848,6 +980,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="image_choice",
+        scoring_modes=("exact",),
         family="visual",
         summary="Choose the right image among several.",
         content=(
@@ -867,6 +1000,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="diagram",
+        scoring_modes=("exact", "normalised"),
+        leak_paths=("accepted",),
         family="visual",
         summary="Read a diagram and state what it shows.",
         content=(
@@ -878,6 +1013,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="hotspot",
+        scoring_modes=("exact",),
+        pointer_interaction=True,
         family="visual",
         summary="Point at the right place on an image.",
         content=(_asset("image", required=True), Bool("show_grid")),
@@ -903,6 +1040,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="labeling",
+        scoring_modes=("set",),
+        pointer_interaction=True,
         family="visual",
         summary="Put each label on the right marker.",
         content=(
@@ -935,6 +1074,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     # ── Timeline and process ──────────────────────────────────────────────
     ComponentSpec(
         type="timeline",
+        scoring_modes=("ordered",),
+        pointer_interaction=True,
         family="timeline",
         summary="Place events in chronological order.",
         content=(
@@ -955,6 +1096,8 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="process_flow",
+        scoring_modes=("ordered",),
+        pointer_interaction=True,
         family="timeline",
         summary="Order the stages of a process and how they connect.",
         content=(
@@ -982,6 +1125,9 @@ SPECS: tuple[ComponentSpec, ...] = (
     # ── Structured information ────────────────────────────────────────────
     ComponentSpec(
         type="table_grid",
+        scoring_modes=("set", "exact", "normalised"),
+        pointer_interaction=True,
+        leak_paths=("cells[].accepted",),
         family="structured",
         summary="Fill a grid, contrasting cases across two dimensions.",
         content=(
@@ -1023,6 +1169,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     # ── Scenarios and decisions ───────────────────────────────────────────
     ComponentSpec(
         type="scenario_choice",
+        scoring_modes=("exact",),
         family="scenario",
         summary="Judge one situation and choose what to do.",
         content=(
@@ -1047,6 +1194,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="decision_path",
+        scoring_modes=("ordered",),
         family="scenario",
         summary="A sequence of decisions where each one follows from the last.",
         content=(
@@ -1075,6 +1223,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="case_study",
+        scoring_modes=("rubric",),
         family="scenario",
         summary="Extended material with questions, judged against a rubric.",
         content=(
@@ -1088,6 +1237,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     # ── Reflection and assessment ─────────────────────────────────────────
     ComponentSpec(
         type="confidence_rating",
+        scoring_modes=("self_check",),
         family="reflection",
         summary="How sure the learner is. A self-report, never marked.",
         content=(
@@ -1100,6 +1250,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="self_explanation",
+        scoring_modes=("rubric",),
         family="reflection",
         summary="Explain the reasoning, judged against a rubric.",
         content=(
@@ -1111,6 +1262,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="reflection",
+        scoring_modes=("self_check",),
         family="reflection",
         summary="Look back on the work. A self-report, never marked.",
         content=(
@@ -1122,6 +1274,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     ),
     ComponentSpec(
         type="rubric_response",
+        scoring_modes=("rubric",),
         family="reflection",
         summary="Open work produced explicitly against named criteria.",
         content=(
@@ -1165,20 +1318,33 @@ _RUBRIC = shared(
     ),
 )
 
-_SCORING = shared(
-    "scoring",
-    Obj(
-        "scoring",
-        description="How the response is judged. Evaluator-only.",
-        members=(
-            Enum("mode", required=True, choices=SCORING_MODES),
-            Bool("partial_credit"),
-            Int("points", minimum=0, maximum=1000),
-            Number("tolerance", minimum=0.0, maximum=1000000.0),
-            Text("units", max_chars=40),
+
+def _scoring(modes: tuple[str, ...]) -> Field:
+    """The scoring block for one set of allowed modes.
+
+    Emitted per mode-set rather than once for everything: the type already
+    decides what "scored" can mean, so the schema says so too. There are far
+    fewer distinct sets than there are component types, so this stays a
+    handful of definitions rather than 31.
+    """
+    name = "scoring_" + "_".join(modes)
+    if name in _SHARED:
+        return replace(_SHARED[name], ref=name)
+    return shared(
+        name,
+        Obj(
+            "scoring",
+            description="How the response is judged. Evaluator-only.",
+            members=(
+                Enum("mode", required=True, choices=modes),
+                Bool("partial_credit"),
+                Int("points", minimum=0, maximum=1000),
+                Number("tolerance", minimum=0.0, maximum=1000000.0),
+                Text("units", max_chars=40),
+            ),
         ),
-    ),
-)
+    )
+
 
 _FEEDBACK = shared(
     "feedback",
@@ -1234,32 +1400,47 @@ _NOTES = shared(
 )
 
 
-#: The judging half, identical for every component type. Two variants, because
-#: whether a rubric is *required* is the one thing that differs: open work with
-#: no criteria cannot be marked, and the schema should say so rather than
-#: leaving that to the runtime alone.
-_EVALUATION_MEMBERS: tuple[Field, ...] = (_RUBRIC, _SCORING, _HINTS, _FEEDBACK, _BRANCHING, _NOTES)
+#: The judging half. Everything except ``scoring`` is identical for every
+#: component type; ``scoring`` narrows to the modes the type can actually be
+#: marked with, and the rubric is required, optional, or refused depending on
+#: whether the type is open work, keyed, or a self-report.
+_EVALUATION_TAIL: tuple[Field, ...] = (_HINTS, _FEEDBACK, _BRANCHING, _NOTES)
 
-_EVALUATION = shared(
-    "evaluation",
-    Obj(
-        "evaluation",
-        description="How the response is judged. Never shown to the learner.",
-        members=_EVALUATION_MEMBERS,
-    ),
-)
 
-_EVALUATION_WITH_RUBRIC = shared(
-    "evaluation_with_rubric",
-    Obj(
-        "evaluation",
-        required=True,
-        description=(
-            "How the response is judged. Open work needs a rubric. Never shown to the learner."
+def _evaluation(spec: ComponentSpec) -> Field:
+    """The evaluation block for one component type, shared by shape."""
+    scoring = _scoring(spec.scoring_modes)
+    if spec.self_report:
+        # No rubric at all. Grading how confident somebody says they feel is a
+        # category error, and a field that exists invites the attempt.
+        kind, members, required = "self_report", (scoring, *_EVALUATION_TAIL), False
+    elif spec.requires_rubric:
+        kind = "open"
+        members = (replace(_RUBRIC, required=True), scoring, *_EVALUATION_TAIL)
+        required = True
+    else:
+        kind, members, required = "keyed", (_RUBRIC, scoring, *_EVALUATION_TAIL), False
+
+    name = f"evaluation_{kind}_{'_'.join(spec.scoring_modes)}"
+    if name in _SHARED:
+        return replace(_SHARED[name], ref=name, required=required)
+    return shared(
+        name,
+        Obj(
+            "evaluation",
+            required=required,
+            description="How the response is judged. Never shown to the learner.",
+            members=members,
         ),
-        members=(replace(_RUBRIC, required=True), *_EVALUATION_MEMBERS[1:]),
-    ),
-)
+    )
+
+
+#: Registering every type's scoring and evaluation block at import time, so
+#: that :func:`shared_definitions` is complete no matter what order a caller
+#: asks in. Built lazily, a definition referenced by a component branch could
+#: be missing from ``$defs`` simply because nothing had asked for that branch
+#: yet — a dangling reference in the advertised schema.
+_EAGER_DEFINITIONS: tuple[Field, ...] = tuple(_evaluation(spec) for spec in SPECS)
 
 
 def component_members(spec: ComponentSpec) -> tuple[Field, ...]:
@@ -1282,7 +1463,7 @@ def component_members(spec: ComponentSpec) -> tuple[Field, ...]:
                 ref=spec.answer_ref,
             )
         )
-    members.append(_EVALUATION_WITH_RUBRIC if spec.requires_rubric else _EVALUATION)
+    members.append(_evaluation(spec))
     return tuple(members)
 
 
@@ -1359,6 +1540,7 @@ def build_component(raw: Any, path: str) -> Component:
 
     _check_answer_references(spec, content, answer, path)
     _check_scoring(spec, evaluation, path)
+    _check_feedback(spec, content, evaluation, path)
     for check in _CROSS_CHECKS.get(spec.type, ()):
         check(content, answer, path)
     _check_word_bounds(content, path)
@@ -1396,6 +1578,15 @@ def _check_answer_references(
                 f"{path}.answer.{ref.answer_path} must name every entry in "
                 f"{ref.content_field} exactly once"
             )
+        # A repeated id in a set-valued answer is not a stronger answer, it is
+        # an ambiguous one: "these two options" listed twice grades differently
+        # depending on whether the marker deduplicates.
+        if ref.mode != "member" or ref.answer_path.endswith("[]"):
+            duplicates = sorted({v for v in referenced if referenced.count(v) > 1})
+            if duplicates:
+                raise ComponentError(
+                    f"{path}.answer.{ref.answer_path} names {', '.join(duplicates)} more than once"
+                )
 
 
 def _check_decision_path(content: dict[str, Any], answer: dict[str, Any], path: str) -> None:
@@ -1419,19 +1610,90 @@ def _check_decision_path(content: dict[str, Any], answer: dict[str, Any], path: 
 
 
 def _check_table_grid(content: dict[str, Any], answer: dict[str, Any], path: str) -> None:
-    """One expected value per cell, and never in a cell already filled in."""
-    prefilled = {(cell["row_id"], cell["column_id"]) for cell in content.get("prefilled_cells", [])}
-    seen: set[tuple[str, str]] = set()
+    """Every cell in the grid is either filled in or expected, exactly once.
+
+    A grid with an unaccounted cell is a question with no stated answer: the
+    learner is shown an empty box nothing will ever mark.
+    """
+    rows = _content_ids(content, "rows")
+    columns = _content_ids(content, "columns")
+    grid = {(row, column) for row in rows for column in columns}
+
+    prefilled: set[tuple[str, str]] = set()
+    for index, cell in enumerate(content.get("prefilled_cells", [])):
+        key = (cell["row_id"], cell["column_id"])
+        where = f"{path}.content.prefilled_cells[{index}]"
+        _require_cell(key, grid, rows, columns, where)
+        if key in prefilled:
+            raise ComponentError(f"{where} fills the same cell twice")
+        prefilled.add(key)
+
+    expected: set[tuple[str, str]] = set()
     for index, cell in enumerate(answer.get("cells", [])):
         key = (cell["row_id"], cell["column_id"])
-        if key in seen:
-            raise ComponentError(f"{path}.answer.cells[{index}] defines the same cell twice")
+        where = f"{path}.answer.cells[{index}]"
+        _require_cell(key, grid, rows, columns, where)
+        if key in expected:
+            raise ComponentError(f"{where} defines the same cell twice")
         if key in prefilled:
             raise ComponentError(
-                f"{path}.answer.cells[{index}] expects an answer in a cell that is "
-                "already filled in for the learner"
+                f"{where} expects an answer in a cell that is already filled in for the learner"
             )
-        seen.add(key)
+        expected.add(key)
+
+    unaccounted = sorted(grid - prefilled - expected)
+    if unaccounted:
+        first = unaccounted[0]
+        raise ComponentError(
+            f"{path} leaves cell ({first[0]}, {first[1]}) with neither a prefilled value nor "
+            f"an expected answer; {len(unaccounted)} cell(s) are unaccounted for"
+        )
+
+
+def _require_cell(
+    key: tuple[str, str], grid: set[tuple[str, str]], rows, columns, where: str
+) -> None:
+    if key[0] not in rows:
+        raise ComponentError(f"{where}.row_id names '{key[0]}', which rows does not declare")
+    if key[1] not in columns:
+        raise ComponentError(f"{where}.column_id names '{key[1]}', which columns does not declare")
+    if key not in grid:  # pragma: no cover - unreachable once both ids exist
+        raise ComponentError(f"{where} is not a cell of this grid")
+
+
+#: ``{{blank_id}}`` in a cloze passage. Declared here so the validator and the
+#: schema description name the same syntax.
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-z0-9_-]+)\s*\}\}")
+
+
+def _check_fill_blank(content: dict[str, Any], answer: dict[str, Any], path: str) -> None:
+    """Every gap in the passage is a declared blank, and every blank is a gap.
+
+    Both directions matter. A placeholder with no blank is a gap nothing can
+    grade; a blank with no placeholder is an answer the learner is never
+    given anywhere to write.
+    """
+    declared = _content_ids(content, "blanks")
+    found = _PLACEHOLDER_RE.findall(content.get("text", ""))
+
+    unknown = sorted({name for name in found if name not in declared})
+    if unknown:
+        raise ComponentError(
+            f"{path}.content.text uses placeholder(s) {', '.join(unknown)}, which blanks "
+            "does not declare"
+        )
+    repeated = sorted({name for name in found if found.count(name) > 1})
+    if repeated:
+        raise ComponentError(
+            f"{path}.content.text repeats placeholder(s) {', '.join(repeated)}; each blank "
+            "needs its own identifier"
+        )
+    missing = [name for name in declared if name not in found]
+    if missing:
+        raise ComponentError(
+            f"{path}.content.text has no gap for blank(s) {', '.join(missing)}; write each "
+            "one as {{blank_id}} where it belongs"
+        )
 
 
 #: How many coordinates each hotspot shape needs. A region with the wrong
@@ -1467,6 +1729,7 @@ def _check_confidence_scale(content: dict[str, Any], answer: dict[str, Any], pat
 #: Per-type checks that need to see the whole component at once.
 _CROSS_CHECKS: dict[str, tuple[Any, ...]] = {
     "decision_path": (_check_decision_path,),
+    "fill_blank": (_check_fill_blank,),
     "table_grid": (_check_table_grid,),
     "hotspot": (_check_hotspot,),
     "confidence_rating": (_check_confidence_scale,),
@@ -1481,45 +1744,106 @@ def _check_word_bounds(content: dict[str, Any], path: str) -> None:
 
 
 def _check_scoring(spec: ComponentSpec, evaluation: dict[str, Any], path: str) -> None:
-    """Refuse a scoring definition that contradicts the component itself."""
+    """Refuse a scoring definition that contradicts the component itself.
+
+    The mode enum in the schema already narrows to what this type can be
+    marked with; this re-checks it, because the schema is guidance and the
+    runtime is the boundary.
+    """
+    if spec.self_report and evaluation.get("rubric"):
+        raise ComponentError(
+            f"{path}.evaluation.rubric does not apply to a self-report component: nobody "
+            "marks how confident someone says they feel"
+        )
+
     scoring = evaluation.get("scoring")
     if scoring is None:
         return
     mode = scoring.get("mode")
+    if mode not in spec.scoring_modes:
+        raise ComponentError(
+            f"{path}.evaluation.scoring.mode '{mode}' does not apply to a {spec.type} "
+            f"component; use one of: {', '.join(spec.scoring_modes)}"
+        )
     if mode == "rubric" and not evaluation.get("rubric"):
         raise ComponentError(f"{path}.evaluation.scoring.mode is 'rubric' but no rubric is defined")
-    if mode == "numeric" and spec.family in {"selection", "ordering", "visual"}:
+
+
+def _check_feedback(spec: ComponentSpec, content: dict[str, Any], evaluation, path: str) -> None:
+    """Per-option feedback must name an option this component actually has.
+
+    Feedback attached to an option that does not exist is feedback nobody will
+    ever see, and two entries for one option is a coin toss over which the
+    learner gets.
+    """
+    per_option = (evaluation.get("feedback") or {}).get("per_option") or []
+    if not per_option:
+        return
+
+    declared = set(_content_ids(content, "options"))
+    if not declared:
         raise ComponentError(
-            f"{path}.evaluation.scoring.mode 'numeric' does not apply to a {spec.family} component"
+            f"{path}.evaluation.feedback.per_option does not apply to a {spec.type} "
+            "component, which has no options"
         )
-    if spec.self_report and mode not in (None, "self_check", "rubric"):
-        raise ComponentError(
-            f"{path}.evaluation.scoring.mode must be 'self_check' for a self-report component"
-        )
+
+    seen: set[str] = set()
+    for index, entry in enumerate(per_option):
+        option_id = entry["option_id"]
+        where = f"{path}.evaluation.feedback.per_option[{index}].option_id"
+        if option_id not in declared:
+            raise ComponentError(f"{where} names '{option_id}', which options does not declare")
+        if option_id in seen:
+            raise ComponentError(f"{where} gives '{option_id}' feedback twice")
+        seen.add(option_id)
 
 
 def _check_answer_leak(spec: ComponentSpec, component: Component, path: str) -> None:
-    """Refuse an answer already visible in the component that asks for it.
+    """Refuse an answer the learner can already read in the question.
 
-    Applied only where showing the answer is *definitionally* a leak: the gap
-    in a cloze, the back of a flashcard, the target of a recall cue. It is
-    deliberately not applied everywhere — "Define photosynthesis" legitimately
-    contains the word its answer is about, and a blanket rule would reject
-    ordinary, correct exercises while catching nothing an author intended.
+    Applied to every component whose hidden answer holds text the learner is
+    expected to *produce*: cloze gaps, short answers, translations, the back
+    of a flashcard, a recall target, a corrected sentence, a reference
+    solution, a grid cell. Selection components are exempt because their key
+    is an opaque option id — the option *text* is meant to be visible, and
+    that is the whole format.
+
+    The comparison is over the complete recursive learner-visible projection —
+    prompt, content, labels, captions, alt text, everything — and matches on
+    token boundaries rather than substrings. That is what lets a two-character
+    answer such as ``Na`` be checked without it matching inside "national",
+    and what keeps "Define photosynthesis" legal while refusing "Type Paris.
+    The answer is Paris."
     """
     if not spec.leak_paths:
         return
-    visible = normalised_for_comparison(_flatten_text(component.learner_payload()))
+    visible = tokens(_flatten_text(_leak_surface(spec, component)))
     for leak_path in spec.leak_paths:
         for value in _walk(component.answer, leak_path):
             for text in value if isinstance(value, list) else [value]:
-                if not isinstance(text, str) or len(text.strip()) < 4:
+                if not isinstance(text, str):
                     continue
-                if normalised_for_comparison(text) in visible:
+                if contains_token_sequence(visible, tokens(text)):
                     raise ComponentError(
-                        f"{path} shows its own answer: '{text}' appears in the part the "
-                        "learner sees before answering"
+                        f"{path} shows its own answer: '{text}' is already readable in the "
+                        "part the learner sees before answering"
                     )
+
+
+def _leak_surface(spec: ComponentSpec, component: Component) -> dict[str, Any]:
+    """The visible half, minus anything an answer may legitimately repeat.
+
+    Only one exception exists, and it is a real one: a grid's prefilled cells
+    are visible *worked examples*, and two cells of a comparison table may
+    honestly hold the same value — "4" filled in for one organism and "4"
+    expected for another. A prefilled cell that duplicates its own cell's
+    answer is refused separately, by :func:`_check_table_grid`.
+    """
+    payload = component.learner_payload()
+    if spec.type != "table_grid":
+        return payload
+    content = {k: v for k, v in payload.get("content", {}).items() if k != "prefilled_cells"}
+    return {**payload, "content": content}
 
 
 def _flatten_text(value: Any) -> str:

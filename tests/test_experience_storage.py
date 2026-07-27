@@ -298,17 +298,23 @@ def test_a_withdrawn_track_takes_no_new_experience(hermes_home: Path):
         prepare(track_id=track_id)
 
 
+def stored_objective(track_id: str, principal: Principal = OWNER, **overrides) -> tuple[str, dict]:
+    """An objective on *track_id*, and the manifest objective that matches it."""
+    objective = {"behavior": "state the base case", "condition": "unaided", "standard": "4 in 5"}
+    objective.update(overrides)
+    saved = service.save_context(
+        principal=principal, objectives=[{"track_id": track_id, **objective}]
+    )
+    return saved["outcome"]["objectives"][0]["objective_id"], objective
+
+
 def test_an_objective_may_be_named_when_its_track_is(hermes_home: Path):
     track_id = confirmed_track()
-    saved = service.save_context(
-        principal=OWNER,
-        objectives=[
-            {"track_id": track_id, "behavior": "b", "condition": "c", "standard": "4 in 5"}
-        ],
-    )
-    objective_id = saved["outcome"]["objectives"][0]["objective_id"]
+    objective_id, objective = stored_objective(track_id)
 
-    result = prepare(track_id=track_id, objective_id=objective_id)
+    result = prepare(
+        manifest=manifest(objective=objective), track_id=track_id, objective_id=objective_id
+    )
 
     assert result["objective_id"] == objective_id
 
@@ -320,28 +326,21 @@ def test_an_objective_without_its_track_is_refused(hermes_home: Path):
 
 def test_another_learners_objective_is_refused(hermes_home: Path):
     track_id = confirmed_track(OWNER)
-    saved = service.save_context(
-        principal=OWNER,
-        objectives=[
-            {"track_id": track_id, "behavior": "b", "condition": "c", "standard": "4 in 5"}
-        ],
-    )
-    objective_id = saved["outcome"]["objectives"][0]["objective_id"]
+    objective_id, objective = stored_objective(track_id)
     other_track = confirmed_track(OTHER)
 
     with pytest.raises(service.NotFoundError):
-        prepare(OTHER, track_id=other_track, objective_id=objective_id)
+        prepare(
+            OTHER,
+            manifest=manifest(objective=objective),
+            track_id=other_track,
+            objective_id=objective_id,
+        )
 
 
 def test_a_retired_objective_is_refused(hermes_home: Path):
     track_id = confirmed_track()
-    saved = service.save_context(
-        principal=OWNER,
-        objectives=[
-            {"track_id": track_id, "behavior": "b", "condition": "c", "standard": "4 in 5"}
-        ],
-    )
-    objective_id = saved["outcome"]["objectives"][0]["objective_id"]
+    objective_id, _ = stored_objective(track_id)
     service.save_context(
         principal=OWNER,
         objectives=[{"objective_id": objective_id, "track_id": track_id, "status": "retired"}],
@@ -517,3 +516,166 @@ def test_the_refusal_names_no_path(hermes_home: Path):
         prepare()
 
     assert str(hermes_home) not in str(refusal.value)
+
+
+# ── The experience must be about the objective it names ───────────────────
+
+
+@pytest.mark.parametrize("part", ["behavior", "condition", "standard"])
+def test_an_objective_the_manifest_contradicts_is_refused(hermes_home: Path, part: str):
+    """Ownership is not enough. A record that reads as evidence of progress
+    against something it never tested is worse than no record."""
+    track_id = confirmed_track()
+    objective_id, objective = stored_objective(track_id)
+    contradicted = {**objective, part: "something else entirely"}
+
+    with pytest.raises(service.ValidationError, match=part):
+        prepare(
+            manifest=manifest(objective=contradicted),
+            track_id=track_id,
+            objective_id=objective_id,
+        )
+
+
+def test_objective_agreement_ignores_case_and_spacing(hermes_home: Path):
+    track_id = confirmed_track()
+    objective_id, objective = stored_objective(track_id)
+    reworded = {key: f"  {value.upper()}  " for key, value in objective.items()}
+
+    result = prepare(
+        manifest=manifest(objective=reworded), track_id=track_id, objective_id=objective_id
+    )
+
+    assert result["objective_id"] == objective_id
+
+
+def test_an_objective_from_another_track_is_refused(hermes_home: Path):
+    first = confirmed_track(name="First")
+    second = confirmed_track(name="Second")
+    objective_id, objective = stored_objective(first)
+
+    with pytest.raises(service.NotFoundError):
+        prepare(
+            manifest=manifest(objective=objective),
+            track_id=second,
+            objective_id=objective_id,
+        )
+
+
+def test_a_contradicted_objective_stores_nothing(hermes_home: Path):
+    track_id = confirmed_track()
+    objective_id, _ = stored_objective(track_id)
+
+    with pytest.raises(service.ValidationError):
+        prepare(manifest=manifest(), track_id=track_id, objective_id=objective_id)
+
+    assert rows("SELECT * FROM experiences") == []
+
+
+# ── Relationships the database itself enforces ────────────────────────────
+
+
+def test_the_schema_refuses_an_objective_belonging_to_another_track(hermes_home: Path):
+    """The composite key spans the track, so the row is unstorable."""
+    first = confirmed_track(name="First")
+    second = confirmed_track(name="Second")
+    objective_id, objective = stored_objective(first)
+    prepare(manifest=manifest(objective=objective), track_id=first, objective_id=objective_id)
+    owner = rows("SELECT * FROM experiences")[0]
+
+    with storage.connect() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO experiences"
+            " (id, learner_id, profile_id, track_id, objective_id, manifest_schema_version,"
+            "  title, objective_behavior, objective_condition, objective_standard, instructions,"
+            "  ui_locale, expected_duration_minutes, difficulty, accessibility,"
+            "  source_references, delivery, component_count, created_at, updated_at)"
+            " VALUES ('x', ?, ?, ?, ?, 1, 't', 'b', 'c', 's', 'i', 'en', 5, 'introductory',"
+            " '{}', '[]', '{}', 1, 'now', 'now')",
+            (owner["learner_id"], owner["profile_id"], second, objective_id),
+        )
+
+
+def test_the_schema_refuses_an_objective_named_without_a_track(hermes_home: Path):
+    track_id = confirmed_track()
+    objective_id, objective = stored_objective(track_id)
+    prepare(manifest=manifest(objective=objective), track_id=track_id, objective_id=objective_id)
+    owner = rows("SELECT * FROM experiences")[0]
+
+    with storage.connect() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO experiences"
+            " (id, learner_id, profile_id, track_id, objective_id, manifest_schema_version,"
+            "  title, objective_behavior, objective_condition, objective_standard, instructions,"
+            "  ui_locale, expected_duration_minutes, difficulty, accessibility,"
+            "  source_references, delivery, component_count, created_at, updated_at)"
+            " VALUES ('x', ?, ?, NULL, ?, 1, 't', 'b', 'c', 's', 'i', 'en', 5, 'introductory',"
+            " '{}', '[]', '{}', 1, 'now', 'now')",
+            (owner["learner_id"], owner["profile_id"], objective_id),
+        )
+
+
+def test_deleting_an_objective_works_and_takes_its_experiences_with_it(hermes_home: Path):
+    """The v3 schema raised ``NOT NULL constraint failed`` on any deletion.
+
+    The action is now ``CASCADE``, which agrees with what a track deletion
+    already does to the same rows.
+    """
+    track_id = confirmed_track()
+    objective_id, objective = stored_objective(track_id)
+    prepare(manifest=manifest(objective=objective), track_id=track_id, objective_id=objective_id)
+    prepare()  # a second experience, attached to nothing
+
+    with storage.connect() as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM objectives")
+        conn.commit()
+
+    remaining = rows("SELECT objective_id FROM experiences")
+    assert len(remaining) == 1
+    assert remaining[0]["objective_id"] is None
+
+
+def test_the_schema_refuses_an_evaluator_row_naming_another_experience(hermes_home: Path):
+    """Evaluator data must belong to the experience its component belongs to."""
+    prepare()
+    component = rows("SELECT * FROM experience_components")[0]
+
+    with storage.connect() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM experience_component_evaluations")
+        conn.execute(
+            "INSERT INTO experience_component_evaluations"
+            " (component_id, experience_id, learner_id, profile_id, evaluation, created_at)"
+            " VALUES (?, 'a-different-experience', ?, ?, '{}', 'now')",
+            (component["id"], component["learner_id"], component["profile_id"]),
+        )
+
+
+def test_the_schema_refuses_an_evaluator_row_for_another_learner(hermes_home: Path):
+    prepare()
+    component = rows("SELECT * FROM experience_components")[0]
+
+    with storage.connect() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM experience_component_evaluations")
+        conn.execute(
+            "INSERT INTO experience_component_evaluations"
+            " (component_id, experience_id, learner_id, profile_id, evaluation, created_at)"
+            " VALUES (?, ?, 'someone-else', ?, '{}', 'now')",
+            (component["id"], component["experience_id"], component["profile_id"]),
+        )
+
+
+def test_deleting_an_experience_cascades_to_both_child_tables(hermes_home: Path):
+    prepare()
+
+    with storage.connect() as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM experiences")
+        conn.commit()
+
+    assert rows("SELECT * FROM experience_components") == []
+    assert rows("SELECT * FROM experience_component_evaluations") == []

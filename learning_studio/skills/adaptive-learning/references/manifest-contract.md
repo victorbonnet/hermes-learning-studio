@@ -27,11 +27,19 @@ these are rejected wherever they appear:
 
 - anything tag-shaped — `<p>`, `</p>`, `<!--`, `<script`, `<style`;
 - event-handler attributes, `javascript:` and `data:` URLs, HTML entities;
-- stylesheet syntax — `@import`, a `url` reference, a `{ property: value; }`
-  block;
-- URLs of any scheme, filesystem paths, `../` traversal;
-- credential-shaped values — `api_key=…`, `password: …`, bearer tokens, keys;
+- stylesheet syntax — `@import`, a `url` reference, or a declaration block,
+  with or without its trailing semicolon;
+- URLs and URIs of any scheme, including `mailto:`, `ftp:` and `file:`;
+- bare web addresses such as `www.example.com` or `example.com/page`;
+- filesystem paths — `/etc/hosts`, `/secret.txt`, `./notes`, `../up`,
+  `~/notes.txt`, `C:\Users`, `\\server\share`;
+- credential-shaped values — `api_key=…`, `password: …`, `Authorization:
+  Basic …`, bearer tokens, and current prefixed token shapes;
 - invisible and bidirectional characters.
+
+Ordinary prose is unaffected: `a < b`, `3/4`, `12/05/2026`, `Node.js`,
+`/help`, "the .org suffix", `{x : x > 0}`, and "what makes a password strong"
+all pass.
 
 Write mathematical comparisons with spaces: `a < b`, not `a<b`.
 
@@ -53,6 +61,11 @@ learning_studio_prepare({
   "manifest":  { … }
 })
 ```
+
+If you send `objective_id`, the manifest's `objective` must be the stored
+objective's own wording — case and spacing aside. An experience that named one
+objective while assessing another would read, later, as evidence of progress
+against something it never tested.
 
 You never pass a learner. Identity comes from the Hermes session, and the
 experience id is generated for you — there is no field for either, so there is
@@ -120,9 +133,13 @@ for you:
   an offline flashcard self-check — that is a legitimate design, but say so
   and never present its score as an assessment result.
 
-- **Never reveal the key in the prompt, the media, or the alt text.** The tool
-  catches this for cloze passages, flashcards, and recall cues, where hiding
-  the answer *is* the format. Everywhere else it is your judgement.
+- **Never reveal the key in the prompt, the media, or the alt text.** This is
+  enforced for every component whose answer is text the learner must produce —
+  cloze gaps, short answers, translations, corrections, recall cues, flashcard
+  backs, reference solutions, grid cells. The whole visible half is compared,
+  on token boundaries, so `H2O` in "Type H2O" is caught as surely as a
+  sentence is. Selection components are exempt: their key is an option id, and
+  the option text is meant to be read.
 - **Release hints one at a time**, and send feedback in response to an attempt
   rather than alongside the question.
 
@@ -147,6 +164,17 @@ An unknown type is rejected, and so is any field the type does not declare —
 at every level. If a rejection surprises you, the type is probably not the one
 you want.
 
+A few types carry their own rules:
+
+- **`fill_blank`** — every `{{placeholder}}` in the passage must be a declared
+  blank, every declared blank must appear in the passage, and no placeholder
+  may repeat.
+- **`table_grid`** — every cell is either prefilled or has an expected answer,
+  exactly once. An empty box nothing will mark is not a question.
+- **`multi_select`** and the other set answers — no id twice.
+- **`feedback.per_option`** — each entry must name an option this component
+  has, and no option twice.
+
 ## Evaluation modes
 
 `evaluation.scoring.mode` is one of:
@@ -161,6 +189,13 @@ you want.
 | `rubric` | Open work judged against named criteria |
 | `self_check` | The learner grades their own recall, or reports on themselves |
 
+**Each component type accepts only the modes that can mark it.**
+`multiple_choice` is `exact`; `multi_select`, `matching` and `labeling` are
+`set`; ordering types are `ordered`; `short_answer` is `exact`, `normalised`
+or `numeric`; a flashcard or a self-report is `self_check`; open work is
+`rubric`. A mode outside its type's list is refused, and a self-report takes
+no rubric at all — nobody marks how confident someone says they feel.
+
 Always state whether partial credit applies. Silence produces inconsistent
 scoring across a set, which reads to the learner as unfairness. Open work
 (`free_response`, `case_study`, `self_explanation`, `rubric_response`,
@@ -171,9 +206,17 @@ scoring across a set, which reads to the learner as unfairness. Open work
 `evaluation.branching` is a list of `{on, go_to}`, where `on` is `correct`,
 `incorrect`, or `always`, and `go_to` names another component in this
 experience. Rejected: a target that does not exist, a component branching to
-itself, two `always` branches, an `always` branch mixed with conditional ones,
-and a loop made only of `always` edges. A retry loop on `incorrect` is fine —
-the learner's own answer is the way out.
+itself, two branches for the same outcome, and an `always` branch mixed with
+conditional ones.
+
+Also rejected, and this is the one worth understanding: **any group of
+components the learner can never leave.** An outcome you do not branch falls
+through to the next component, and from the last one to the end — so as long
+as one possible answer is unbranched, or leads forward, the exercise
+finishes. Two components that send each other back on *both* `correct` and
+`incorrect` do not, whatever the learner answers, and are refused. A retry
+loop branching only on `incorrect` is fine: answering correctly falls
+through.
 
 ## Source references
 
@@ -187,20 +230,41 @@ No URLs, no file paths, no credentials. Up to ten per experience.
 
 ## Accessibility
 
-Manifest-level: `source` (required), `text_alternatives_required`,
-`captions_required`, `visual_description_required`, `keyboard_only`,
-`reduced_motion`, `no_time_limit`, `reading_level`, `notes`.
+Two levels, and they are about different things.
 
-Component-level: `alt_text`, `caption`, `long_description`,
-`keyboard_alternative`, `transcript_required`, `captions_required`,
-`reduced_motion`, `no_time_limit`.
+**Manifest-level** describes what the *experience* must provide, as a closed
+list — there is no free-text field:
 
-`source` must be `explicit_request`, `confirmed_track`, or `profile_config` —
-the three sources the Studio treats as authoritative. There is no value for an
-inference, because you must not infer someone's needs. Metadata on an exercise
-is **not** a durable fact about the learner and creates no memory candidate;
-storing an accessibility need still needs the explicit consent described in
-SKILL.md.
+`source` (required) and `accommodations` (required), drawn from: `captions`,
+`transcript`, `text_alternatives`, `visual_description`, `keyboard_only`,
+`reduced_motion`, `no_time_limit`, `extended_time`, `plain_language`.
+
+`source` is `explicit_request`, `confirmed_track`, or `profile_config`, and
+**the claim is verified against that source**. A `confirmed_track` claim is
+checked against that track's confirmed context; `profile_config` against the
+operator's configuration; `explicit_request` against what this learner has
+actually recorded. Naming a source that says nothing is refused. There is no
+value meaning "I inferred it", because you must not.
+
+To use an accommodation, the need has to be stored for the learner already —
+which means they asked you to remember it and you sent
+`accessibility_consent`. If it is session-only, omit `accessibility` and
+honour the need in conversation. Declaring one records nothing about the
+learner and creates no memory candidate.
+
+**The experience must be able to deliver what it declares.** `keyboard_only`
+alongside a hotspot, labelling, matching or drag-ordering component is refused
+unless that component supplies `accessibility.keyboard_alternative`.
+`captions` needs a caption on each asset-bearing component;
+`visual_description` needs a long description.
+
+**Component-level** describes the *component*: `alt_text`, `caption`,
+`long_description`, `keyboard_alternative`, `transcript_required`,
+`captions_required`, `reduced_motion`, `no_time_limit`.
+
+Never write a diagnosis, a disability, or a sentence about the learner into
+any of them. "A cross-section of the heart" is alt text; "the learner has
+epilepsy" is a health record, and is refused.
 
 ## Assets
 
