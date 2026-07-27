@@ -339,15 +339,26 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
 
     session_context = _load_session_context(src)
 
+    accepted = set(inspect.signature(session_context.set_session_vars).parameters)
+
     def as_user(user_id: str):
-        """Bind a platform identity exactly as the gateway does per message."""
+        """Bind a platform identity exactly as the gateway does per message.
+
+        Only parameters the *installed* Hermes actually declares are passed.
+        Hermes versions differ here — ``chat_type`` exists on current upstream
+        main but not on every release — and hardcoding the full call makes
+        this test fail with a ``TypeError`` about the host's signature rather
+        than telling us anything about this plugin.
+        """
+        candidate = {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "user_id": user_id,
+            "user_name": "ignored-label",
+            "session_key": f"telegram:{user_id}",
+        }
         return session_context.set_session_vars(
-            platform="telegram",
-            chat_id="chat-1",
-            chat_type="dm",
-            user_id=user_id,
-            user_name="ignored-label",
-            session_key=f"telegram:{user_id}",
+            **{k: v for k, v in candidate.items() if k in accepted}
         )
 
     # ── First authenticated learner ──────────────────────────────────────
@@ -409,3 +420,114 @@ def test_session_context_exposes_the_variables_identity_depends_on():
     assert hasattr(session_context, "session_context_engaged")
     for name in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_USER_ID"):
         assert name in session_context._VAR_MAP, f"{name} is no longer a session variable"
+
+
+# ── Identity binding through the real host ─────────────────────────────────
+
+
+def _bind(session_context, **wanted):
+    """Call the host's ``set_session_vars`` with only what it declares.
+
+    Signatures differ between Hermes versions; passing an argument the
+    installed host does not have raises ``TypeError`` and tells us nothing
+    about this plugin.
+    """
+    accepted = set(inspect.signature(session_context.set_session_vars).parameters)
+    return session_context.set_session_vars(**{k: v for k, v in wanted.items() if k in accepted})
+
+
+def test_set_session_vars_still_accepts_what_this_plugin_needs():
+    """The host must keep binding the two values identity depends on."""
+    session_context = _load_session_context(_hermes_src())
+
+    accepted = set(inspect.signature(session_context.set_session_vars).parameters)
+
+    for required in ("platform", "user_id"):
+        assert required in accepted, (
+            f"gateway.session_context.set_session_vars no longer accepts {required!r} — "
+            "learning_studio.identity must be re-verified against the host"
+        )
+
+
+def test_the_plugin_depends_only_on_session_variables_the_host_defines():
+    """Guards against reading a name this Hermes does not expose.
+
+    ``HERMES_SESSION_CHAT_TYPE`` is the cautionary case: it exists on current
+    upstream main but not on every release, and depending on it made the
+    plugin's behaviour vary by host version for no benefit.
+    """
+    session_context = _load_session_context(_hermes_src())
+
+    import learning_studio.identity as identity
+
+    source = Path(identity.__file__).read_text(encoding="utf-8")
+    read_names = set(re.findall(r'_session_value\(\s*"([A-Z_]+)"', source))
+    assert read_names, "no session variables are read — has identity resolution moved?"
+
+    unsupported = sorted(read_names - set(session_context._VAR_MAP))
+    assert unsupported == [], (
+        f"the plugin reads session variables this Hermes does not define: {unsupported}"
+    )
+
+
+def test_identity_comes_from_the_real_session_binding(tmp_path, monkeypatch):
+    """Bind through the real host, then read back through the real resolver."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "ident-profile"))
+    session_context = _load_session_context(_hermes_src())
+
+    from learning_studio.identity import IdentityError, resolve_principal
+
+    tokens = _bind(session_context, platform="telegram", user_id="424242", chat_id="c")
+    try:
+        who = resolve_principal()
+        assert who.platform == "telegram"
+        assert who.user_id == "424242"
+        assert who.source == "gateway_session"
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    # Once cleared, the previous learner must not still be resolvable. In a
+    # process that has engaged the session system there is no "local user" to
+    # fall back to, so refusing is the correct — and safer — outcome.
+    with pytest.raises(IdentityError):
+        resolve_principal()
+
+
+def test_binding_user_a_then_user_b_does_not_bleed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "ab-profile"))
+    session_context = _load_session_context(_hermes_src())
+
+    from learning_studio.identity import resolve_principal
+
+    tokens = _bind(session_context, platform="telegram", user_id="aaa")
+    try:
+        assert resolve_principal().user_id == "aaa"
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    tokens = _bind(session_context, platform="telegram", user_id="bbb")
+    try:
+        assert resolve_principal().user_id == "bbb"
+    finally:
+        session_context.clear_session_vars(tokens)
+
+
+def test_a_failure_after_binding_does_not_leak_identity(tmp_path, monkeypatch):
+    """Cleanup sits in a finally established before state is changed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "leak-profile"))
+    session_context = _load_session_context(_hermes_src())
+
+    from learning_studio.identity import IdentityError, resolve_principal
+
+    tokens = _bind(session_context, platform="telegram", user_id="leaky")
+    try:
+        raise RuntimeError("simulated mid-test failure")
+    except RuntimeError:
+        pass
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    # "leaky" must not be visible to whatever runs next. In an engaged
+    # process that means a refusal, never a silent fallback to some default.
+    with pytest.raises(IdentityError):
+        resolve_principal()

@@ -101,6 +101,74 @@ def other_principal():
     )
 
 
+#: Every session variable the real host defines, plus the two this plugin
+#: actually reads. Listed explicitly rather than by prefix so that clearing
+#: is total even if a test sets one by hand.
+SESSION_ENV_VARS = (
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_TYPE",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_KEY",
+    "HERMES_SESSION_ID",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_SESSION_MESSAGE_ID",
+    "HERMES_SESSION_PROFILE",
+    "HERMES_GATEWAY_SESSION",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_identity():
+    """Start every test with no inherited learner identity.
+
+    Autouse and unconditional, because the failure it prevents is silent and
+    environment-dependent: run the suite from inside a live Telegram-hosted
+    Hermes session and `HERMES_SESSION_PLATFORM=telegram` is already in the
+    environment, so a test expecting the local-CLI principal quietly asserts
+    against somebody's real account instead.
+
+    Both halves of the identity path are cleared — the environment *and* the
+    host's ContextVars when the real module happens to be loaded — since
+    either alone would leave the other leaking. Everything is restored
+    afterwards, including variables a test set itself.
+    """
+    import contextlib
+    import os
+    import sys
+
+    saved_env = {name: os.environ.get(name) for name in SESSION_ENV_VARS}
+    for name in SESSION_ENV_VARS:
+        os.environ.pop(name, None)
+
+    session_context = sys.modules.get("gateway.session_context")
+    saved_vars = {}
+    if session_context is not None:
+        # Snapshot and blank the real ContextVars; `get_session_env` treats a
+        # bound "" as authoritative, which is exactly the "no session" answer.
+        for var_name, var in getattr(session_context, "_VAR_MAP", {}).items():
+            saved_vars[var_name] = var.set("")
+
+    try:
+        yield
+    finally:
+        if session_context is not None:
+            for var_name, token in saved_vars.items():
+                # A token created in another context cannot be reset here;
+                # that is survivable, the environment restore below is not.
+                with contextlib.suppress(ValueError, KeyError):
+                    session_context._VAR_MAP[var_name].reset(token)
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 @pytest.fixture
 def gateway_session(monkeypatch):
     """Bind Hermes session vars the way a platform adapter does.

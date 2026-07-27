@@ -265,7 +265,11 @@ _MIGRATION_001 = (
                                'add', 'replace', 'remove', 'no_action'
                            )),
         replaces           TEXT,
+        -- The learner's words when agreeing, and the canonical need that
+        -- consent authorised. Both are kept so a later reader can audit why
+        -- a sensitive candidate was allowed to exist at all.
         consent_reference  TEXT,
+        consented_need     TEXT,
         created_at         TEXT NOT NULL,
         updated_at         TEXT NOT NULL,
         FOREIGN KEY (learner_id, profile_id)

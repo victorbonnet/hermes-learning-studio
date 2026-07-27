@@ -172,8 +172,22 @@ class AccessibilityConsent:
         self.needs = needs
 
     def covers(self, value: Any) -> bool:
+        """True when every part of *value* is a need the learner listed.
+
+        Compared on the canonical form, so "Captions On Audio" and
+        "captions on audio" are the same need while "captions" is not the
+        same as "captions on all video" — see
+        :func:`~learning_studio.models.normalize_need`.
+        """
+        from .models import normalize_need
+
         values = value if isinstance(value, list) else [value]
-        return bool(values) and all(str(item) in self.needs for item in values)
+        if not values:
+            return False
+        try:
+            return all(normalize_need(item) in self.needs for item in values)
+        except ValueError:
+            return False
 
     @classmethod
     def parse(cls, raw: Any, config: LearningStudioConfig) -> AccessibilityConsent | None:
@@ -202,7 +216,14 @@ class AccessibilityConsent:
             )
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
-        return cls(statement=statement, needs=frozenset(needs))
+
+        from .models import normalize_need
+
+        try:
+            canonical = frozenset(normalize_need(item) for item in needs)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        return cls(statement=statement, needs=canonical)
 
 
 def _consent_allows(field: str, value: Any, consent: AccessibilityConsent | None) -> bool:
@@ -825,6 +846,7 @@ def _candidates_json(
             "recommended_action": str(row["recommended_action"]),
             "replaces": row["replaces"],
             "consent_reference": row["consent_reference"],
+            "consented_need": row["consented_need"],
             "track_id": row["track_id"],
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
@@ -1403,6 +1425,8 @@ def _save_candidates(
                 evidence_count=int(proposal.get("evidence_count", 1)),
                 min_evidence=config.memory_candidate_min_evidence,
                 consent_statement=consent.statement if consent else None,
+                consented_needs=consent.needs if consent else frozenset(),
+                consented_need=proposal.get("consented_need"),
             )
         except (candidate_rules.CandidateRejected, ValueError, TypeError) as exc:
             outcome["memory_candidates"]["rejected"].append(
@@ -1419,8 +1443,9 @@ def _save_candidates(
             "INSERT INTO memory_candidates"
             " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
             "  origin, evidence_count, confidence, durability, confirmation_state,"
-            "  recommended_action, replaces, consent_reference, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  recommended_action, replaces, consent_reference, consented_need,"
+            "  created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 candidate_id,
                 learner_id,
@@ -1437,6 +1462,7 @@ def _save_candidates(
                 candidate.recommended_action.value,
                 candidate.replaces,
                 candidate.consent_reference,
+                candidate.consented_need,
                 timestamp,
                 timestamp,
             ),

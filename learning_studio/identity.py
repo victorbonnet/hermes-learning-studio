@@ -62,13 +62,14 @@ class Principal:
     #: Stable platform user ID of the message sender. Empty only for
     #: :data:`LOCAL_PLATFORM`, where the profile is the identity.
     user_id: str
-    #: Conversation the message arrived in. Recorded for provenance; it is
-    #: deliberately *not* part of the learner scope, so the same person keeps
-    #: one learning record across their DM and a group chat.
-    chat_id: str = ""
-    chat_type: str = ""
     #: ``gateway_session`` | ``local_profile`` — which resolution path applied.
     source: str = "local_profile"
+
+    # Conversation scope is deliberately absent. It played no part in
+    # authorisation or storage, and reading it meant depending on session
+    # variables (``HERMES_SESSION_CHAT_TYPE``) that not every Hermes version
+    # exposes. This plugin now depends on exactly two host session values:
+    # the platform and the sender ID.
 
     @property
     def is_local(self) -> bool:
@@ -157,8 +158,6 @@ def resolve_principal() -> Principal:
             profile=profile,
             platform=platform,
             user_id=user_id,
-            chat_id=_session_value("HERMES_SESSION_CHAT_ID"),
-            chat_type=_session_value("HERMES_SESSION_CHAT_TYPE"),
             source="gateway_session",
         )
 

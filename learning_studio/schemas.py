@@ -255,6 +255,17 @@ _MEMORY_CANDIDATE = {
                 "recommended_action is 'replace'."
             ),
         },
+        "consented_need": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_VALUE_CHARS,
+            "description": (
+                "Required for an 'accessibility' candidate, and only for one. Must be "
+                "exactly one of the needs listed in accessibility_consent.needs, and the "
+                "statement must be that same need. Consent to remember one need is never "
+                "consent to record another fact about someone's health."
+            ),
+        },
         "evidence_count": {
             "type": "integer",
             "minimum": 1,

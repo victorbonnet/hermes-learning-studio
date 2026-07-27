@@ -343,6 +343,12 @@ The learner scope is `(profile, platform, sender ID)`, so the same numeric ID
 on two platforms is two people, and one person keeps one record across their
 DM and a group chat.
 
+Those two variables are the plugin's entire dependency on host session state.
+Conversation scope is deliberately not read: it played no part in
+authorisation or storage, and `HERMES_SESSION_CHAT_TYPE` is not defined by
+every Hermes version, so depending on it made behaviour vary by host for no
+benefit.
+
 **Anonymous multi-user sessions are refused.** If a gateway session is active
 but carries no sender ID, the tools store nothing and say why, rather than
 pooling strangers into a shared record. With no gateway at all — CLI, cron —
@@ -403,12 +409,41 @@ disability or diagnosis.
 
 Accessibility needs are **session-only by default**, and session-only means
 absent from the database rather than merely short-lived in it. Send them in
-`current_request` to have them applied without being stored. Storing one
-requires `accessibility_consent` naming that exact need and quoting what the
-learner said — consent for one need is not consent for another, and a
-sensitive candidate additionally requires `confirmation_state:
-learner_confirmed` and an origin that is the learner stating it. Repeated
-evidence can never produce a diagnosis or disability candidate.
+`current_request` to have them applied without being stored.
+
+Storing one requires `accessibility_consent`, which names the exact needs the
+learner agreed to and quotes what they said:
+
+```json
+{
+  "accessibility_consent": {
+    "consent_statement": "please remember I need captions",
+    "needs": ["captions on audio"]
+  },
+  "memory_candidates": [{
+    "category": "accessibility",
+    "statement": "captions on audio",
+    "consented_need": "captions on audio",
+    "origin": "explicit_durable_preference",
+    "confirmation_state": "learner_confirmed",
+    "evidence_summary": "Asked for this to be remembered"
+  }]
+}
+```
+
+A sensitive candidate must satisfy **five** independent conditions: category
+`accessibility`; an origin that is the learner stating it (never
+`repeated_evidence`); `confirmation_state: learner_confirmed`; consent that
+exists; and `consented_need` matching one of the agreed needs exactly. The
+`statement` must *be* the consented need — presentation wording belongs in
+your reply to the learner, never in the stored fact.
+
+Matching is on the canonical form only: NFKC, trimmed, internal whitespace
+collapsed, case-folded. **No fuzzy matching, no substrings, no model.** So
+`Captions On Audio` matches `captions on audio`, while `captions` does **not**
+cover `captions on all video and audio` — those are different needs, and only
+the learner can say which they agreed to. Consent to remember captions never
+authorises storing a diagnosis.
 
 ## Roadmap
 

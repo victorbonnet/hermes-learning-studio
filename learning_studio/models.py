@@ -187,6 +187,34 @@ def validate_context_payload(payload: Any, max_chars: int = MAX_VALUE_CHARS) -> 
     return {field: validate_field_value(field, raw, max_chars) for field, raw in payload.items()}
 
 
+def normalize_need(raw: Any) -> str:
+    """Canonical form of an accessibility need, for exact consent matching.
+
+    Consent is matched on this form and nothing else. The rules are
+    deliberately narrow, because every relaxation is a way for consent to one
+    thing to become consent to another:
+
+    - NFKC, so a full-width or composed variant is the same need;
+    - surrounding whitespace trimmed, internal runs collapsed;
+    - case-folded.
+
+    There is **no** fuzzy matching, no stemming, no substring rule, and no
+    model involved. "captions" does not cover "captions on all video and
+    audio": they are different needs, and only the learner can say which one
+    they agreed to. Anything cleverer here would be a judgement about
+    someone's health made by a string comparison.
+    """
+    import unicodedata
+
+    if not isinstance(raw, str):
+        raise ValueError("an accessibility need must be a string")
+    folded = unicodedata.normalize("NFKC", raw)
+    collapsed = " ".join(folded.split())
+    if not collapsed:
+        raise ValueError("an accessibility need must not be empty")
+    return collapsed.casefold()
+
+
 def validate_track_name(raw: Any) -> str:
     return clean_text(raw, "track name", MAX_NAME_CHARS)
 

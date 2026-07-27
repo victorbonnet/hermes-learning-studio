@@ -233,28 +233,58 @@ def test_an_unconfirmed_accessibility_candidate_is_refused():
         )
 
 
-def test_an_accessibility_candidate_without_a_consent_statement_is_refused():
+def test_an_accessibility_candidate_without_consent_is_refused():
     """A generic yes elsewhere in the request is not consent for this fact."""
-    with pytest.raises(CandidateRejected, match="requires 'consent_statement'"):
+    with pytest.raises(CandidateRejected, match="requires accessibility_consent"):
         _propose(
             category="accessibility",
-            statement="Needs captions on any audio material.",
+            statement="captions on any audio material",
             evidence_summary="Asked for this to be remembered.",
             confirmation_state="learner_confirmed",
+            consent_statement=None,
         )
 
 
-def test_accessibility_is_accepted_when_confirmed_and_consented():
+def test_an_accessibility_candidate_without_a_consented_need_is_refused():
+    """Consent must name the fact, not merely exist."""
+    with pytest.raises(CandidateRejected, match="requires 'consented_need'"):
+        _propose(
+            category="accessibility",
+            statement="captions on any audio material",
+            evidence_summary="Asked for this to be remembered.",
+            confirmation_state="learner_confirmed",
+            consent_statement="please remember this",
+            consented_needs=frozenset({"captions on any audio material"}),
+        )
+
+
+def test_a_consented_need_outside_the_agreed_list_is_refused():
+    with pytest.raises(CandidateRejected, match="does not match any need"):
+        _propose(
+            category="accessibility",
+            statement="a screen reader",
+            evidence_summary="Asked for this to be remembered.",
+            confirmation_state="learner_confirmed",
+            consent_statement="remember I need captions",
+            consented_needs=frozenset({"captions on audio"}),
+            consented_need="a screen reader",
+        )
+
+
+def test_accessibility_is_accepted_when_confirmed_and_exactly_consented():
     candidate = _propose(
         category="accessibility",
-        statement="Needs captions on any audio material.",
+        statement="captions on any audio material",
         evidence_summary="Asked for this to be remembered for future sessions.",
         confirmation_state="learner_confirmed",
         consent_statement="yes, please remember I need captions",
+        consented_needs=frozenset({"captions on any audio material"}),
+        consented_need="captions on any audio material",
     )
 
     assert candidate.category.value == "accessibility"
     assert candidate.consent_reference == "yes, please remember I need captions"
+    assert candidate.consented_need == "captions on any audio material"
 
 
 def test_a_sensitive_statement_cannot_be_relabelled_to_slip_past_the_scan():
