@@ -36,6 +36,13 @@ When you use a new part of the `ctx` API, add the corresponding method to the
 fake and copy the host's validation with it — a permissive fake is worse than
 no fake, because it turns a startup crash into a green test run.
 
+**`register_tool`'s parameter order is `(name, toolset, schema, handler, …)`.**
+Some published documentation shows `(name, schema, handler, toolset="")`,
+which would bind a schema dict to `toolset` if called positionally. Always
+pass keywords. `tests/fake_hermes.py` mirrors the real order, and
+`tests/test_hermes_integration.py` asserts every keyword this plugin passes
+still exists in the host.
+
 Tests must not make real network calls. No Telegram, Cloudflare, or
 image-provider requests, and nothing that reads a real credential.
 
@@ -49,10 +56,20 @@ image-provider requests, and nothing that reads a real credential.
 - **Put optional dependencies behind lazy imports** inside the function that
   needs them, and declare them as extras in `pyproject.toml`.
 - **Resolve paths with the profile-safe helper.** Hermes supports multiple
-  profiles via `HERMES_HOME`, so never hardcode `~/.hermes`. Use the host's
-  `get_hermes_home()` — imported lazily, inside the function that needs a
-  path, so the plugin stays importable outside a Hermes process. This release
-  reads and writes no paths.
+  profiles via `HERMES_HOME`, so never hardcode `~/.hermes` and never use the
+  process CWD. Go through `learning_studio.paths`, which delegates to the
+  host's `get_hermes_home()` lazily so the plugin stays importable outside a
+  Hermes process. Every persistence test must use the `hermes_home` fixture —
+  a test that writes to a developer's real profile is a privacy leak.
+- **Scope every learner-owned query.** Add `profile_id` and `learner_id` to
+  the `WHERE` clause, not to a check after the fetch. Ownership failures and
+  missing rows must return the same message; revealing which is which leaks
+  the existence of another learner's data.
+- **Never reach Hermes memory.** No importing it, no dispatching to it, no
+  subprocess, no editing `MEMORY.md` or profile memory files. Return memory
+  *candidates* and let the agent decide. `tests/test_no_memory_access.py`
+  enforces this statically and dynamically; if you find yourself wanting to
+  weaken it, the answer is no.
 - **Behavioural settings go in `config.yaml`; secrets go in `.env`.** Never
   commit real tokens, user IDs, credentials, domains, or private paths — not
   even in examples. Use obvious placeholders.

@@ -10,9 +10,12 @@ description: Generic adaptive-learning guidance for structured conversational st
 author: Victor Bonnet
 kind: standalone
 
-# This release registers a bundled skill only. Tools, hooks, and slash
-# commands arrive in later PRs and will be declared here when they exist.
-provides_tools: []
+# The tools this plugin registers, in the `plugin_learning_studio` toolset.
+# Hooks and slash commands arrive in later PRs and will be declared here when
+# they exist.
+provides_tools:
+  - learning_studio_get_context
+  - learning_studio_save_context
 provides_hooks: []
 
 # No credentials are needed. A non-empty `requires_env` would gate the plugin

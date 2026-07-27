@@ -26,6 +26,46 @@ import pytest
 HERMES_SRC_ENV = "HERMES_AGENT_SRC"
 
 
+@pytest.fixture(autouse=True)
+def _restore_process_state():
+    """Undo everything importing Hermes does to this process.
+
+    These tests deliberately put a Hermes checkout on ``sys.path`` and import
+    real host modules. Left in place, those imports change the behaviour of
+    every later test in the session: ``learning_studio.paths`` starts
+    resolving through the real ``hermes_constants``, host code scaffolds
+    profile files such as ``SOUL.md`` into the temporary home, and the
+    filesystem-isolation test then fails for a reason that has nothing to do
+    with this plugin.
+
+    The isolation assertion is right and stays as it is; the pollution is the
+    bug. So the snapshot below is thorough on purpose: module table, import
+    path, and the host's own tool registry.
+    """
+    saved_modules = dict(sys.modules)
+    saved_path = list(sys.path)
+
+    yield
+
+    for name in [n for n in sys.modules if n not in saved_modules]:
+        del sys.modules[name]
+    sys.modules.update(saved_modules)
+    sys.path[:] = saved_path
+
+    # The real registry is a process-global singleton; tools registered by a
+    # test would otherwise still be there for the next one.
+    registry = saved_modules.get("tools.registry")
+    if registry is not None:  # pragma: no cover - only when the host was loaded
+        try:
+            from learning_studio import TOOLSET_NAME
+
+            for name, entry in list(registry.registry._tools.items()):
+                if entry.toolset == TOOLSET_NAME:
+                    del registry.registry._tools[name]
+        except Exception:
+            pass
+
+
 def _hermes_src() -> Path:
     raw = os.environ.get(HERMES_SRC_ENV)
     if not raw:
@@ -50,14 +90,52 @@ def _load_module(name: str, path: Path, src: Path):
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
 
+    if name in sys.modules:
+        return sys.modules[name]
+
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    # Registered before execution because ``@dataclass`` resolves annotations
+    # via ``sys.modules[cls.__module__]``; an unregistered module makes that
+    # lookup return None and the class definition fails.
+    sys.modules[name] = module
     try:
         spec.loader.exec_module(module)
     except ImportError as exc:
+        del sys.modules[name]
         pytest.skip(f"Hermes checkout is missing its own dependencies: {exc}")
+    except Exception:
+        del sys.modules[name]
+        raise
     return module
+
+
+def _load_session_context(src: Path):
+    """Import ``gateway.session_context`` under its real dotted name.
+
+    It has to be the real name, not an alias: ``learning_studio.identity``
+    does ``from gateway.session_context import get_session_env``, so a copy
+    loaded under another name would hold different ContextVars and the test
+    would bind identity somewhere the plugin never looks.
+
+    A synthetic parent package is installed first so importing the submodule
+    does not execute ``gateway/__init__.py``, which pulls in third-party
+    dependencies a bare checkout does not have.
+    """
+    import types
+
+    if "gateway.session_context" in sys.modules:
+        return sys.modules["gateway.session_context"]
+
+    if "gateway" not in sys.modules:
+        parent = types.ModuleType("gateway")
+        parent.__path__ = [str(src / "gateway")]
+        sys.modules["gateway"] = parent
+
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    return importlib.import_module("gateway.session_context")
 
 
 @pytest.fixture
@@ -142,3 +220,314 @@ def test_plugin_dispatch_returns_before_file_path_is_handled():
         "file_path handling now precedes the plugin dispatch — re-evaluate "
         "whether skill_view can open plugin references directly"
     )
+
+
+# ── The runtime APIs this plugin depends on ────────────────────────────────
+
+
+def test_get_hermes_home_exists_and_is_profile_aware(monkeypatch, tmp_path: Path):
+    """``paths.hermes_home()`` delegates to this; a rename would break isolation."""
+    src = _hermes_src()
+    constants = _load_module("_hermes_constants", src / "hermes_constants.py", src)
+
+    assert hasattr(constants, "get_hermes_home"), (
+        "hermes_constants.get_hermes_home is gone — learning_studio.paths must be updated"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-x"))
+    assert Path(constants.get_hermes_home()) == tmp_path / "profile-x"
+
+
+def test_the_plugin_resolves_storage_under_the_real_hermes_home(monkeypatch, tmp_path: Path):
+    """End to end: the host's resolver, through this plugin's path helper."""
+    src = _hermes_src()
+    _load_module("_hermes_constants", src / "hermes_constants.py", src)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-y"))
+    from learning_studio.paths import storage_root
+
+    assert storage_root() == tmp_path / "profile-y" / "workspace" / "learning-studio"
+
+
+def test_register_tool_signature_matches_what_the_plugin_calls():
+    """The parameter order is easy to get wrong and silent when wrong.
+
+    The host's signature is ``(name, toolset, schema, handler, ...)``. Public
+    documentation has shown ``(name, schema, handler, toolset="")``, which
+    would bind a schema dict to ``toolset``. This plugin passes keywords
+    only, so what matters is that every keyword it passes still exists.
+    """
+    src = _hermes_src()
+    plugins_source = (src / "hermes_cli" / "plugins.py").read_text(encoding="utf-8")
+
+    signature = re.search(r"def register_tool\((.*?)\) -> None:", plugins_source, re.S)
+    assert signature, "could not find PluginContext.register_tool in this Hermes checkout"
+
+    params = signature.group(1)
+    for keyword in ("name", "toolset", "schema", "handler", "description"):
+        assert f"{keyword}:" in params, (
+            f"PluginContext.register_tool no longer accepts '{keyword}' — "
+            "learning_studio.plugin.register must be updated"
+        )
+
+
+def test_the_toolset_name_does_not_collide_with_a_builtin_toolset():
+    """A collision would make the registry reject our tools at startup."""
+    src = _hermes_src()
+    registry_source = (src / "tools" / "registry.py").read_text(encoding="utf-8")
+
+    from learning_studio import TOOLSET_NAME
+
+    assert f'toolset="{TOOLSET_NAME}"' not in registry_source
+
+
+def test_the_tool_names_do_not_shadow_a_builtin_tool():
+    """Shadowing a built-in is rejected without an operator opt-in we do not have."""
+    src = _hermes_src()
+    from learning_studio.schemas import TOOL_SCHEMAS
+
+    builtin_names: set[str] = set()
+    for path in (src / "tools").glob("*.py"):
+        builtin_names.update(
+            re.findall(
+                r'registry\.register\(\s*name=["\']([a-z0-9_]+)["\']',
+                path.read_text(encoding="utf-8", errors="ignore"),
+            )
+        )
+
+    collisions = sorted(set(TOOL_SCHEMAS) & builtin_names)
+    assert collisions == [], f"tool names collide with Hermes built-ins: {collisions}"
+
+
+def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypatch, tmp_path: Path):
+    """Register through the host's own PluginContext, then call the tools.
+
+    The fake context mirrors the host, but only the host proves the plugin
+    actually loads. This drives the real ``PluginContext`` and the real tool
+    registry, in an isolated HERMES_HOME, with identity supplied the way the
+    gateway supplies it.
+    """
+    import json
+
+    src = _hermes_src()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "live-profile"))
+
+    plugins = _load_module("_hermes_plugins", src / "hermes_cli" / "plugins.py", src)
+
+    # Not via _load_module: PluginContext.register_tool does
+    # ``from tools.registry import registry``, so the assertions have to read
+    # that exact module object. Loading a second copy under an alias would
+    # inspect a registry nothing ever wrote to.
+    registry_module = importlib.import_module("tools.registry")
+
+    manifest = plugins.PluginManifest(name="learning-studio", version="0.1.0")
+    manager = plugins.PluginManager()
+    ctx = plugins.PluginContext(manifest, manager)
+
+    from learning_studio import TOOLSET_NAME, register
+
+    register(ctx)
+
+    registry = registry_module.registry
+    registered = {
+        name: entry for name, entry in registry._tools.items() if entry.toolset == TOOLSET_NAME
+    }
+    assert sorted(registered) == [
+        "learning_studio_get_context",
+        "learning_studio_save_context",
+    ]
+
+    session_context = _load_session_context(src)
+
+    accepted = set(inspect.signature(session_context.set_session_vars).parameters)
+
+    def as_user(user_id: str):
+        """Bind a platform identity exactly as the gateway does per message.
+
+        Only parameters the *installed* Hermes actually declares are passed.
+        Hermes versions differ here — ``chat_type`` exists on current upstream
+        main but not on every release — and hardcoding the full call makes
+        this test fail with a ``TypeError`` about the host's signature rather
+        than telling us anything about this plugin.
+        """
+        candidate = {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "user_id": user_id,
+            "user_name": "ignored-label",
+            "session_key": f"telegram:{user_id}",
+        }
+        return session_context.set_session_vars(
+            **{k: v for k, v in candidate.items() if k in accepted}
+        )
+
+    # ── First authenticated learner ──────────────────────────────────────
+    tokens = as_user("111111")
+    try:
+        saved = json.loads(
+            registry.dispatch(
+                "learning_studio_save_context",
+                {"track": {"name": "Live track", "confirmed": True, "context": {"goal": "g"}}},
+            )
+        )
+        assert saved["ok"] is True, saved
+        assert saved["outcome"]["track"]["status"] == "created"
+        assert saved["hermes_memory_updated"] is False
+
+        fetched = json.loads(registry.dispatch("learning_studio_get_context", {}))
+        assert fetched["confirmed_context"]["goal"]["value"] == "g"
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    # ── Second authenticated learner, same profile ───────────────────────
+    tokens = as_user("222222")
+    try:
+        other = json.loads(registry.dispatch("learning_studio_get_context", {}))
+        assert other["tracks"] == [], "a second principal saw the first principal's track"
+
+        # And cannot reach it by naming the first learner in arguments.
+        impersonation = json.loads(
+            registry.dispatch("learning_studio_get_context", {"learner_key": "111111"})
+        )
+        assert impersonation["ok"] is False
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    db = tmp_path / "live-profile" / "workspace" / "learning-studio" / "learning-studio.sqlite3"
+    assert db.is_file(), "the real run did not write to the profile-scoped storage root"
+
+
+def test_the_session_user_id_is_a_real_host_supplied_value():
+    """The identity this plugin trusts must come from the platform payload.
+
+    If Hermes ever stopped binding ``user_id`` from the message source, this
+    plugin's isolation guarantee would quietly become a guess.
+    """
+    src = _hermes_src()
+    run_source = (src / "gateway" / "run.py").read_text(encoding="utf-8")
+
+    assert "user_id=str(context.source.user_id)" in run_source, (
+        "the gateway no longer binds user_id from the message source — "
+        "learning_studio.identity must be re-verified"
+    )
+
+
+def test_session_context_exposes_the_variables_identity_depends_on():
+    src = _hermes_src()
+    session_context = _load_session_context(src)
+
+    assert hasattr(session_context, "get_session_env")
+    assert hasattr(session_context, "session_context_engaged")
+    for name in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_USER_ID"):
+        assert name in session_context._VAR_MAP, f"{name} is no longer a session variable"
+
+
+# ── Identity binding through the real host ─────────────────────────────────
+
+
+def _bind(session_context, **wanted):
+    """Call the host's ``set_session_vars`` with only what it declares.
+
+    Signatures differ between Hermes versions; passing an argument the
+    installed host does not have raises ``TypeError`` and tells us nothing
+    about this plugin.
+    """
+    accepted = set(inspect.signature(session_context.set_session_vars).parameters)
+    return session_context.set_session_vars(**{k: v for k, v in wanted.items() if k in accepted})
+
+
+def test_set_session_vars_still_accepts_what_this_plugin_needs():
+    """The host must keep binding the two values identity depends on."""
+    session_context = _load_session_context(_hermes_src())
+
+    accepted = set(inspect.signature(session_context.set_session_vars).parameters)
+
+    for required in ("platform", "user_id"):
+        assert required in accepted, (
+            f"gateway.session_context.set_session_vars no longer accepts {required!r} — "
+            "learning_studio.identity must be re-verified against the host"
+        )
+
+
+def test_the_plugin_depends_only_on_session_variables_the_host_defines():
+    """Guards against reading a name this Hermes does not expose.
+
+    ``HERMES_SESSION_CHAT_TYPE`` is the cautionary case: it exists on current
+    upstream main but not on every release, and depending on it made the
+    plugin's behaviour vary by host version for no benefit.
+    """
+    session_context = _load_session_context(_hermes_src())
+
+    import learning_studio.identity as identity
+
+    source = Path(identity.__file__).read_text(encoding="utf-8")
+    read_names = set(re.findall(r'_session_value\(\s*"([A-Z_]+)"', source))
+    assert read_names, "no session variables are read — has identity resolution moved?"
+
+    unsupported = sorted(read_names - set(session_context._VAR_MAP))
+    assert unsupported == [], (
+        f"the plugin reads session variables this Hermes does not define: {unsupported}"
+    )
+
+
+def test_identity_comes_from_the_real_session_binding(tmp_path, monkeypatch):
+    """Bind through the real host, then read back through the real resolver."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "ident-profile"))
+    session_context = _load_session_context(_hermes_src())
+
+    from learning_studio.identity import IdentityError, resolve_principal
+
+    tokens = _bind(session_context, platform="telegram", user_id="424242", chat_id="c")
+    try:
+        who = resolve_principal()
+        assert who.platform == "telegram"
+        assert who.user_id == "424242"
+        assert who.source == "gateway_session"
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    # Once cleared, the previous learner must not still be resolvable. In a
+    # process that has engaged the session system there is no "local user" to
+    # fall back to, so refusing is the correct — and safer — outcome.
+    with pytest.raises(IdentityError):
+        resolve_principal()
+
+
+def test_binding_user_a_then_user_b_does_not_bleed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "ab-profile"))
+    session_context = _load_session_context(_hermes_src())
+
+    from learning_studio.identity import resolve_principal
+
+    tokens = _bind(session_context, platform="telegram", user_id="aaa")
+    try:
+        assert resolve_principal().user_id == "aaa"
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    tokens = _bind(session_context, platform="telegram", user_id="bbb")
+    try:
+        assert resolve_principal().user_id == "bbb"
+    finally:
+        session_context.clear_session_vars(tokens)
+
+
+def test_a_failure_after_binding_does_not_leak_identity(tmp_path, monkeypatch):
+    """Cleanup sits in a finally established before state is changed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "leak-profile"))
+    session_context = _load_session_context(_hermes_src())
+
+    from learning_studio.identity import IdentityError, resolve_principal
+
+    tokens = _bind(session_context, platform="telegram", user_id="leaky")
+    try:
+        raise RuntimeError("simulated mid-test failure")
+    except RuntimeError:
+        pass
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    # "leaky" must not be visible to whatever runs next. In an engaged
+    # process that means a refusal, never a silent fallback to some default.
+    with pytest.raises(IdentityError):
+        resolve_principal()

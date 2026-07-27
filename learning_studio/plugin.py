@@ -1,7 +1,14 @@
 """Plugin registration.
 
-This is the whole of the plugin's contract with Hermes for now: one bundled,
-read-only skill. Tools, persistence, and the dashboard land in later PRs.
+The plugin's contract with Hermes: one bundled read-only skill and two typed
+tools for learning context. The dashboard, exercise runtime, and Mini App
+land in later PRs.
+
+``register(ctx)`` runs at every Hermes startup for every enabled plugin, so
+it must not raise. It deliberately does **not** open the database: a
+corrupt or newer-versioned store would then take the whole plugin down at
+startup rather than failing one tool call with an explanation. Storage is
+initialised lazily, inside the handlers.
 """
 
 from __future__ import annotations
@@ -20,8 +27,7 @@ PLUGIN_NAME = "learning-studio"
 #: ``skill_view("learning-studio:adaptive-learning")``.
 SKILL_NAME = "adaptive-learning"
 
-#: Reserved toolset name for the tools later PRs will register. Declared here
-#: so the identity is fixed even though nothing uses it yet.
+#: Toolset the Learning Studio's tools are grouped under.
 TOOLSET_NAME = "plugin_learning_studio"
 
 SKILLS_DIR = Path(__file__).parent / "skills"
@@ -40,10 +46,25 @@ def skill_path(name: str = SKILL_NAME) -> Path:
 def register(ctx: Any) -> None:
     """Register this plugin's surface with Hermes.
 
-    Called once at startup with a ``PluginContext``. Registration is
-    deliberately minimal — a single bundled skill — so that enabling the
-    plugin cannot fail on missing optional dependencies or credentials.
+    Called once at startup with a ``PluginContext``. Registration imports
+    nothing optional, touches no network, and opens no database, so enabling
+    the plugin cannot fail a session.
     """
     path = skill_path()
     ctx.register_skill(SKILL_NAME, path, _SKILL_DESCRIPTION)
     logger.debug("Registered skill %s:%s from %s", PLUGIN_NAME, SKILL_NAME, path)
+
+    # Imported here rather than at module scope so that a syntax or import
+    # error in the tool layer cannot stop the skill from registering.
+    from .schemas import TOOL_SCHEMAS
+    from .tools import HANDLERS
+
+    for name, schema in TOOL_SCHEMAS.items():
+        ctx.register_tool(
+            name=name,
+            toolset=TOOLSET_NAME,
+            schema=schema,
+            handler=HANDLERS[name],
+            description=schema["description"],
+        )
+    logger.debug("Registered %d tools in toolset %s", len(TOOL_SCHEMAS), TOOLSET_NAME)

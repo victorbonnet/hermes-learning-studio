@@ -69,17 +69,60 @@ class FakePluginContext:
             raise FileNotFoundError(f"SKILL.md not found at {path}")
         self.skills.append(RegisteredSkill(name, Path(path), description))
 
-    # -- surface this PR must NOT use yet --------------------------------
-
     def register_tool(
         self,
         name: str,
+        toolset: str,
         schema: dict[str, Any],
         handler: Callable[..., Any],
-        toolset: str = "",
-        **_kwargs: Any,
+        check_fn: Callable[..., Any] | None = None,
+        requires_env: list[str] | None = None,
+        is_async: bool = False,
+        description: str = "",
+        emoji: str = "",
+        override: bool = False,
     ) -> None:
+        """Mirror of ``PluginContext.register_tool``.
+
+        The parameter *order* matters and is easy to get wrong: the host's
+        signature is ``(name, toolset, schema, handler, ...)``, not the
+        ``(name, schema, handler, toolset="")`` that some documentation
+        shows. A fake with the wrong order accepts positional calls the real
+        host would silently mis-bind — registering a tool whose toolset is a
+        schema dict — so this copy is kept faithful and the plugin calls it
+        with keywords only.
+
+        The validation below mirrors ``tools.registry.register``: a schema
+        must carry the name, description, and parameters the model needs,
+        and ``override`` is refused because a plugin may not shadow a
+        built-in without an operator opt-in in config.yaml.
+        """
+        if not isinstance(schema, dict):
+            raise TypeError(
+                f"schema for tool '{name}' must be a dict, got {type(schema).__name__} "
+                "(check the register_tool argument order)"
+            )
+        for key in ("name", "description", "parameters"):
+            if key not in schema:
+                raise ValueError(f"Tool schema for '{name}' is missing '{key}'.")
+        if schema["name"] != name:
+            raise ValueError(
+                f"Tool schema name '{schema['name']}' does not match registered name '{name}'."
+            )
+        if not isinstance(toolset, str) or not toolset:
+            raise ValueError(f"Tool '{name}' must declare a non-empty toolset.")
+        if not callable(handler):
+            raise TypeError(f"Handler for tool '{name}' is not callable.")
+        if override:
+            raise PermissionError(
+                f"Plugin '{self.plugin_name}' cannot override built-in tool '{name}' "
+                "without an operator opt-in (plugins.entries.<id>.allow_tool_override)."
+            )
+        if any(tool.name == name for tool in self.tools):
+            raise ValueError(f"Tool '{name}' is already registered.")
         self.tools.append(RegisteredTool(name, toolset, schema, handler))
+
+    # -- surface this PR must NOT use yet --------------------------------
 
     def register_hook(self, event_name: str, callback: Callable[..., Any]) -> None:
         self.hooks.append((event_name, callback))
