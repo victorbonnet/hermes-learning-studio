@@ -5,10 +5,11 @@ learning: structured study sessions built on active recall and spaced
 repetition.
 
 > **Status: early development foundation.** This is not the feature-complete
-> public release. What exists today is a single bundled skill and nothing else:
-> **no tools, no storage, no progress persistence, no Mini App, and no network
-> requests.** Study sessions run as ordinary conversation, and nothing carries
-> over between them. See [Roadmap](#roadmap) for what is still to come.
+> public release. What exists today is a single bundled skill — agent guidance
+> and nothing else: **no tools, no storage, no progress persistence, no Mini
+> App, and no network requests.** Study sessions run as ordinary conversation,
+> and nothing carries over between them. See [Roadmap](#roadmap) for what is
+> still to come.
 
 ## Install
 
@@ -65,6 +66,13 @@ Plugin skills are namespaced by the manifest name and are deliberately absent
 from the system prompt's `<available_skills>` index — they are explicit,
 opt-in loads.
 
+The skill links a catalogue of exercise-format references, which the agent
+opens one at a time rather than loading wholesale:
+
+```
+skill_view("learning-studio:adaptive-learning", "references/selection-cards.md")
+```
+
 ## Architecture
 
 The repository is simultaneously a Hermes **directory plugin** and an
@@ -79,11 +87,12 @@ installable **Python package**, which drives the layout:
 │   ├── plugin.py               # register(ctx) — the whole host contract
 │   └── skills/
 │       └── adaptive-learning/
-│           └── SKILL.md        # Bundled, read-only skill
+│           ├── SKILL.md        # The orchestration workflow
+│           └── references/     # Loaded on demand via skill_view(name, path)
 └── tests/                      # Unit tests against a fake plugin context
 ```
 
-Four decisions shape this foundation:
+The decisions that shape this foundation:
 
 **One identity, two install paths.** Hermes derives a plugin's skill namespace
 from its manifest `name` for directory installs, and from the entry-point name
@@ -117,10 +126,30 @@ FastAPI and Pillow dependencies that later PRs introduce must stay behind lazy
 imports inside the code paths that need them; a test blocks those modules at
 import time and asserts registration still succeeds.
 
+**One skill, many references.** The skill is a single orchestration workflow —
+discovery, objectives, pedagogy, format selection, verification, activation,
+interpretation, adaptation — with a catalogue of exercise-format references
+beside it. The catalogue is *not* registered as fourteen skills: Hermes'
+progressive disclosure means `skill_view(name)` returns SKILL.md and
+`skill_view(name, "references/selection-cards.md")` returns one reference, so
+the agent pays for only what the current decision needs. Tests assert that
+every reference is linked by a valid relative path, that none is orphaned, and
+that the registered surface stays at exactly one skill.
+
 **The skill tells the truth about its own scope.** `SKILL.md` states plainly
 that this foundation has no tools and no persistence, because a skill that
 implies otherwise sends the agent after tools that do not exist. A test fails if
-the skill body references tool names while `register()` registers no tools.
+the skill body references tool names while `register()` registers no tools, and
+textual contract tests pin the load-bearing rules: what may launch without
+asking, that a missing tool falls back to chat, that exercises are declarative
+data rather than generated frontend code, that image assets come from real tool
+results, and who owns which memory store.
+
+**Subject-agnostic by construction.** No subject is the plugin's default.
+Examples span language learning, programming, history, and science, and a test
+fails if any one domain accounts for more than 40% of the examples in the
+skill corpus or if a format reference illustrates fewer than three unrelated
+subjects.
 
 **No runtime dependencies.** `dependencies` is empty, so installing the plugin
 adds nothing to a user's Hermes environment. PyYAML is a test-only dependency
@@ -135,10 +164,12 @@ and are never committed. This foundation reads neither.
 
 ## Roadmap
 
-Deliberately **not** here yet: runtime tools, SQLite persistence, learning
-tracks, memory integration, exercise manifests, the FastAPI dashboard and Mini
-App, Telegram authentication, frontend code, Cloudflare tunnels, slash commands,
-and image handling. Each lands in a later PR.
+Deliberately **not** here yet: runtime tools, SQLite persistence, a manifest
+renderer or validator, the FastAPI dashboard and Mini App, Telegram
+authentication, frontend code, Cloudflare tunnels, slash commands, managed
+asset import, and any scheduler. Each lands in a later PR. The skill describes
+how the agent will use those capabilities and instructs it to fall back to
+chat until they exist.
 
 ## Development
 
