@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets stay out of the repository. Behavioural settings belong in
+# config.yaml; credentials belong in .env, which is never committed.
+.env
+.env.*
+!.env.example
