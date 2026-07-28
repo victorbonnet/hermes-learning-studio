@@ -84,23 +84,9 @@ AUTHORITATIVE_ORIGINS: frozenset[Origin] = frozenset(
 
 
 #: Categories carrying information about someone's health, disability, or
-#: accommodations. These are gated structurally — by origin and by consent
-#: bound to the specific statement — and not merely by a text scan. A caller
-#: who rewords an inferred diagnosis to slip past a regex still cannot get it
-#: through, because the *origin* and the *confirmation state* are what decide.
+#: accommodations. They are refused unconditionally; Hermes exposes no
+#: host-backed consent event that could authorize durable storage.
 SENSITIVE_CATEGORIES: frozenset[Category] = frozenset({Category.ACCESSIBILITY})
-
-#: The only origins a sensitive candidate may have. Notably absent:
-#: ``repeated_evidence``. A pattern across exercises is an observation about
-#: performance; it is never grounds to record that someone *has* a condition.
-#: Only the learner can state that about themselves.
-SENSITIVE_ORIGINS: frozenset[Origin] = frozenset(
-    {
-        Origin.EXPLICIT_DURABLE_PREFERENCE,
-        Origin.EXPLICIT_CORRECTION,
-        Origin.EXPLICIT_WITHDRAWAL,
-    }
-)
 
 
 #: Origins a caller might reach for that must never yield a candidate. Named
@@ -224,9 +210,8 @@ _FORBIDDEN_CONTENT: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ),
 )
 
-#: Diagnosis and disability language, wherever it appears. Permitted only in
-#: an ``accessibility`` candidate the learner explicitly asked to be
-#: remembered — never inferred, never in another category.
+#: Diagnosis and disability language, wherever it appears. It is refused in
+#: every candidate category; accessibility candidates are themselves refused.
 _SENSITIVE_TRAIT_RE = re.compile(
     r"\b(?:dyslexi\w*|dyspraxi\w*|adhd|autis\w*|asperger\w*|disabilit\w*|disabled|"
     r"disorder|diagnos\w*|medication|therapy|depress\w*|anxiet\w*|ptsd)\b",
@@ -234,17 +219,9 @@ _SENSITIVE_TRAIT_RE = re.compile(
 )
 
 
-def _scan(text: str, label: str, *, sensitive_allowed: bool = False) -> None:
-    """Reject material that must never reach a durable proposal.
-
-    ``sensitive_allowed`` relaxes only the *inferred-trait* pattern, and only
-    for a candidate that has already passed the structural consent gates in
-    :func:`_check_sensitive`. Everything else — credentials, tokens, raw
-    answers, transcripts — is refused unconditionally.
-    """
+def _scan(text: str, label: str) -> None:
+    """Reject material that must never reach a durable proposal."""
     for name, pattern, why in _FORBIDDEN_CONTENT:
-        if sensitive_allowed and name == "inferred_sensitive_trait":
-            continue
         if pattern.search(text):
             raise CandidateRejected(f"{label} rejected ({name}): {why}")
 
@@ -264,11 +241,9 @@ class MemoryCandidate:
     replaces: str | None = None
     track_id: str | None = None
     evidence_count: int | None = None
-    #: For a sensitive candidate, the learner's own words when agreeing —
-    #: recorded so a later reader can tell consent from assumption.
+    #: Compatibility field for legacy storage; accepted proposals leave it NULL.
     consent_reference: str | None = None
-    #: The canonical need this candidate is bound to, normalised. This is the
-    #: authorisation, not the prose: it must match a need the learner listed.
+    #: Compatibility field for legacy storage; accepted proposals leave it NULL.
     consented_need: str | None = None
 
     def to_json(self) -> dict[str, Any]:
@@ -322,12 +297,9 @@ def propose(
     that a pattern has recurred often enough to be worth *asking* the learner
     about, and a single observation has not.
 
-    Sensitive candidates additionally require ``consented_need`` — the exact
-    need the learner agreed to — matched against ``consented_needs`` after
-    normalisation. ``consent_statement`` alone is not enough and never was:
-    "please remember I need captions" is not permission to record a
-    diagnosis, and an earlier version accepted exactly that because it
-    checked only that *some* consent existed. Consent binds to one fact.
+    Accessibility candidates are refused unconditionally. The consent-shaped
+    arguments remain only for API compatibility; because they are supplied by
+    the model, they never authorize persistence.
     """
     if isinstance(origin, str) and origin in FORBIDDEN_ORIGINS:
         raise CandidateRejected(f"no memory candidate from '{origin}': {FORBIDDEN_ORIGINS[origin]}")
@@ -373,11 +345,11 @@ def propose(
         consented_need=consented_need,
     )
 
-    # Text scanning runs last and is defence in depth only. The structural
-    # gates above are what actually enforce the boundary; a regex can always
-    # be worded around, an origin cannot.
+    # Text scanning runs last and is defence in depth. Accessibility is already
+    # refused structurally; sensitive language cannot be smuggled under a
+    # different category either.
     for label, text in (("statement", statement), ("evidence_summary", evidence_summary)):
-        _scan(text, label, sensitive_allowed=category in SENSITIVE_CATEGORIES)
+        _scan(text, label)
 
     return MemoryCandidate(
         category=category,
@@ -403,9 +375,8 @@ SENSITIVE_UNAVAILABLE = (
     "accessibility and other sensitive facts cannot be stored as durable candidates. "
     "Everything that would authorise it — the consent statement, the needs it covers, the "
     "origin, the confirmation — is written by you in the same call, so none of it proves "
-    "the learner agreed. Honour the need in this session instead, and record it on a "
-    "confirmed track only as one of the fixed accommodation tokens. Never record that "
-    "someone has a condition."
+    "the learner agreed. Honour the need for the current call without persisting it. "
+    "Never record that someone has a condition."
 )
 
 
@@ -445,10 +416,8 @@ def _check_sensitive(
     variable or treat a claim as proof, this fails closed. Nothing sensitive
     is stored through this path, and the response says so.
 
-    An accessibility need is still *honoured*: in the current request, and on
-    a confirmed track whose stored value is one of the fixed accommodation
-    tokens — a vocabulary that cannot spell a diagnosis. What is refused is
-    the durable record asserting that a person has a condition.
+    An accessibility need is still *honoured* for the current request. It is
+    never written to a track, context row, revision, or memory candidate.
 
     The non-sensitive path keeps its own protection: sensitive vocabulary may
     not be smuggled in under another category either.

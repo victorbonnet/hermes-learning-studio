@@ -207,11 +207,11 @@ never an authorisation check.
 All primary keys are opaque generated tokens, so nothing keys on a label a
 learner can change.
 
-**Migrations are all-or-nothing.** Each migration runs in its own transaction
-and rolls back completely on failure, because a half-applied schema is harder
-to recover from than a failed startup. Explicit privacy and retention
+**Migrations are all-or-nothing.** All pending migrations run in one shared
+transaction and roll back together on failure, because a half-applied schema
+is harder to recover from than a failed startup. Explicit privacy and retention
 migrations may purge rows that the current policy forbids keeping; unrelated
-data is preserved and the cleanup rolls back with the migration on failure. A
+data is preserved and the cleanup rolls back with the upgrade batch on failure. A
 database written by a newer version of the plugin is refused with an
 explanation and left byte-for-byte untouched — deleting or "resetting" an
 unfamiliar database would destroy a learner's record to make the code happy.

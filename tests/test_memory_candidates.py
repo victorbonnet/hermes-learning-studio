@@ -252,7 +252,8 @@ def test_the_refusal_explains_why_rather_than_just_failing():
 
     message = str(refusal.value)
     assert "written by you in the same call" in message
-    assert "confirmed track" in message
+    assert "current call without persisting" in message
+    assert "Never record that someone has a condition" in message
 
 
 def test_a_forged_consent_statement_changes_nothing():
