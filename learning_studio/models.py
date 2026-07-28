@@ -50,9 +50,9 @@ LIST_FIELDS: tuple[str, ...] = (
 
 CONTEXT_FIELDS: tuple[str, ...] = SCALAR_FIELDS + LIST_FIELDS
 
-#: Session-only unless the learner explicitly asks otherwise. Honoured fully
-#: for the current session, never inferred, never durable by default. See
-#: SKILL.md's consent rules — this is the code half of that contract.
+#: Always session-only. Honoured for the current call when supplied, never
+#: inferred and never written to durable storage, regardless of model-supplied
+#: consent. See SKILL.md's accessibility rules.
 SESSION_ONLY_FIELDS: frozenset[str] = frozenset({"accessibility_needs"})
 
 MAX_LIST_ITEMS = 25

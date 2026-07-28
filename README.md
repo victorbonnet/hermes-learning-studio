@@ -207,12 +207,14 @@ never an authorisation check.
 All primary keys are opaque generated tokens, so nothing keys on a label a
 learner can change.
 
-**Migrations are all-or-nothing, and never destructive.** Each migration runs
-in its own transaction and rolls back completely on failure, because a
-half-applied schema is harder to recover from than a failed startup. A
+**Migrations are all-or-nothing.** Each migration runs in its own transaction
+and rolls back completely on failure, because a half-applied schema is harder
+to recover from than a failed startup. Explicit privacy and retention
+migrations may purge rows that the current policy forbids keeping; unrelated
+data is preserved and the cleanup rolls back with the migration on failure. A
 database written by a newer version of the plugin is refused with an
-explanation and left untouched — deleting or "resetting" it would destroy a
-learner's record to make the code happy.
+explanation and left byte-for-byte untouched — deleting or "resetting" an
+unfamiliar database would destroy a learner's record to make the code happy.
 
 **`register()` opens no database.** It registers a skill and three tools and
 returns. Initialising storage at startup would let a corrupt or
@@ -424,8 +426,8 @@ a track's context, and one `save_context` call can create the track, set
 authorises it. A source a model can populate is not a source, so what remains
 is a file a person edits.
 
-**Nothing about a person is stored at all.** An accessibility need is never
-written to storage, whatever consent accompanies it, and an `accessibility`
+**No accessibility need about a person is stored.** An accessibility need is
+never written to storage, whatever consent accompanies it, and an `accessibility`
 memory candidate is refused however it is presented. The consent statement, the
 need, the track flag, the origin and the confirmation all arrive in one tool
 call, written by one model, and Hermes exposes no confirmation event to check

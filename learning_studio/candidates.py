@@ -40,7 +40,7 @@ class Category(StrEnum):
     DURABLE_PREFERENCE = "durable_preference"
     LONG_TERM_GOAL = "long_term_goal"
     TARGET_LEVEL = "target_level"
-    #: Session-only unless the learner explicitly asks otherwise.
+    #: Compatibility vocabulary only; runtime always refuses persistence.
     ACCESSIBILITY = "accessibility"
     PRIVACY_PREFERENCE = "privacy_preference"
 

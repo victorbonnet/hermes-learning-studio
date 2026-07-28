@@ -169,7 +169,7 @@ def test_migrations_are_contiguous_and_the_version_is_the_last_one():
     versions = [m.version for m in storage.MIGRATIONS]
 
     assert versions == list(range(1, len(versions) + 1))
-    assert storage.SCHEMA_VERSION == versions[-1] == 6
+    assert storage.SCHEMA_VERSION == versions[-1] == 7
 
 
 def test_migration_two_adds_the_column():
@@ -1091,6 +1091,14 @@ def test_migration_five_was_not_rewritten_for_semantic_cleanup(hermes_home: Path
     assert "WHERE durability = 'durable'" not in body
 
 
+def test_migration_six_was_not_rewritten_for_privacy_cleanup(hermes_home: Path):
+    """Profiles that already reached v6 must receive privacy cleanup via v7."""
+    body = " ".join(next(m for m in storage.MIGRATIONS if m.version == 6).statements)
+
+    assert "accessibility_needs" not in body
+    assert "category = 'accessibility'" not in body
+
+
 def test_a_v5_database_receives_lifecycle_and_provenance_cleanup(hermes_home: Path):
     _build_database_at(5)
     now = "2026-01-01T00:00:00+00:00"
@@ -1134,7 +1142,7 @@ def test_a_v5_database_receives_lifecycle_and_provenance_cleanup(hermes_home: Pa
         ).fetchall()
         version = storage.read_schema_version(conn)
 
-    assert version == 6
+    assert version == 7
     assert [dict(row) for row in rows] == [
         {
             "id": "authority-v5",
@@ -1188,6 +1196,118 @@ def test_a_failing_migration_six_rolls_back_cleanup(hermes_home: Path, monkeypat
 
     assert version == 5
     assert row["durability"] == "session"
+
+
+def _seed_accessibility_rows_under_v6() -> None:
+    _build_database_at(6)
+    now = "2026-01-01T00:00:00+00:00"
+    with storage.connect() as conn:
+        conn.execute(
+            "INSERT INTO learners"
+            " (id, profile_id, principal_digest, platform, created_at, updated_at)"
+            " VALUES ('L6', 'default', 'digest-6', 'telegram', ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO learning_contexts"
+            " (id, learner_id, profile_id, scope, track_id, expires_at, created_at, updated_at)"
+            " VALUES ('C6', 'L6', 'default', 'temporary', NULL, ?, ?, ?)",
+            ("2027-01-01T00:00:00+00:00", now, now),
+        )
+        for value_id, field, value in (
+            ("access-value", "accessibility_needs", '["captions"]'),
+            ("goal-value", "goal", "Learn safely"),
+        ):
+            conn.execute(
+                "INSERT INTO context_values"
+                " (id, context_id, learner_id, profile_id, field, value, provenance,"
+                "  confirmed, created_at, updated_at)"
+                " VALUES (?, 'C6', 'L6', 'default', ?, ?, 'confirmed_track', 1, ?, ?)",
+                (value_id, field, value, now, now),
+            )
+        for revision_id, field, value in (
+            ("access-revision", "accessibility_needs", '["captions"]'),
+            ("goal-revision", "goal", "Learn safely"),
+        ):
+            conn.execute(
+                "INSERT INTO context_revisions"
+                " (id, context_id, learner_id, profile_id, field, previous_value,"
+                "  previous_provenance, new_value, provenance, change_reason, created_at)"
+                " VALUES (?, 'C6', 'L6', 'default', ?, NULL, NULL, ?, 'confirmed_track',"
+                " 'confirmed_track', ?)",
+                (revision_id, field, value, now),
+            )
+        for candidate_id, category in (
+            ("access-candidate", "accessibility"),
+            ("goal-candidate", "long_term_goal"),
+        ):
+            conn.execute(
+                "INSERT INTO memory_candidates"
+                " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
+                "  origin, evidence_count, confidence, durability, confirmation_state,"
+                "  recommended_action, replaces, consent_reference, consented_need, expires_at,"
+                "  created_at, updated_at)"
+                " VALUES (?, 'L6', 'default', NULL, ?, ?, 'Legacy row', 'model_proposed', NULL,"
+                " 'medium', 'durable', 'unconfirmed', 'add', NULL, NULL, NULL, NULL, ?, ?)",
+                (candidate_id, category, candidate_id, now, now),
+            )
+        conn.commit()
+
+
+def test_a_v6_database_purges_only_legacy_accessibility_data(hermes_home: Path):
+    _seed_accessibility_rows_under_v6()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        version = storage.read_schema_version(conn)
+        values = [row["id"] for row in conn.execute("SELECT id FROM context_values ORDER BY id")]
+        revisions = [
+            row["id"] for row in conn.execute("SELECT id FROM context_revisions ORDER BY id")
+        ]
+        candidates = [
+            row["id"] for row in conn.execute("SELECT id FROM memory_candidates ORDER BY id")
+        ]
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert version == 7
+    assert values == ["goal-value"]
+    assert revisions == ["goal-revision"]
+    assert candidates == ["goal-candidate"]
+    assert foreign_keys == []
+
+
+def test_a_failing_migration_seven_rolls_back_privacy_cleanup(hermes_home: Path, monkeypatch):
+    _seed_accessibility_rows_under_v6()
+    real = list(storage.MIGRATIONS)
+    monkeypatch.setattr(
+        storage,
+        "MIGRATIONS",
+        [
+            *real[:6],
+            storage.Migration(version=7, statements=(*real[6].statements, "THIS IS NOT SQL")),
+        ],
+    )
+
+    with pytest.raises(storage.MigrationError):
+        storage.initialize()
+
+    with storage.connect() as conn:
+        version = storage.read_schema_version(conn)
+        sensitive_values = conn.execute(
+            "SELECT COUNT(*) AS n FROM context_values WHERE field = 'accessibility_needs'"
+        ).fetchone()["n"]
+        sensitive_revisions = conn.execute(
+            "SELECT COUNT(*) AS n FROM context_revisions WHERE field = 'accessibility_needs'"
+        ).fetchone()["n"]
+        sensitive_candidates = conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_candidates WHERE category = 'accessibility'"
+        ).fetchone()["n"]
+
+    assert version == 6
+    assert sensitive_values == 1
+    assert sensitive_revisions == 1
+    assert sensitive_candidates == 1
 
 
 def test_a_failing_migration_five_rolls_back_completely(hermes_home: Path, monkeypatch):

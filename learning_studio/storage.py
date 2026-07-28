@@ -666,6 +666,18 @@ _MIGRATION_006 = (
 )
 
 
+# Migration 7 enforces the unconditional session-only accessibility policy on
+# databases that may already have reached v6. Older releases could persist the
+# same sensitive fact in current values, revision history, or candidates. None
+# has host-backed consent, so all three representations are purged together;
+# unrelated learning context and candidates remain intact.
+_MIGRATION_007 = (
+    "DELETE FROM context_revisions WHERE field = 'accessibility_needs'",
+    "DELETE FROM context_values WHERE field = 'accessibility_needs'",
+    "DELETE FROM memory_candidates WHERE category = 'accessibility'",
+)
+
+
 #: Ordered, contiguous from 1. The list order is the application order.
 MIGRATIONS: list[Migration] = [
     Migration(version=1, statements=_MIGRATION_001),
@@ -674,6 +686,7 @@ MIGRATIONS: list[Migration] = [
     Migration(version=4, statements=_MIGRATION_004),
     Migration(version=5, statements=_MIGRATION_005),
     Migration(version=6, statements=_MIGRATION_006),
+    Migration(version=7, statements=_MIGRATION_007),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

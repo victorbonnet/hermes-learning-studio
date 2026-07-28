@@ -137,6 +137,7 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
             r"\bwww\.[a-z0-9-]+\.[a-z]{2,}|"
             r"\b[a-z0-9][a-z0-9-]{0,62}\.[a-z]{2,24}/\S|"
             r"\b[a-z0-9][a-z0-9-]*-[a-z0-9-]*\.[a-z]{2,24}\b|"
+            r"\b(?=[a-z0-9-]*\d[a-z0-9-]*\.)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.[a-z]{2}\b|"
             r"\b[a-z0-9][a-z0-9-]{0,62}\.[a-z]{3,24}\b|"
             r"\b[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0-9][a-z0-9-]{1,62}){2,}\b",
             re.IGNORECASE,
@@ -376,6 +377,18 @@ def safe_text(
     if len(text) < min_chars:
         raise UnsafeContent(f"{label} must be at least {min_chars} character(s)")
     comparison = unicodedata.normalize("NFKC", text)
+    # Treat every Unicode opening punctuation character immediately before a
+    # path as a lexical boundary for safety inspection. Enumerating brackets
+    # made uncommon forms such as ``《/etc/passwd》`` a bypass; Unicode
+    # categories are the structural rule. Other brackets stay intact so CSS
+    # and IPv6 detectors still see their complete syntax.
+    comparison_chars = list(comparison)
+    for index, char in enumerate(comparison_chars):
+        if unicodedata.category(char) in {"Ps", "Pi"} and re.match(
+            r"(?:~?[/\\]|[A-Za-z]:[/\\])", comparison[index + 1 :]
+        ):
+            comparison_chars[index] = " "
+    comparison = "".join(comparison_chars)
     for pattern, explanation in _RULES:
         if pattern.search(comparison):
             raise UnsafeContent(f"{label} {explanation}")
