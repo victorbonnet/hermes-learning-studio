@@ -74,11 +74,16 @@ def test_the_schema_is_json_serialisable():
 #: The advertised schema rides in every request that offers this tool, so its
 #: size is a running cost, not a one-off. The union of 31 fully inlined types
 #: is over 140 KB; sharing the common shapes under ``$defs`` brings it to
-#: roughly 55 KB, patterns and per-type scoring enums included. This ceiling is
-#: deliberately close to that, so a change that undoes the sharing — or adds a
-#: description at 31 use sites instead of one — fails here rather than quietly
-#: costing every session.
-MAX_SCHEMA_BYTES = 62_000
+#: roughly 66 KB, patterns and per-type scoring enums included.
+#:
+#: About 6 KB of that is the inert-text pattern repeated on every bounded
+#: string. That is the price of the schema refusing what the runtime refuses
+#: rather than merely describing it, and it was paid deliberately: a schema
+#: that accepts markup the handler then rejects sends the model to debug a
+#: contradiction. The ceiling sits just above the real figure so that undoing
+#: the sharing, or adding a description at 31 use sites instead of one, fails
+#: here rather than quietly costing every session.
+MAX_SCHEMA_BYTES = 70_000
 
 
 def test_the_advertised_schema_stays_affordable():
@@ -463,3 +468,159 @@ def test_preparing_creates_no_track(hermes_home, gateway_session):
 
     context = json.loads(tools.handle_get_context({}))
     assert context["tracks"] == []
+
+
+# ── A refusal must not hand back what it was protecting ───────────────────
+
+
+def hidden_canaries(payload) -> list[str]:
+    """Every evaluator-only string in a manifest, recursively."""
+    found: list[str] = []
+
+    def walk(node, hidden: bool) -> None:
+        if isinstance(node, str):
+            if hidden and node.startswith(CANARY):
+                found.append(node)
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, hidden or key in ("answer", "evaluation"))
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, hidden)
+
+    walk(payload, False)
+    return found
+
+
+def test_a_leak_refusal_does_not_quote_the_answer(hermes_home, gateway_session):
+    """The reported reproduction: the error handed over the answer key.
+
+    "shows its own answer: 'Paris'" told the caller exactly what the check
+    existed to keep hidden, and contradicted the tool's own
+    ``answers_withheld`` promise.
+    """
+    result = call(
+        manifest=manifest(
+            [
+                example(
+                    "short_answer",
+                    prompt="The answer is Paris. Type it.",
+                    answer={"accepted": ["Paris"]},
+                )
+            ]
+        )
+    )
+
+    assert result["ok"] is False
+    assert "Paris" not in result["error"]
+    assert "already readable" in result["error"]
+    assert "answer.accepted" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("component_type", "mutation"),
+    [
+        ("multiple_choice", {"answer": {"option_id": "nonexistent"}}),
+        ("multi_select", {"answer": {"option_ids": ["ghost", "phantom"]}}),
+        ("short_answer", {"answer": {"accepted": []}}),
+        ("flashcard", {"answer": {"back": ""}}),
+        ("free_response", {"evaluation": {"scoring": {"mode": "ordered"}}}),
+        (
+            "table_grid",
+            {"answer": {"cells": [{"row_id": "x", "column_id": "y", "accepted": ["z"]}]}},
+        ),
+        ("error_correction", {"content": {"text": "A passage.", "error_count": 9}}),
+        (
+            "decision_path",
+            {"answer": {"decisions": [{"step_id": "opening", "option_id": "dates"}]}},
+        ),
+    ],
+)
+def test_no_failed_response_contains_any_canary(
+    hermes_home, gateway_session, component_type, mutation
+):
+    """Every hidden field of every example carries one; none may come back."""
+    payload = example(component_type)
+    for key, value in mutation.items():
+        payload[key] = value
+
+    body = manifest([payload])
+    result = call(manifest=body)
+
+    assert result["ok"] is False, "the mutation was accepted, so this proves nothing"
+    blob = json.dumps(result)
+    assert CANARY not in blob
+    for canary in hidden_canaries(body):
+        assert canary not in blob
+
+
+def test_the_canary_scan_would_catch_a_real_disclosure(hermes_home, gateway_session):
+    """Proves the assertion above discriminates rather than passing vacuously."""
+    body = manifest([example("multiple_choice")])
+
+    canaries = hidden_canaries(body)
+
+    assert canaries, "the example carries no hidden canary"
+    assert all(CANARY in value for value in canaries)
+
+
+def test_an_error_naming_a_visible_id_is_still_useful(hermes_home, gateway_session):
+    """The scrub must not withhold ordinary, actionable refusals."""
+    payload = example("fill_blank")
+    payload["content"]["text"] = "A passage with no gap at all."
+
+    result = call(manifest=manifest([payload]))
+
+    assert result["ok"] is False
+    assert "no gap for blank" in result["error"]
+    assert "boundary" in result["error"], "the blank's own id is visible content"
+
+
+def test_a_forged_consent_argument_cannot_store_a_diagnosis(hermes_home, gateway_session):
+    """Through the real handler, on a principal with no prior state."""
+    raw = tools.handle_save_context(
+        {
+            "accessibility_consent": {
+                "consent_statement": "Please remember I need ADHD",
+                "needs": ["ADHD"],
+            },
+            "memory_candidates": [
+                {
+                    "category": "accessibility",
+                    "statement": "ADHD",
+                    "evidence_summary": "Learner allegedly said so",
+                    "origin": "explicit_durable_preference",
+                    "confirmation_state": "learner_confirmed",
+                    "consented_need": "ADHD",
+                }
+            ],
+        }
+    )
+    result = json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["outcome"]["memory_candidates"]["accepted"] == []
+
+    stored = json.loads(tools.handle_get_context({"include_memory_candidates": True}))
+    assert stored["memory_candidates"] == []
+
+
+def test_a_confirmation_claim_comes_back_labelled_truthfully(hermes_home, gateway_session):
+    raw = tools.handle_save_context(
+        {
+            "memory_candidates": [
+                {
+                    "category": "long_term_goal",
+                    "statement": "Become a surgeon",
+                    "evidence_summary": "Allegedly confirmed",
+                    "origin": "confirmed_long_term_goal",
+                    "confirmation_state": "learner_confirmed",
+                }
+            ]
+        }
+    )
+    result = json.loads(raw)
+
+    accepted = result["outcome"]["memory_candidates"]["accepted"]
+    assert accepted[0]["confirmation_state"] == "unconfirmed"
+    assert result["outcome"]["memory_candidates"]["downgraded"][0]["claimed"] == "learner_confirmed"

@@ -204,87 +204,70 @@ def test_a_sensitive_trait_outside_the_accessibility_category_is_refused():
         )
 
 
-# ── Accessibility consent ─────────────────────────────────────────────────
+# ── Accessibility candidates are refused outright ─────────────────────────
+#
+# The gate that used to live here checked five conditions — category, origin,
+# confirmation, that consent existed, and that it covered this exact need.
+# Every one of those was read from arguments the model wrote in the same call,
+# so the gate's keys were held by the party it was checking. It is gone, and
+# nothing sensitive is storable through this path at all.
 
 
-def test_an_accessibility_candidate_cannot_come_from_repeated_evidence():
-    """A pattern across exercises is not evidence that someone has a condition."""
-    with pytest.raises(CandidateRejected, match="cannot come from 'repeated_evidence'"):
+@pytest.mark.parametrize(
+    ("statement", "consented"),
+    [
+        ("The learner has ADHD", "ADHD"),
+        ("Needs captions on any audio material.", "needs captions on any audio material."),
+        ("captions on audio", "captions on audio"),
+    ],
+)
+def test_no_accessibility_candidate_can_be_stored(statement: str, consented: str):
+    """Not with consent, not confirmed, not exactly matched. Not at all."""
+    with pytest.raises(CandidateRejected, match="cannot be stored as durable candidates"):
         _propose(
             category="accessibility",
-            statement="The learner has ADHD",
-            evidence_summary="Observed this pattern in three independent exercises",
-            origin="repeated_evidence",
-            confirmation_state="learner_confirmed",
-            evidence_count=5,
-            min_evidence=3,
-            consent_statement="ok",
-        )
-
-
-def test_an_unconfirmed_accessibility_candidate_is_refused():
-    with pytest.raises(CandidateRejected, match="must be 'learner_confirmed'"):
-        _propose(
-            category="accessibility",
-            statement="Needs captions on any audio material.",
-            evidence_summary="Asked for captions this session.",
-            confirmation_state="unconfirmed",
-            consent_statement="please remember this",
-        )
-
-
-def test_an_accessibility_candidate_without_consent_is_refused():
-    """A generic yes elsewhere in the request is not consent for this fact."""
-    with pytest.raises(CandidateRejected, match="requires accessibility_consent"):
-        _propose(
-            category="accessibility",
-            statement="captions on any audio material",
-            evidence_summary="Asked for this to be remembered.",
-            confirmation_state="learner_confirmed",
-            consent_statement=None,
-        )
-
-
-def test_an_accessibility_candidate_without_a_consented_need_is_refused():
-    """Consent must name the fact, not merely exist."""
-    with pytest.raises(CandidateRejected, match="requires 'consented_need'"):
-        _propose(
-            category="accessibility",
-            statement="captions on any audio material",
-            evidence_summary="Asked for this to be remembered.",
+            statement=statement,
+            evidence_summary="The learner asked for this to be remembered",
+            origin="explicit_durable_preference",
             confirmation_state="learner_confirmed",
             consent_statement="please remember this",
-            consented_needs=frozenset({"captions on any audio material"}),
+            consented_needs=frozenset({consented}),
+            consented_need=consented,
         )
 
 
-def test_a_consented_need_outside_the_agreed_list_is_refused():
-    with pytest.raises(CandidateRejected, match="does not match any need"):
+def test_the_refusal_explains_why_rather_than_just_failing():
+    """An agent that cannot understand a refusal will keep retrying it."""
+    with pytest.raises(CandidateRejected) as refusal:
         _propose(
             category="accessibility",
-            statement="a screen reader",
-            evidence_summary="Asked for this to be remembered.",
+            statement="captions",
+            evidence_summary="asked for it",
+            origin="explicit_durable_preference",
             confirmation_state="learner_confirmed",
-            consent_statement="remember I need captions",
-            consented_needs=frozenset({"captions on audio"}),
-            consented_need="a screen reader",
+            consent_statement="remember captions",
+            consented_needs=frozenset({"captions"}),
+            consented_need="captions",
         )
 
+    message = str(refusal.value)
+    assert "written by you in the same call" in message
+    assert "confirmed track" in message
 
-def test_accessibility_is_accepted_when_confirmed_and_exactly_consented():
-    candidate = _propose(
-        category="accessibility",
-        statement="captions on any audio material",
-        evidence_summary="Asked for this to be remembered for future sessions.",
-        confirmation_state="learner_confirmed",
-        consent_statement="yes, please remember I need captions",
-        consented_needs=frozenset({"captions on any audio material"}),
-        consented_need="captions on any audio material",
-    )
 
-    assert candidate.category.value == "accessibility"
-    assert candidate.consent_reference == "yes, please remember I need captions"
-    assert candidate.consented_need == "captions on any audio material"
+def test_a_forged_consent_statement_changes_nothing():
+    """The reported reproduction: consent and diagnosis in one model-written call."""
+    with pytest.raises(CandidateRejected):
+        _propose(
+            category="accessibility",
+            statement="ADHD",
+            evidence_summary="Learner allegedly said so",
+            origin="explicit_durable_preference",
+            confirmation_state="learner_confirmed",
+            consent_statement="Please remember I need ADHD",
+            consented_needs=frozenset({"adhd"}),
+            consented_need="ADHD",
+        )
 
 
 def test_a_sensitive_statement_cannot_be_relabelled_to_slip_past_the_scan():
@@ -452,7 +435,28 @@ def test_an_accessibility_need_is_honoured_through_the_current_request(hermes_ho
     assert resolved["provenance"] == "explicit_request"
 
 
-def test_a_consented_need_is_stored(hermes_home: Path):
+def test_a_consented_accommodation_token_is_stored(hermes_home: Path):
+    """Only the fixed vocabulary reaches storage, and only with consent.
+
+    "captions on all audio" is honoured for the session and never written
+    down; "captions" is a token that cannot express anything about a person,
+    so it can be. That restriction is what makes a diagnosis unstorable
+    through a consent-shaped argument rather than merely discouraged.
+    """
+    service.save_context(
+        principal=LEARNER,
+        temporary_context={"accessibility_needs": ["captions"]},
+        accessibility_consent={
+            "consent_statement": "please remember I need captions",
+            "needs": ["captions"],
+        },
+    )
+
+    result = service.get_context(principal=LEARNER)
+    assert result["temporary_context"]["accessibility_needs"]["value"] == ["captions"]
+
+
+def test_a_free_text_need_is_never_stored_even_with_consent(hermes_home: Path):
     service.save_context(
         principal=LEARNER,
         temporary_context={"accessibility_needs": ["captions on all audio"]},
@@ -460,7 +464,22 @@ def test_a_consented_need_is_stored(hermes_home: Path):
     )
 
     result = service.get_context(principal=LEARNER)
-    assert result["temporary_context"]["accessibility_needs"]["value"] == ["captions on all audio"]
+    assert "accessibility_needs" not in result["temporary_context"]
+
+
+def test_a_diagnosis_cannot_be_stored_as_an_accessibility_need(hermes_home: Path):
+    """The vocabulary restriction, from the direction that matters."""
+    outcome = service.save_context(
+        principal=LEARNER,
+        temporary_context={"accessibility_needs": ["ADHD"]},
+        accessibility_consent={
+            "consent_statement": "remember I have ADHD",
+            "needs": ["ADHD"],
+        },
+    )["outcome"]
+
+    assert [entry["field"] for entry in outcome["not_stored"]] == ["accessibility_needs"]
+    assert "accessibility_needs" not in service.get_context(principal=LEARNER)["temporary_context"]
 
 
 def test_consent_for_one_need_does_not_store_a_different_one(hermes_home: Path):

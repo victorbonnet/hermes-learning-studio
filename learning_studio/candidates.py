@@ -360,6 +360,19 @@ def propose(
     )
 
 
+#: Returned whenever an accessibility candidate is proposed. Worded for the
+#: agent, and truthful about *why* — a refusal an agent cannot understand is
+#: one it will keep retrying.
+SENSITIVE_UNAVAILABLE = (
+    "accessibility and other sensitive facts cannot be stored as durable candidates. "
+    "Everything that would authorise it — the consent statement, the needs it covers, the "
+    "origin, the confirmation — is written by you in the same call, so none of it proves "
+    "the learner agreed. Honour the need in this session instead, and record it on a "
+    "confirmed track only as one of the fixed accommodation tokens. Never record that "
+    "someone has a condition."
+)
+
+
 def _check_sensitive(
     *,
     category: Category,
@@ -371,42 +384,49 @@ def _check_sensitive(
     consented_needs: frozenset[str],
     consented_need: Any,
 ) -> tuple[str | None, str | None]:
-    """Gate disability, diagnosis, and accessibility material on real consent.
+    """Refuse to store disability, diagnosis, or accessibility material at all.
 
-    Five independent conditions must all hold, and each blocks a different
-    way of getting this wrong:
+    **This used to be a five-condition gate, and the gate was the wrong shape.**
+    Every one of its inputs — the consent statement, the needs it covered, the
+    origin, the confirmation state — arrives in the same tool call, written by
+    the same model. A gate whose every key is handed over by the party being
+    checked is not a gate. Sending::
 
-    1. **Category.** Sensitive material may only travel as an accessibility
-       candidate — it cannot be smuggled in as a "preference".
-    2. **Origin.** It must come from the learner saying so. Repeated
-       evidence, performance patterns, timings, and scores are observations
-       about work, never grounds to record that someone *has* a condition.
-    3. **Confirmation.** ``learner_confirmed`` only. An unconfirmed guess
-       about someone's health is the exact thing that must never persist.
-    4. **Consent exists**, in the learner's own words.
-    5. **Consent covers *this* need.** ``consented_need`` must match one of
-       the needs the learner listed, and the statement must be that need.
+        accessibility_consent = {"consent_statement": "remember I need ADHD",
+                                 "needs": ["ADHD"]}
+        memory_candidates = [{"category": "accessibility", "statement": "ADHD",
+                              "origin": "explicit_durable_preference",
+                              "confirmation_state": "learner_confirmed",
+                              "consented_need": "ADHD"}]
 
-    Condition 5 is the one that was missing. Without it, "please remember I
-    need captions" authorised storing an ADHD diagnosis, because the code
-    only checked that consent existed at all. Matching is exact after
-    :func:`~learning_studio.models.normalize_need` — no substrings, no
-    similarity, no inference. Deciding that "ADHD" is or is not "related to"
-    captions is not a judgement a string comparison gets to make.
+    satisfied all five conditions and stored a durable row asserting that a
+    learner had confirmed a diagnosis, on nobody's word but the model's.
 
-    Returns ``(consent_statement, canonical_need)`` for the audit trail.
+    Hermes' plugin API gives this plugin the platform and the sender id and
+    nothing else: there is no host-supplied event meaning "the learner agreed
+    to this", so ``consent_statement``, ``needs``, ``origin`` and
+    ``confirmation_state`` are all claims. Rather than invent a session
+    variable or treat a claim as proof, this fails closed. Nothing sensitive
+    is stored through this path, and the response says so.
+
+    An accessibility need is still *honoured*: in the current request, and on
+    a confirmed track whose stored value is one of the fixed accommodation
+    tokens — a vocabulary that cannot spell a diagnosis. What is refused is
+    the durable record asserting that a person has a condition.
+
+    The non-sensitive path keeps its own protection: sensitive vocabulary may
+    not be smuggled in under another category either.
     """
-    from .models import normalize_need
+    del origin, confirmation_state, consent_statement, consented_needs
 
     combined = f"{statement}\n{evidence}"
-    mentions_sensitive = bool(_SENSITIVE_TRAIT_RE.search(combined))
-
     if category not in SENSITIVE_CATEGORIES:
-        if mentions_sensitive:
+        if _SENSITIVE_TRAIT_RE.search(combined):
             raise CandidateRejected(
-                "sensitive health, disability, or diagnosis material cannot be proposed under "
-                f"category '{category.value}'; only an accessibility candidate the learner "
-                "explicitly asked to be remembered may carry it"
+                "sensitive health, disability, or diagnosis material cannot be proposed as a "
+                f"'{category.value}' candidate — and it cannot be proposed as an "
+                "accessibility one either, because nothing in a tool call can prove the "
+                "learner agreed to it being recorded"
             )
         if consented_need is not None:
             raise CandidateRejected(
@@ -415,52 +435,4 @@ def _check_sensitive(
             )
         return None, None
 
-    if origin not in SENSITIVE_ORIGINS:
-        allowed = ", ".join(sorted(o.value for o in SENSITIVE_ORIGINS))
-        raise CandidateRejected(
-            f"an accessibility candidate cannot come from '{origin.value}'. A pattern across "
-            "exercises is an observation about performance, not evidence that someone has a "
-            f"condition — only the learner can state that. Allowed origins: {allowed}"
-        )
-
-    if confirmation_state is not ConfirmationState.LEARNER_CONFIRMED:
-        raise CandidateRejected(
-            "an accessibility candidate must be 'learner_confirmed'. Confirm the fact with "
-            "the learner in their own words before proposing it; an unconfirmed inference "
-            "about someone's health must never become durable"
-        )
-
-    try:
-        reference = clean_text(consent_statement, "consent_statement", MAX_VALUE_CHARS)
-    except ValueError as exc:
-        raise CandidateRejected(
-            "an accessibility candidate requires accessibility_consent recording what the "
-            f"learner agreed to remember ({exc})"
-        ) from exc
-
-    if consented_need is None:
-        raise CandidateRejected(
-            "an accessibility candidate requires 'consented_need' naming the exact need the "
-            "learner agreed to. Consent to remember one need is not consent to record "
-            "another fact about their health"
-        )
-    try:
-        canonical = normalize_need(consented_need)
-    except ValueError as exc:
-        raise CandidateRejected(f"consented_need is invalid: {exc}") from exc
-
-    if canonical not in consented_needs:
-        raise CandidateRejected(
-            "consented_need does not match any need the learner agreed to remember. "
-            "Consent binds to one exact need — ask them about this one specifically "
-            "rather than reusing permission given for something else"
-        )
-
-    if normalize_need(statement) != canonical:
-        raise CandidateRejected(
-            "an accessibility candidate's statement must be exactly the consented need, so "
-            "that what gets remembered is what was agreed to. Put any wording for the "
-            "learner in your reply, not in the stored fact"
-        )
-
-    return reference, canonical
+    raise CandidateRejected(SENSITIVE_UNAVAILABLE)

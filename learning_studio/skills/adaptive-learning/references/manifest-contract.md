@@ -31,8 +31,11 @@ these are rejected wherever they appear:
   with or without its trailing semicolon;
 - URLs and URIs of any scheme, including `mailto:`, `ftp:` and `file:`;
 - bare web addresses such as `www.example.com` or `example.com/page`;
-- filesystem paths — `/etc/hosts`, `/secret.txt`, `./notes`, `../up`,
-  `~/notes.txt`, `C:\Users`, `\\server\share`;
+- filesystem paths — `/etc/hosts`, `/secret.txt`, `/secret`, `./notes`,
+  `../up`, `~/notes`, `C:\Users`, `\\server\share`. A leading slash is a
+  path, so a slash-command is written as "the help command", not `/help`;
+- hosts and addresses — `example.fr/path`, `sub.example.com`,
+  `192.168.1.1/admin`, `localhost:8080/admin`;
 - credential-shaped values — `api_key=…`, `password: …`, `Authorization:
   Basic …`, bearer tokens, and current prefixed token shapes;
 - invisible and bidirectional characters.
@@ -137,9 +140,15 @@ for you:
   enforced for every component whose answer is text the learner must produce —
   cloze gaps, short answers, translations, corrections, recall cues, flashcard
   backs, reference solutions, grid cells. The whole visible half is compared,
-  on token boundaries, so `H2O` in "Type H2O" is caught as surely as a
-  sentence is. Selection components are exempt: their key is an option id, and
-  the option text is meant to be read.
+  three ways: as a token sequence, so `H2O` in "Type H2O" is caught and `Na`
+  does not match inside "national"; as a separated spelling, so `P.a.r.i.s`
+  does not hide `Paris`; and as a symbol string, so an answer of `+` or `===`
+  cannot be printed in its own prompt. Selection components are exempt: their
+  key is an option id, and the option text is meant to be read.
+- **A refusal never quotes what it is protecting.** Errors name the field —
+  `answer.accepted` — and never the value. Nothing this tool returns will
+  quote an answer, a rubric, a hint, or a note, including when one of them is
+  the reason for the refusal.
 - **Release hints one at a time**, and send feedback in response to an attempt
   rather than alongside the question.
 
@@ -172,6 +181,12 @@ A few types carry their own rules:
 - **`table_grid`** — every cell is either prefilled or has an expected answer,
   exactly once. An empty box nothing will mark is not a question.
 - **`multi_select`** and the other set answers — no id twice.
+- **`categorization`** — every item assigned exactly once, no category twice
+  for one item, and one category per item unless `allow_multiple` is set.
+  Several *items* may share a category; that is what grouping is.
+- **`error_correction`** — `error_count`, if given, equals the number of
+  corrections; each corrected phrase appears in the passage; each correction
+  changes something.
 - **`feedback.per_option`** — each entry must name an option this component
   has, and no option twice.
 
@@ -239,28 +254,30 @@ list — there is no free-text field:
 `transcript`, `text_alternatives`, `visual_description`, `keyboard_only`,
 `reduced_motion`, `no_time_limit`, `extended_time`, `plain_language`.
 
-`source` is `explicit_request`, `confirmed_track`, or `profile_config`, and
-**the claim is verified against that source**. A `confirmed_track` claim is
-checked against that track's confirmed context; `profile_config` against the
-operator's configuration; `explicit_request` against what this learner has
-actually recorded. Naming a source that says nothing is refused. There is no
-value meaning "I inferred it", because you must not.
+`source` is `confirmed_track` or `profile_config`, and **the claim is verified
+against that source**: a `confirmed_track` claim against that track's confirmed
+context, `profile_config` against the operator's configuration. Naming a source
+that says nothing is refused, and there is no value meaning "I inferred it".
 
-To use an accommodation, the need has to be stored for the learner already —
-which means they asked you to remember it and you sent
-`accessibility_consent`. If it is session-only, omit `accessibility` and
-honour the need in conversation. Declaring one records nothing about the
-learner and creates no memory candidate.
+`explicit_request` is deliberately absent. It was checked against the
+learner's temporary context — a row *the agent* had written earlier — so it
+amounted to the model authorising itself. Hermes exposes no per-request
+accessibility signal to check instead, so the source is gone rather than
+faked. A session-only need is honoured in conversation and not recorded on
+the exercise.
 
 **The experience must be able to deliver what it declares.** `keyboard_only`
 alongside a hotspot, labelling, matching or drag-ordering component is refused
 unless that component supplies `accessibility.keyboard_alternative`.
-`captions` needs a caption on each asset-bearing component;
-`visual_description` needs a long description.
+`captions` needs an actual `caption`; `transcript` needs an actual
+`transcript`; asking for both needs both. They are different accommodations
+for different people, and a flag asserting one is needed is not the thing
+itself. `visual_description` needs a long description. `no_time_limit` may not
+sit beside a `delivery.time_limit_seconds`.
 
 **Component-level** describes the *component*: `alt_text`, `caption`,
-`long_description`, `keyboard_alternative`, `transcript_required`,
-`captions_required`, `reduced_motion`, `no_time_limit`.
+`transcript`, `long_description`, `keyboard_alternative`, `reduced_motion`,
+`no_time_limit`.
 
 Never write a diagnosis, a disability, or a sentence about the learner into
 any of them. "A cross-section of the heart" is alt text; "the learner has

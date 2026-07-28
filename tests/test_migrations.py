@@ -35,12 +35,11 @@ CONSENT = {
 
 def _valid_candidate(**overrides):
     payload = {
-        "category": "accessibility",
-        "statement": "captions on audio",
+        "category": "durable_preference",
+        "statement": "Prefers worked examples first",
         "evidence_summary": "The learner asked for this to be remembered",
         "origin": "explicit_durable_preference",
         "confirmation_state": "learner_confirmed",
-        "consented_need": "captions on audio",
     }
     payload.update(overrides)
     return payload
@@ -293,47 +292,46 @@ def test_the_legacy_candidate_is_absent_from_a_later_read(hermes_home: Path):
 # ── Behaviour after the upgrade ───────────────────────────────────────────
 
 
-def test_a_consented_candidate_saves_after_the_upgrade(hermes_home: Path):
-    """The failure the reviewer reported: this raised OperationalError."""
+def test_a_candidate_saves_after_the_upgrade(hermes_home: Path):
+    """The failure the reviewer reported: this raised OperationalError.
+
+    The candidate is an ordinary preference now. An accessibility one is
+    refused whatever the schema version, because nothing in a tool call can
+    establish that a learner consented to it.
+    """
     _build_v1_database()
     with storage.connect() as conn:
         _seed_v1_rows(conn)
 
-    result = service.save_context(
-        principal=LEARNER,
-        accessibility_consent=CONSENT,
-        memory_candidates=[_valid_candidate()],
-    )
+    result = service.save_context(principal=LEARNER, memory_candidates=[_valid_candidate()])
 
     assert result["outcome"]["memory_candidates"]["accepted"], result["outcome"]
 
 
 def test_the_candidate_round_trips_after_the_upgrade(hermes_home: Path):
     _build_v1_database()
-    service.save_context(
-        principal=LEARNER,
-        accessibility_consent=CONSENT,
-        memory_candidates=[_valid_candidate()],
-    )
+    service.save_context(principal=LEARNER, memory_candidates=[_valid_candidate()])
 
     stored = service.get_context(principal=LEARNER, include_memory_candidates=True)
-    candidate = next(c for c in stored["memory_candidates"] if c["category"] == "accessibility")
+    candidate = stored["memory_candidates"][0]
 
-    assert candidate["statement"] == "captions on audio"
-    assert candidate["consented_need"] == "captions on audio"
-    assert candidate["consent_reference"] == CONSENT["consent_statement"]
+    assert candidate["statement"] == "Prefers worked examples first"
     assert candidate["origin"] == "explicit_durable_preference"
-    assert candidate["confirmation_state"] == "learner_confirmed"
+    # Claimed as confirmed, recorded as unconfirmed: nothing in the call can
+    # show that the learner agreed, so the row does not say that they did.
+    assert candidate["confirmation_state"] == "unconfirmed"
     assert candidate["created_at"] and candidate["updated_at"]
 
 
-def test_mismatched_consent_is_still_rejected_after_the_upgrade(hermes_home: Path):
+def test_a_sensitive_candidate_is_still_rejected_after_the_upgrade(hermes_home: Path):
     _build_v1_database()
 
     result = service.save_context(
         principal=LEARNER,
         accessibility_consent=CONSENT,
-        memory_candidates=[_valid_candidate(statement="ADHD", consented_need="ADHD")],
+        memory_candidates=[
+            _valid_candidate(category="accessibility", statement="ADHD", consented_need="ADHD")
+        ],
     )
 
     assert result["outcome"]["memory_candidates"]["accepted"] == []
@@ -398,17 +396,15 @@ def test_a_fresh_database_applies_every_migration(hermes_home: Path):
 
 
 def test_a_fresh_database_accepts_and_rejects_correctly(hermes_home: Path):
-    accepted = service.save_context(
-        principal=LEARNER,
-        accessibility_consent=CONSENT,
-        memory_candidates=[_valid_candidate()],
-    )
+    accepted = service.save_context(principal=LEARNER, memory_candidates=[_valid_candidate()])
     assert len(accepted["outcome"]["memory_candidates"]["accepted"]) == 1
 
     rejected = service.save_context(
         principal=LEARNER,
         accessibility_consent=CONSENT,
-        memory_candidates=[_valid_candidate(statement="ADHD", consented_need="ADHD")],
+        memory_candidates=[
+            _valid_candidate(category="accessibility", statement="ADHD", consented_need="ADHD")
+        ],
     )
     assert rejected["outcome"]["memory_candidates"]["accepted"] == []
 

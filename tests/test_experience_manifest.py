@@ -75,7 +75,7 @@ def test_a_manifest_may_carry_every_optional_field():
                 }
             ],
             accessibility={
-                "source": "explicit_request",
+                "source": "confirmed_track",
                 "accommodations": ["captions", "no_time_limit"],
             },
             delivery={"mode": "practice", "allow_back": True, "time_limit_seconds": 0},
@@ -453,7 +453,7 @@ def test_accessibility_metadata_must_declare_where_it_came_from():
 
 def test_accessibility_metadata_must_name_what_it_asks_for():
     with pytest.raises(ManifestError, match="accommodations"):
-        build_manifest(manifest(accessibility={"source": "explicit_request"}))
+        build_manifest(manifest(accessibility={"source": "confirmed_track"}))
 
 
 @pytest.mark.parametrize("source", ACCESSIBILITY_SOURCES)
@@ -473,6 +473,9 @@ def test_the_three_authoritative_sources_parse(source: str):
         Provenance.RECENT_EVIDENCE.value,
         Provenance.DEFAULT.value,
         Provenance.CONFIRMED_PREFERENCE.value,
+        # Removed as a source: it was authorised by a row the model itself
+        # wrote, so it proved nothing about what the learner asked for.
+        Provenance.EXPLICIT_REQUEST.value,
         "guessed",
     ],
 )
@@ -487,10 +490,15 @@ def test_an_inferred_accessibility_source_is_rejected(source: str):
         build_manifest(manifest(accessibility={"source": source}))
 
 
-def test_the_accepted_sources_are_derived_from_the_provenance_vocabulary():
-    """Adding a provenance in PR 03's model must not widen this silently."""
+def test_only_sources_outside_the_models_control_are_accepted():
+    """A source the model can write into is not a source.
+
+    ``explicit_request`` used to be here and was checked against a context
+    row — which the model had written in an earlier call. What is left is an
+    operator's configuration file and a confirmed track whose stored value
+    can only be one of the fixed accommodation tokens.
+    """
     assert set(ACCESSIBILITY_SOURCES) == {
-        Provenance.EXPLICIT_REQUEST.value,
         Provenance.CONFIRMED_TRACK.value,
         Provenance.PROFILE_CONFIG.value,
     }
@@ -501,7 +509,7 @@ def test_an_unknown_accessibility_field_is_rejected():
         build_manifest(
             manifest(
                 accessibility={
-                    "source": "explicit_request",
+                    "source": "confirmed_track",
                     "accommodations": ["captions"],
                     "diagnosis": "dyslexia",
                 }
@@ -524,9 +532,7 @@ def test_there_is_no_free_text_field_in_accessibility_metadata():
 def test_an_accommodation_outside_the_vocabulary_is_rejected(accommodation: str):
     with pytest.raises(ManifestError, match="must be one of"):
         build_manifest(
-            manifest(
-                accessibility={"source": "explicit_request", "accommodations": [accommodation]}
-            )
+            manifest(accessibility={"source": "confirmed_track", "accommodations": [accommodation]})
         )
 
 
@@ -642,7 +648,7 @@ def test_a_branch_forward_past_a_component_is_allowed():
 
 
 def accessible(*accommodations: str) -> dict:
-    return {"source": "explicit_request", "accommodations": list(accommodations)}
+    return {"source": "confirmed_track", "accommodations": list(accommodations)}
 
 
 @pytest.mark.parametrize(
@@ -682,7 +688,7 @@ def test_keyboard_only_is_accepted_for_components_that_need_no_pointer():
 
 @pytest.mark.parametrize("component_type", ["image_choice", "diagram", "hotspot"])
 def test_captions_without_a_caption_on_an_asset_component_is_rejected(component_type: str):
-    with pytest.raises(ManifestError, match="captions or a transcript"):
+    with pytest.raises(ManifestError, match="no accessibility.caption"):
         build_manifest(manifest([example(component_type)], accessibility=accessible("captions")))
 
 
@@ -721,3 +727,97 @@ def test_an_accommodation_with_no_component_consequence_is_simply_recorded():
     )
 
     assert built.accessibility["accommodations"] == ["reduced_motion"]
+
+
+# ── Captions and transcripts are different accommodations ─────────────────
+
+
+def test_a_transcript_does_not_satisfy_captions():
+    """They serve different people; one is not a substitute for the other."""
+    component = example("diagram", accessibility={"transcript": "The narration, written out."})
+
+    with pytest.raises(ManifestError, match="no accessibility.caption"):
+        build_manifest(manifest([component], accessibility=accessible("captions")))
+
+
+def test_a_caption_does_not_satisfy_a_transcript():
+    component = example("diagram", accessibility={"caption": "A caption only"})
+
+    with pytest.raises(ManifestError, match="not a transcript"):
+        build_manifest(manifest([component], accessibility=accessible("transcript")))
+
+
+def test_requesting_both_requires_both():
+    component = example("diagram", accessibility={"caption": "A caption only"})
+
+    with pytest.raises(ManifestError, match="not a transcript"):
+        build_manifest(manifest([component], accessibility=accessible("captions", "transcript")))
+
+
+def test_both_are_accepted_when_both_are_present():
+    component = example(
+        "diagram",
+        accessibility={
+            "caption": "A series circuit with three components.",
+            "transcript": "The narration describes each component in turn.",
+        },
+    )
+
+    built = build_manifest(
+        manifest([component], accessibility=accessible("captions", "transcript"))
+    )
+
+    assert built.component_count == 1
+
+
+def test_a_flag_asserting_a_transcript_is_needed_is_not_a_transcript():
+    """The boolean that used to satisfy this no longer exists at all."""
+    from learning_studio.components import COMPONENT_ACCESSIBILITY
+
+    names = {member.name for member in COMPONENT_ACCESSIBILITY}
+
+    assert "transcript" in names
+    assert "transcript_required" not in names
+    assert "captions_required" not in names
+
+
+def test_no_time_limit_rejects_a_delivery_time_limit():
+    with pytest.raises(ManifestError, match="no_time_limit"):
+        build_manifest(
+            manifest(
+                [example("short_answer")],
+                accessibility=accessible("no_time_limit"),
+                delivery={"time_limit_seconds": 30},
+            )
+        )
+
+
+def test_no_time_limit_is_accepted_with_no_limit_set():
+    built = build_manifest(
+        manifest(
+            [example("short_answer")],
+            accessibility=accessible("no_time_limit"),
+            delivery={"mode": "practice", "time_limit_seconds": 0},
+        )
+    )
+
+    assert built.delivery["time_limit_seconds"] == 0
+
+
+def test_extended_time_may_still_carry_a_limit():
+    """A longer limit is not a contradiction; no limit at all is."""
+    built = build_manifest(
+        manifest(
+            [example("short_answer")],
+            accessibility=accessible("extended_time"),
+            delivery={"time_limit_seconds": 600},
+        )
+    )
+
+    assert built.accessibility["accommodations"] == ["extended_time"]
+
+
+def test_an_asset_nested_in_an_option_is_found_for_captions():
+    """``image_choice`` carries one asset per option, not one on the content."""
+    with pytest.raises(ManifestError, match="no accessibility.caption"):
+        build_manifest(manifest([example("image_choice")], accessibility=accessible("captions")))

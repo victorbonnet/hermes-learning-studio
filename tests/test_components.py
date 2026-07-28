@@ -346,7 +346,7 @@ def test_open_work_without_a_rubric_is_rejected(component_type: str):
                     {"step_id": "close", "option_id": "dates"},
                 ]
             },
-            "not an option of step",
+            "not an option of that step",
         ),
     ],
 )
@@ -499,7 +499,7 @@ def test_a_cloze_answer_inside_the_visible_passage_is_rejected():
     payload = example("fill_blank")
     payload["content"]["text"] = "A divergent boundary forms where plates move {{boundary}}."
 
-    with pytest.raises(ComponentError, match="shows its own answer"):
+    with pytest.raises(ComponentError, match="already readable"):
         build_component(payload, "component")
 
 
@@ -508,7 +508,7 @@ def test_a_flashcard_whose_front_gives_away_the_back_is_rejected():
     payload["content"]["front"] = "The mountain: yama"
     payload["answer"]["back"] = "yama"
 
-    with pytest.raises(ComponentError, match="shows its own answer"):
+    with pytest.raises(ComponentError, match="already readable"):
         build_component(payload, "component")
 
 
@@ -516,7 +516,7 @@ def test_a_recall_cue_that_contains_the_answer_is_rejected():
     payload = example("typed_recall")
     payload["content"]["cue"] = "The tibia is the weight-bearing bone"
 
-    with pytest.raises(ComponentError, match="shows its own answer"):
+    with pytest.raises(ComponentError, match="already readable"):
         build_component(payload, "component")
 
 
@@ -703,13 +703,13 @@ def test_deep_copying_an_example_does_not_share_state():
 )
 def test_an_answer_repeated_in_the_visible_half_is_rejected(component_type, overrides):
     """Short answers included: ``H2O`` and ``Na`` are exactly what gets leaked."""
-    with pytest.raises(ComponentError, match="shows its own answer"):
+    with pytest.raises(ComponentError, match="already readable"):
         build(component_type, **overrides)
 
 
 def test_an_answer_leaked_through_component_accessibility_text_is_rejected():
     """The whole recursive visible half is compared, not only the prompt."""
-    with pytest.raises(ComponentError, match="shows its own answer"):
+    with pytest.raises(ComponentError, match="already readable"):
         build(
             "short_answer",
             accessibility={"caption": "Remember: the answer is Paris"},
@@ -722,7 +722,7 @@ def test_an_answer_leaked_through_a_content_label_is_rejected():
     payload["content"]["rows"][0]["header"] = "Mitosis produces two daughter cells"
     payload["answer"]["cells"][0]["accepted"] = ["two daughter cells"]
 
-    with pytest.raises(ComponentError, match="shows its own answer"):
+    with pytest.raises(ComponentError, match="already readable"):
         build_component(payload, "component")
 
 
@@ -775,7 +775,7 @@ def test_feedback_for_an_option_that_does_not_exist_is_rejected():
     payload = example("multiple_choice")
     payload["evaluation"]["feedback"]["per_option"] = [{"option_id": "ghost", "text": "no"}]
 
-    with pytest.raises(ComponentError, match="which options does not declare"):
+    with pytest.raises(ComponentError, match="does not declare"):
         build_component(payload, "component")
 
 
@@ -866,4 +866,222 @@ def test_the_same_cell_prefilled_twice_is_rejected():
     ]
 
     with pytest.raises(ComponentError, match="fills the same cell twice"):
+        build_component(payload, "component")
+
+
+# ── Normalisation bypasses in the answer-leak check ───────────────────────
+
+
+@pytest.mark.parametrize(
+    ("component_type", "overrides"),
+    [
+        (
+            "short_answer",
+            {"prompt": "Type P.a.r.i.s as your answer.", "answer": {"accepted": ["Paris"]}},
+        ),
+        (
+            "short_answer",
+            {"prompt": "Spell it P-a-r-i-s exactly.", "answer": {"accepted": ["Paris"]}},
+        ),
+        (
+            "typed_recall",
+            {"content": {"cue": "It is H.2.O"}, "answer": {"accepted": ["H2O"]}},
+        ),
+        (
+            "short_answer",
+            {"prompt": "Type + exactly. The answer is +.", "answer": {"accepted": ["+"]}},
+        ),
+        ("short_answer", {"prompt": "Type === here.", "answer": {"accepted": ["==="]}}),
+        ("typed_recall", {"content": {"cue": "Enter ✓"}, "answer": {"accepted": ["✓"]}}),
+    ],
+)
+def test_an_obfuscated_or_symbolic_answer_is_still_caught(component_type, overrides):
+    """Separators and symbols were both ways past the tokeniser."""
+    with pytest.raises(ComponentError, match="already readable"):
+        build(component_type, **overrides)
+
+
+@pytest.mark.parametrize(
+    ("component_type", "overrides"),
+    [
+        # Word boundaries hold: the separated rule needs the whole answer.
+        (
+            "typed_recall",
+            {"content": {"cue": "The national anthem"}, "answer": {"accepted": ["Na"]}},
+        ),
+        (
+            "short_answer",
+            {"prompt": "Explain what is different about it.", "answer": {"accepted": ["if"]}},
+        ),
+        # A topic mentioned without giving the answer away.
+        (
+            "short_answer",
+            {
+                "prompt": "Which city is the capital of France?",
+                "answer": {"accepted": ["Paris"]},
+            },
+        ),
+        # Purely numeric answers are not treated as separated spellings, so a
+        # decimal is not read as an obfuscated integer.
+        ("short_answer", {"prompt": "The mean was 4.2 overall.", "answer": {"accepted": ["42"]}}),
+        # A symbol the answer does not use.
+        ("short_answer", {"prompt": "Simplify 3 - 1 fully.", "answer": {"accepted": ["+"]}}),
+    ],
+)
+def test_a_near_miss_is_not_mistaken_for_a_leak(component_type, overrides):
+    assert build(component_type, **overrides).type == component_type
+
+
+@pytest.mark.parametrize(
+    "component_type",
+    [
+        "fill_blank",
+        "short_answer",
+        "translation",
+        "error_correction",
+        "code_response",
+        "flashcard",
+        "typed_recall",
+        "diagram",
+        "table_grid",
+    ],
+)
+def test_every_keyed_text_component_is_leak_checked(component_type: str):
+    """The registry declares a leak path for each of them."""
+    assert SPEC_BY_TYPE[component_type].leak_paths
+
+
+# ── Categorization groups items; it does not forbid shared categories ─────
+
+
+def test_two_items_may_share_a_category():
+    """The commonest correct grouping answer there is."""
+    payload = example("categorization")
+    payload["answer"]["assignments"] = [
+        {"item_id": "glass", "category_ids": ["recycling"]},
+        {"item_id": "peel", "category_ids": ["recycling"]},
+    ]
+
+    assert build_component(payload, "component").type == "categorization"
+
+
+def test_multiple_categories_are_allowed_when_the_component_says_so():
+    payload = example("categorization")
+    payload["content"]["allow_multiple"] = True
+    payload["answer"]["assignments"] = [
+        {"item_id": "glass", "category_ids": ["recycling", "compost"]},
+        {"item_id": "peel", "category_ids": ["compost"]},
+    ]
+
+    assert build_component(payload, "component").type == "categorization"
+
+
+def test_multiple_categories_are_refused_when_the_component_does_not():
+    payload = example("categorization")
+    payload["content"]["allow_multiple"] = False
+    payload["answer"]["assignments"] = [
+        {"item_id": "glass", "category_ids": ["recycling", "compost"]},
+        {"item_id": "peel", "category_ids": ["compost"]},
+    ]
+
+    with pytest.raises(ComponentError, match="allow_multiple"):
+        build_component(payload, "component")
+
+
+def test_multiple_categories_are_refused_when_allow_multiple_is_omitted():
+    payload = example("categorization")
+    del payload["content"]["allow_multiple"]
+    payload["answer"]["assignments"] = [
+        {"item_id": "glass", "category_ids": ["recycling", "compost"]},
+        {"item_id": "peel", "category_ids": ["compost"]},
+    ]
+
+    with pytest.raises(ComponentError, match="allow_multiple"):
+        build_component(payload, "component")
+
+
+def test_the_same_category_twice_for_one_item_is_refused():
+    payload = example("categorization")
+    payload["content"]["allow_multiple"] = True
+    payload["answer"]["assignments"] = [
+        {"item_id": "glass", "category_ids": ["recycling", "recycling"]},
+        {"item_id": "peel", "category_ids": ["compost"]},
+    ]
+
+    with pytest.raises(ComponentError, match="same category more than once"):
+        build_component(payload, "component")
+
+
+def test_an_undeclared_category_is_still_refused():
+    payload = example("categorization")
+    payload["answer"]["assignments"] = [
+        {"item_id": "glass", "category_ids": ["landfill"]},
+        {"item_id": "peel", "category_ids": ["compost"]},
+    ]
+
+    with pytest.raises(ComponentError, match="does not declare"):
+        build_component(payload, "component")
+
+
+def test_an_item_without_an_assignment_is_still_refused():
+    payload = example("categorization")
+    payload["answer"]["assignments"] = [{"item_id": "glass", "category_ids": ["recycling"]}]
+
+    with pytest.raises(ComponentError, match="exactly once"):
+        build_component(payload, "component")
+
+
+# ── Error correction: the count must be the count ─────────────────────────
+
+
+def test_the_stated_error_count_must_match_the_key():
+    payload = example("error_correction")
+    payload["content"]["error_count"] = 2
+
+    with pytest.raises(ComponentError, match="error_count says 2"):
+        build_component(payload, "component")
+
+
+def test_an_error_count_below_the_key_is_refused():
+    payload = example("error_correction")
+    payload["answer"]["corrections"].append(
+        {"incorrect": "The committee have", "correct": "The committee has"}
+    )
+
+    with pytest.raises(ComponentError, match="error_count says 1"):
+        build_component(payload, "component")
+
+
+def test_a_matching_error_count_is_accepted():
+    payload = example("error_correction")
+    payload["content"]["error_count"] = 1
+
+    assert build_component(payload, "component").type == "error_correction"
+
+
+def test_an_error_count_mismatch_does_not_quote_the_correction():
+    payload = example("error_correction")
+    payload["content"]["error_count"] = 2
+
+    with pytest.raises(ComponentError) as refusal:
+        build_component(payload, "component")
+
+    assert "which were widely reported" not in str(refusal.value)
+
+
+def test_a_correction_that_changes_nothing_is_refused():
+    payload = example("error_correction")
+    payload["answer"]["corrections"][0]["correct"] = payload["answer"]["corrections"][0][
+        "incorrect"
+    ]
+
+    with pytest.raises(ComponentError, match="nothing to fix"):
+        build_component(payload, "component")
+
+
+def test_a_correction_of_text_that_is_not_in_the_passage_is_refused():
+    payload = example("error_correction")
+    payload["answer"]["corrections"][0]["incorrect"] = "a phrase that never appears"
+
+    with pytest.raises(ComponentError, match="nothing to correct"):
         build_component(payload, "component")

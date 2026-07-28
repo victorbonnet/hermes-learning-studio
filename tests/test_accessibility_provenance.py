@@ -40,7 +40,7 @@ def prepare(principal: Principal = LEARNER, **kwargs):
 
 
 def record_session_need(need: str, principal: Principal = LEARNER) -> None:
-    """What the learner asked for this session, recorded the consented way."""
+    """Write a session need the way an agent would, consent and all."""
     service.save_context(
         principal=principal,
         temporary_context={"accessibility_needs": [need]},
@@ -89,23 +89,36 @@ def test_profile_config_without_matching_configuration_is_refused(hermes_home: P
         prepare(manifest=manifest(accessibility=access("profile_config", "keyboard_only")))
 
 
-def test_explicit_request_with_nothing_recorded_is_refused(hermes_home: Path):
-    """There is no host-supplied per-request accessibility channel to trust.
+def test_explicit_request_is_not_a_source_at_all(hermes_home: Path):
+    """It was, and it could not stay.
 
-    So an explicit request has to have been *recorded* through
-    ``learning_studio_save_context``, with the learner's consent, before an
-    exercise may carry it. Anything else would be the model vouching for the
-    model.
+    ``explicit_request`` was checked against the learner's temporary context —
+    a row the model had written in an earlier call. "The learner asked for
+    this" was therefore authorised by the model's own earlier assertion, which
+    is not authorisation. Hermes supplies no per-request accessibility signal
+    to check instead, so the source is gone rather than faked: a session-only
+    need is honoured in conversation and simply not recorded on the exercise.
     """
-    with pytest.raises(service.ConsentError, match="save it with"):
+    with pytest.raises(service.ValidationError, match="must be one of"):
+        prepare(manifest=manifest(accessibility=access("explicit_request", "captions")))
+
+
+def test_a_model_written_session_row_authorises_nothing(hermes_home: Path):
+    """Writing the need first does not make the claim true afterwards."""
+    record_session_need("captions")
+
+    with pytest.raises(service.ValidationError, match="must be one of"):
         prepare(manifest=manifest(accessibility=access("explicit_request", "captions")))
 
 
 def test_a_need_recorded_for_one_accommodation_does_not_authorise_another(hermes_home: Path):
-    record_session_need("captions")
+    track_id = confirmed_track_with("plain_language")
 
     with pytest.raises(service.ConsentError):
-        prepare(manifest=manifest(accessibility=access("explicit_request", "transcript")))
+        prepare(
+            manifest=manifest(accessibility=access("confirmed_track", "transcript")),
+            track_id=track_id,
+        )
 
 
 def test_a_claim_is_checked_against_the_source_it_names_not_any_source(hermes_home: Path):
@@ -122,8 +135,12 @@ def test_a_claim_is_checked_against_the_source_it_names_not_any_source(hermes_ho
 def test_a_refused_claim_stores_nothing(hermes_home: Path):
     from learning_studio import storage
 
+    track_id = confirmed_track_with("plain_language")
     with pytest.raises(service.ConsentError):
-        prepare(manifest=manifest(accessibility=access("explicit_request", "captions")))
+        prepare(
+            manifest=manifest(accessibility=access("confirmed_track", "captions")),
+            track_id=track_id,
+        )
 
     with storage.connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS n FROM experiences").fetchone()["n"] == 0
@@ -132,11 +149,16 @@ def test_a_refused_claim_stores_nothing(hermes_home: Path):
 # ── Cross-learner and cross-track provenance ──────────────────────────────
 
 
-def test_another_learners_recorded_need_does_not_authorise_this_one(hermes_home: Path):
-    record_session_need("captions", principal=OTHER)
+def test_another_learners_confirmed_track_does_not_authorise_this_one(hermes_home: Path):
+    confirmed_track_with("captions", principal=OTHER)
+    mine = confirmed_track_with("plain_language", principal=LEARNER)
 
     with pytest.raises(service.ConsentError):
-        prepare(LEARNER, manifest=manifest(accessibility=access("explicit_request", "captions")))
+        prepare(
+            LEARNER,
+            manifest=manifest(accessibility=access("confirmed_track", "captions")),
+            track_id=mine,
+        )
 
 
 def test_a_need_on_another_track_does_not_authorise_this_track(hermes_home: Path):
@@ -166,10 +188,13 @@ def test_another_learners_track_cannot_be_named_for_provenance(hermes_home: Path
 # ── Each genuinely authoritative source works ─────────────────────────────
 
 
-def test_an_explicit_request_the_learner_recorded_is_accepted(hermes_home: Path):
-    record_session_need("captions")
+def test_an_accommodation_confirmed_on_a_track_is_accepted(hermes_home: Path):
+    track_id = confirmed_track_with("captions")
 
-    result = prepare(manifest=manifest(accessibility=access("explicit_request", "captions")))
+    result = prepare(
+        manifest=manifest(accessibility=access("confirmed_track", "captions")),
+        track_id=track_id,
+    )
 
     assert result["ok"] is True
     assert result["experience"]["accessibility"]["accommodations"] == ["captions"]
@@ -206,16 +231,23 @@ def test_an_experience_may_carry_no_accessibility_metadata_at_all(hermes_home: P
 def test_matching_is_exact_on_the_canonical_form(hermes_home: Path):
     """Case and spacing are ignored; nothing else is.
 
-    "captions on all video" is not "captions": consent to one need has never
-    been consent to another, and a looser comparison would be this module
-    deciding something about a person's health on its own.
+    "captions on all video" is not "captions", and it is not even storable —
+    only the fixed accommodation tokens are. A looser comparison would be this
+    module deciding something about a person's needs on its own.
     """
-    record_session_need("  CAPTIONS  ")
-    assert prepare(manifest=manifest(accessibility=access("explicit_request", "captions")))["ok"]
+    track_id = confirmed_track_with("  CAPTIONS  ")
+    assert prepare(
+        manifest=manifest(accessibility=access("confirmed_track", "captions")),
+        track_id=track_id,
+    )["ok"]
 
-    record_session_need("captions on all video", principal=OTHER)
+    other_track = confirmed_track_with("captions on all video", principal=OTHER)
     with pytest.raises(service.ConsentError):
-        prepare(OTHER, manifest=manifest(accessibility=access("explicit_request", "captions")))
+        prepare(
+            OTHER,
+            manifest=manifest(accessibility=access("confirmed_track", "captions")),
+            track_id=other_track,
+        )
 
 
 # ── Nothing about a person may be written down ────────────────────────────
@@ -305,19 +337,26 @@ def test_the_accommodation_vocabulary_is_closed_and_describes_the_exercise():
 
 def test_preparing_with_accessibility_creates_no_memory_candidate(hermes_home: Path):
     """Exercise metadata must not become a durable fact about the learner."""
-    record_session_need("captions")
+    track_id = confirmed_track_with("captions")
 
-    prepare(manifest=manifest(accessibility=access("explicit_request", "captions")))
+    prepare(
+        manifest=manifest(accessibility=access("confirmed_track", "captions")),
+        track_id=track_id,
+    )
 
     context = service.get_context(principal=LEARNER, include_memory_candidates=True)
     assert [c for c in context["memory_candidates"] if c["category"] == "accessibility"] == []
 
 
-def test_preparing_does_not_make_a_session_need_durable(hermes_home: Path):
-    """It reads the recorded need; it never promotes or copies it."""
-    record_session_need("captions")
-    before = service.get_context(principal=LEARNER)["confirmed_context"]
+def test_preparing_does_not_change_the_stored_context(hermes_home: Path):
+    """It reads the recorded accommodation; it never promotes or copies it."""
+    track_id = confirmed_track_with("captions")
+    before = service.get_context(principal=LEARNER, track_id=track_id)["confirmed_context"]
 
-    prepare(manifest=manifest(accessibility=access("explicit_request", "captions")))
+    prepare(
+        manifest=manifest(accessibility=access("confirmed_track", "captions")),
+        track_id=track_id,
+    )
 
-    assert service.get_context(principal=LEARNER)["confirmed_context"] == before
+    after = service.get_context(principal=LEARNER, track_id=track_id)["confirmed_context"]
+    assert after == before

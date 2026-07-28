@@ -230,17 +230,41 @@ class AccessibilityConsent:
 
 
 def _consent_allows(field: str, value: Any, consent: AccessibilityConsent | None) -> bool:
-    """True when this exact value may be written to disk."""
+    """True when this exact value may be written to disk.
+
+    Two conditions, and the second is what stops a diagnosis reaching storage
+    through a consent-shaped argument. Consent is written by the model, so on
+    its own it proves nothing; what the *vocabulary* proves is that whatever
+    gets stored is one of nine fixed accommodation tokens, none of which can
+    express a fact about somebody's health. Any other need is honoured for the
+    session and never written down.
+    """
     if field not in SESSION_ONLY_FIELDS:
         return True
-    return consent is not None and consent.covers(value)
+    if consent is None or not consent.covers(value):
+        return False
+    return _is_accommodation_vocabulary(value)
+
+
+def _is_accommodation_vocabulary(value: Any) -> bool:
+    from .manifest import ACCOMMODATIONS
+    from .models import normalize_need
+
+    values = value if isinstance(value, list) else [value]
+    try:
+        return all(normalize_need(item) in ACCOMMODATIONS for item in values)
+    except ValueError:  # pragma: no cover - values are validated before this
+        return False
 
 
 SESSION_ONLY_NOT_STORED = (
     "Accessibility needs are session-only: this was honoured for the current request but "
-    "NOT stored, and will not be available in a later call. Pass it in current_request "
-    "each session. To store it, the learner must explicitly ask, and you must send "
-    "accessibility_consent naming the specific need and their words."
+    "NOT stored, and will not be available in a later call. Pass it in current_request each "
+    "session. The only values that can be stored at all are the fixed accommodation tokens "
+    "(captions, transcript, text_alternatives, visual_description, keyboard_only, "
+    "reduced_motion, no_time_limit, extended_time, plain_language), on a confirmed track, "
+    "with accessibility_consent naming that exact token. Nothing describing a person is "
+    "storable through this tool."
 )
 
 
@@ -1449,6 +1473,15 @@ def _save_candidates(
         if candidate.track_id:
             _owned_track(conn, profile, learner_id, candidate.track_id)
 
+        try:
+            _check_replacement_target(conn, profile, learner_id, candidate)
+        except ValidationError as exc:
+            outcome["memory_candidates"]["rejected"].append(
+                {"statement": _safe_echo(proposal.get("statement")), "reason": str(exc)}
+            )
+            continue
+
+        recorded_state = _recorded_confirmation(candidate, outcome, proposal)
         candidate_id = _new_id()
         timestamp = _now()
         conn.execute(
@@ -1470,7 +1503,7 @@ def _save_candidates(
                 candidate.evidence_count,
                 candidate.confidence.value,
                 candidate.durability.value,
-                candidate.confirmation_state.value,
+                recorded_state.value,
                 candidate.recommended_action.value,
                 candidate.replaces,
                 candidate.consent_reference,
@@ -1480,8 +1513,81 @@ def _save_candidates(
             ),
         )
         accepted = candidate.to_json()
+        accepted["confirmation_state"] = recorded_state.value
         accepted["candidate_id"] = candidate_id
         outcome["memory_candidates"]["accepted"].append(accepted)
+
+
+#: What a stored candidate may claim about how it was confirmed.
+#:
+#: ``learner_confirmed`` is deliberately unreachable. Nothing in a tool call
+#: can establish that a learner confirmed anything: the flag, the origin, the
+#: evidence summary and the consent statement are all written by the model in
+#: the same request, and Hermes supplies no confirmation event to check them
+#: against. A row that claimed otherwise would be a record asserting something
+#: nobody verified, read months later as though somebody had.
+#:
+#: The proposal is still stored — it is useful, and the agent's own reading of
+#: the conversation is real evidence — but labelled for what it is.
+CONFIRMATION_NOT_VERIFIABLE = (
+    "Stored as 'unconfirmed'. This plugin cannot verify that a learner confirmed anything: "
+    "the confirmation flag, the origin and the evidence all come from you, in this call, and "
+    "Hermes supplies no confirmation event to check them against. The proposal is kept — "
+    "labelled truthfully — so that a later reader is not told the learner agreed when nobody "
+    "can show that they did."
+)
+
+
+def _recorded_confirmation(
+    candidate: Any, outcome: dict[str, Any], proposal: dict[str, Any]
+) -> Any:
+    """The confirmation state actually written, which is never a claim of consent."""
+    from .candidates import ConfirmationState
+
+    if candidate.confirmation_state is not ConfirmationState.LEARNER_CONFIRMED:
+        return candidate.confirmation_state
+
+    outcome["memory_candidates"].setdefault("downgraded", []).append(
+        {
+            "statement": _safe_echo(proposal.get("statement")),
+            "claimed": ConfirmationState.LEARNER_CONFIRMED.value,
+            "recorded": ConfirmationState.UNCONFIRMED.value,
+            "reason": CONFIRMATION_NOT_VERIFIABLE,
+        }
+    )
+    return ConfirmationState.UNCONFIRMED
+
+
+def _check_replacement_target(
+    conn: sqlite3.Connection, profile: str, learner_id: str, candidate: Any
+) -> None:
+    """A replacement or removal must name a record that exists and is theirs.
+
+    Without this, "replace what they said about X" is a free-text assertion
+    about a record nobody looked for — and an agent acting on it would edit
+    or delete something on the strength of a string the model composed.
+    """
+    from .candidates import Action
+
+    if candidate.recommended_action not in (Action.REPLACE, Action.REMOVE):
+        return
+    if not candidate.replaces:
+        raise ValidationError(
+            f"a '{candidate.recommended_action.value}' candidate must name, in 'replaces', "
+            "the existing proposal it changes"
+        )
+
+    target = _comparable(candidate.replaces)
+    rows = conn.execute(
+        "SELECT statement FROM memory_candidates WHERE profile_id = ? AND learner_id = ?",
+        (profile, learner_id),
+    ).fetchall()
+    if not any(_comparable(str(row["statement"])) == target for row in rows):
+        raise ValidationError(
+            "'replaces' does not match any proposal stored for this learner. Name the "
+            "existing statement exactly, or propose this as a new candidate instead of a "
+            "replacement — a change to a record nobody can find is not a change."
+        )
 
 
 def _safe_echo(value: Any) -> str:
@@ -1722,16 +1828,17 @@ def _recorded_needs(
     if source == Provenance.CONFIRMED_TRACK.value:
         if track_id is None:
             return set()
+        # Writable, not merely owned: a track the learner archived or withdrew
+        # is one they said they were finished with, and its context is not a
+        # live statement of what they need.
+        try:
+            _writable_track(conn, profile, learner_id, track_id)
+        except ServiceError:
+            return set()
         context = _track_context(conn, profile, learner_id, track_id)
         if context is None:
             return set()
         return _needs_in_context(conn, profile, learner_id, str(context["id"]), CONFIRMED_SOURCES)
-
-    if source == Provenance.EXPLICIT_REQUEST.value:
-        context = _temporary_context(conn, profile, learner_id)
-        if context is None or _is_expired(context):
-            return set()
-        return _needs_in_context(conn, profile, learner_id, str(context["id"]), EXPLICIT_SOURCES)
 
     return set()  # pragma: no cover - the enum admits nothing else
 
@@ -1746,10 +1853,6 @@ CONFIRMED_SOURCES: frozenset[str] = frozenset(
         Provenance.EXPLICIT_CORRECTION.value,
         Provenance.CONFIRMED_PREFERENCE.value,
     }
-)
-
-EXPLICIT_SOURCES: frozenset[str] = frozenset(
-    {Provenance.EXPLICIT_REQUEST.value, Provenance.EXPLICIT_CORRECTION.value}
 )
 
 

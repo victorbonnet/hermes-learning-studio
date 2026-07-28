@@ -107,13 +107,22 @@ CAPTIONS = "captions"
 TRANSCRIPT = "transcript"
 TEXT_ALTERNATIVES = "text_alternatives"
 VISUAL_DESCRIPTION = "visual_description"
+NO_TIME_LIMIT = "no_time_limit"
 
-#: Where accessibility metadata on an exercise may come from, as PR 03's
-#: provenance vocabulary. Built from :class:`Provenance` so the two cannot
-#: drift: adding a provenance there does not silently widen what an exercise
-#: may claim here.
+#: Where accessibility metadata on an exercise may come from.
+#:
+#: Two sources, not three. ``explicit_request`` was here, and it could not
+#: stay: what it checked was a context row the model had written in an earlier
+#: call, so "the learner asked for this" was authorised by the model's own
+#: previous assertion. Hermes supplies no per-request accessibility signal to
+#: check instead, so the source is gone rather than faked.
+#:
+#: What remains is genuinely outside the model's control: an operator's
+#: configuration file, and a confirmed track whose stored value can only be
+#: one of the fixed accommodation tokens. A session-only need is still
+#: honoured — in conversation, and through ``current_request`` — it simply
+#: cannot be recorded on the exercise.
 ACCESSIBILITY_SOURCES: tuple[str, ...] = (
-    Provenance.EXPLICIT_REQUEST.value,
     Provenance.CONFIRMED_TRACK.value,
     Provenance.PROFILE_CONFIG.value,
 )
@@ -334,7 +343,11 @@ def build_manifest(raw: Any) -> Manifest:
     validate_branching(components)
 
     accessibility = validated.get("accessibility", {})
-    validate_accessibility_support(tuple(accessibility.get("accommodations", ())), components)
+    validate_accessibility_support(
+        tuple(accessibility.get("accommodations", ())),
+        components,
+        validated.get("delivery", {}),
+    )
 
     references = tuple(validated.get("source_references", []))
 
@@ -515,16 +528,25 @@ _ASSET_MARKER = "asset_ref"
 
 
 def validate_accessibility_support(
-    accommodations: tuple[str, ...], components: tuple[Component, ...]
+    accommodations: tuple[str, ...], components: tuple[Component, ...], delivery: dict[str, Any]
 ) -> None:
     """Refuse an experience that cannot honour what it declares.
 
     A manifest claiming ``keyboard_only`` while containing a hotspot with no
     keyboard alternative is worse than one that claims nothing: it tells a
     future runtime, and the learner, that the exercise is usable when it is
-    not. The claim is checked against the components rather than trusted.
+    not. Each accommodation is checked independently — captions do not stand
+    in for a transcript, and a transcript does not stand in for captions;
+    they are different accommodations for different people.
     """
     required = set(accommodations)
+
+    if NO_TIME_LIMIT in required and delivery.get("time_limit_seconds"):
+        raise ManifestError(
+            "this experience declares no_time_limit but delivery.time_limit_seconds sets "
+            "one. Remove the limit, or do not declare the accommodation."
+        )
+
     for component in components:
         access = component.accessibility
         spec = SPEC_BY_TYPE[component.type]
@@ -542,28 +564,36 @@ def validate_accessibility_support(
                 "keyboard, or use a component that does not need a pointer."
             )
 
-        if assets:
-            if (CAPTIONS in required or TRANSCRIPT in required) and not (
-                access.get("caption") or access.get("transcript_required")
+        if not assets:
+            if (
+                TEXT_ALTERNATIVES in required
+                and spec.family == "visual"
+                and not access.get("alt_text")
             ):
                 raise ManifestError(
-                    f"component '{component.id}' carries an asset, but this experience "
-                    "declares captions or a transcript and the component provides neither."
+                    f"component '{component.id}' is a visual component with no asset and no "
+                    "accessibility.alt_text, but this experience declares text_alternatives."
                 )
-            if VISUAL_DESCRIPTION in required and not (
-                all(asset.get("long_description") for asset in assets)
-                or access.get("long_description")
-            ):
-                raise ManifestError(
-                    f"component '{component.id}' carries an asset, but this experience "
-                    "declares visual_description and the component has no long description."
-                )
-        elif (
-            TEXT_ALTERNATIVES in required and spec.family == "visual" and not access.get("alt_text")
+            continue
+
+        if CAPTIONS in required and not access.get("caption"):
+            raise ManifestError(
+                f"component '{component.id}' carries an asset, but this experience declares "
+                "captions and the component has no accessibility.caption. A caption is the "
+                "caption text itself, not a flag saying one is needed."
+            )
+        if TRANSCRIPT in required and not access.get("transcript"):
+            raise ManifestError(
+                f"component '{component.id}' carries an asset, but this experience declares "
+                "transcript and the component has no accessibility.transcript. A caption is "
+                "not a transcript; write the spoken content out."
+            )
+        if VISUAL_DESCRIPTION in required and not (
+            all(asset.get("long_description") for asset in assets) or access.get("long_description")
         ):
             raise ManifestError(
-                f"component '{component.id}' is a visual component with no asset and no "
-                "accessibility.alt_text, but this experience declares text_alternatives."
+                f"component '{component.id}' carries an asset, but this experience "
+                "declares visual_description and the component has no long description."
             )
 
 

@@ -5,10 +5,20 @@ not every provider validates before dispatch, tool arguments can arrive from
 a replay or a relay, and ``additionalProperties: false`` buys nothing if the
 handler then reads whatever it likes. Everything the schema promises is
 therefore re-checked here, against the same declarations the schema is built
-from, so the two cannot drift.
+from.
+
+The two are **not** identical, and the difference is deliberate: the runtime
+is stricter. Cross-field rules — an answer that names an option the content
+declares, an objective that matches a stored one — and the content-safety
+rules that need alternation the two regex dialects disagree about cannot be
+put in a JSON Schema, so they live only here and the schema describes them.
+``tests/test_schema_parity.py`` pins that relationship in both directions:
+nothing the schema accepts may be silently refused later, and where the
+runtime is stricter a test names the case.
 
 The checker is a small subset of JSON Schema — objects, arrays, strings,
-numbers, integers, booleans, enums, constants, patterns, bounds, local
+numbers, integers, booleans, enums, constants, patterns, bounds, uniqueness,
+local
 ``$ref``, and ``oneOf`` — because that is all the tool surface uses, and a
 full implementation would be a dependency this plugin does not want. The
 advertised schema is checked against a real JSON Schema implementation in the
@@ -167,6 +177,13 @@ def _validate_array(value: Any, schema: dict[str, Any], path: str, root: dict[st
     max_items = schema.get("maxItems")
     if max_items is not None and len(value) > max_items:
         _fail(path, f"must have at most {max_items} items, got {len(value)}")
+
+    if schema.get("uniqueItems") is True:
+        seen: list[Any] = []
+        for item in value:
+            if item in seen:
+                _fail(path, "must not repeat a value")
+            seen.append(item)
 
     item_schema = schema.get("items")
     if item_schema:

@@ -386,16 +386,23 @@ renderer, and those subjects are still teachable in conversation. Lifting it
 needs a reviewed, explicitly escaped inert-code channel and the renderer that
 would have to honour it.
 
-**One source of truth for the schema.** The JSON Schema the model sees and the
-validation the handler runs are generated from the same field declarations —
-identifier, locale and date patterns are published as strings and compiled from
-those same strings, and each component type advertises exactly the scoring
-modes it accepts. `tests/test_schema_parity.py` checks representative invalid
-values against a real JSON Schema implementation *and* the runtime, so the
-agreement is verified rather than claimed. Cross-field rules JSON Schema cannot
-express — an answer that references an option, an objective that must match a
-stored one — stay the runtime's job, and the schema describes them rather than
-pretending to enforce them.
+**The schema and the runtime agree wherever a schema can say so.** Identifier,
+locale and date patterns are published as strings and compiled from those same
+strings; identifier lists reference the shared definition and advertise
+uniqueness; bounded text advertises a pattern that refuses blank strings,
+markup, and scheme-qualified URLs, generated from the same two declarations the
+validator compiles; each component type advertises exactly the scoring modes it
+accepts.
+
+The rest of the content rules — paths, hosts, credential shapes, stylesheet
+syntax — need alternation the two regex dialects disagree about, so they stay
+runtime-only and the field description says so. Cross-field rules (an answer
+that references an option, an objective that must match a stored one) are the
+runtime's job too. `tests/test_schema_parity.py` runs representative invalid
+values through a real JSON Schema implementation, the plugin's own validator,
+and the manifest builder, so the agreement is *verified* rather than asserted —
+and where the runtime is deliberately stricter, a test says which cases and
+why.
 
 The union of all 31 types is large — about 55 KB, of which the shapes every
 type shares are emitted once under `$defs` rather than 31 times, cutting it
@@ -406,14 +413,33 @@ cost proves too high in practice.
 **Accessibility metadata is authorised, not asserted.** An experience declares
 `accommodations` from a closed vocabulary — captions, transcript, text
 alternatives, visual description, keyboard-only, reduced motion, no time limit,
-extended time, plain language — and names the `source` each came from. The
-source is then *checked*: `confirmed_track` against that track's confirmed
-context, `profile_config` against the operator's configuration,
-`explicit_request` against what the learner has actually recorded. A model can
-write the label but cannot manufacture the thing it points at, which is the
-same reasoning that removed `learner_key`. Matching is exact on the canonical
-form, with no fuzzy, substring, or semantic step — the rule the context layer
-already applies to consent.
+extended time, plain language — and names the `source` each came from. Two
+sources exist, and both are outside the model's control: a confirmed track's
+own context, and the operator's configuration file. Matching is exact on the
+canonical form, with no fuzzy, substring, or semantic step.
+
+`explicit_request` was a third source and has been removed. It was checked
+against the learner's temporary context — a row the model had written in an
+earlier call — so "the learner asked for this" was authorised by the model's
+own earlier assertion. Hermes exposes no per-request accessibility signal to
+check instead, so the source is gone rather than faked; a session-only need is
+honoured in conversation and not recorded on the exercise.
+
+**Nothing sensitive can become a durable record.** An `accessibility` memory
+candidate is refused however it is presented — confirmed, consented, exactly
+matched — because the consent statement, the needs it covers, the origin and
+the confirmation all arrive in the same tool call, written by the same model,
+and no host-supplied confirmation event exists to check them against. A gate
+whose every key is held by the party being checked is not a gate. What remains
+storable is one of the nine accommodation tokens on a confirmed track: a
+vocabulary that cannot express a fact about a person.
+
+**A confirmation the model asserts is recorded as unconfirmed.** Any candidate
+sent with `confirmation_state: learner_confirmed` is stored as `unconfirmed`,
+and the response reports the downgrade. The proposal is kept — the agent's
+reading of the conversation is real evidence — but a record months later will
+not claim the learner agreed when nobody can show that. A replacement or
+removal must name a proposal already stored for that learner.
 
 There is deliberately **no free-text accessibility field** on the manifest. A
 box to type in is a box a diagnosis eventually gets typed into, and this

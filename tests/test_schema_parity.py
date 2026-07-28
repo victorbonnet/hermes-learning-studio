@@ -144,6 +144,64 @@ PARITY_CASES: list[tuple[str, dict]] = [
     ),
     ("empty component list", {"manifest": manifest([])}),
     ("unknown tool argument", {"manifest": manifest(), "learner_key": "2002"}),
+    # Reported disagreements: each of these was accepted by the advertised
+    # schema and refused by the runtime, which sends the model to debug a
+    # contradiction rather than a mistake.
+    (
+        "duplicate accommodation",
+        manifest_with(
+            accessibility={"source": "confirmed_track", "accommodations": ["captions", "captions"]}
+        ),
+    ),
+    (
+        "uppercase identifier in an IdentList",
+        {"manifest": manifest([example("multi_select", answer={"option_ids": ["LIFEJACKETS"]})])},
+    ),
+    (
+        "uppercase identifier in an order list",
+        {"manifest": manifest([example("timeline", answer={"order": ["PERRY"]})])},
+    ),
+    (
+        "duplicate multi-select option id",
+        {
+            "manifest": manifest(
+                [example("multi_select", answer={"option_ids": ["lifejackets", "lifejackets"]})]
+            )
+        },
+    ),
+    ("whitespace-only top-level text", manifest_with(title="   ")),
+    (
+        "whitespace-only nested text",
+        {"manifest": manifest([example("true_false", content={"statement": "   "})])},
+    ),
+    (
+        "whitespace-only text in a list",
+        {"manifest": manifest([example("reflection", content={"prompts": ["   "]})])},
+    ),
+    (
+        "markup in a prompt",
+        {"manifest": manifest([example("true_false", prompt="Read <script>x</script> now")])},
+    ),
+    (
+        "markup on the second line of a passage",
+        {
+            "manifest": manifest(
+                [
+                    example(
+                        "case_study",
+                        content={
+                            "background": "First line is fine.\nSecond has <b>markup</b>.",
+                            "questions": ["What does it show?"],
+                        },
+                    )
+                ]
+            )
+        },
+    ),
+    (
+        "url in a prompt",
+        {"manifest": manifest([example("true_false", prompt="See https://x.invalid/a")])},
+    ),
 ]
 
 
@@ -222,6 +280,75 @@ def test_semantic_constraints_are_described_where_the_schema_cannot_enforce_them
 
     for promise in ("must already be recorded", "unique where it is used"):
         assert promise in blob
+
+
+@pytest.mark.parametrize(
+    ("label", "arguments"),
+    [
+        (
+            "filesystem path",
+            {"manifest": manifest([example("true_false", prompt="Open /secret.txt now")])},
+        ),
+        (
+            "credential",
+            {
+                "manifest": manifest(
+                    [example("true_false", prompt="Use api_key=sk-live-ABCDEFGHIJKLMNOPQ")]
+                )
+            },
+        ),
+        (
+            "bare web address",
+            {"manifest": manifest([example("true_false", prompt="Visit example.fr/path")])},
+        ),
+    ],
+)
+def test_lexical_rules_a_schema_cannot_state_are_still_enforced(label, arguments):
+    """Runtime-only, and the schema says so rather than pretending otherwise.
+
+    Two of the content rules — markup and scheme-qualified URLs — are emitted
+    as a schema ``pattern`` from the same declaration the validator uses.
+    The rest need alternation the two regex dialects disagree about, so they
+    stay runtime-only and the field description names them.
+    """
+    with pytest.raises(ManifestError):
+        build_manifest(arguments["manifest"])
+
+
+def test_the_expressible_rules_are_the_runtime_rules_themselves():
+    """One declaration, not a second list that can drift from the first."""
+    from learning_studio.safety import (
+        _EXPRESSIBLE_RULES,
+        _RULES,
+        MARKUP_PATTERN,
+        SCHEME_URL_PATTERN,
+        text_pattern,
+    )
+
+    assert _EXPRESSIBLE_RULES == (MARKUP_PATTERN, SCHEME_URL_PATTERN)
+
+    compiled = {rule.pattern for rule, _ in _RULES}
+    assert MARKUP_PATTERN in compiled
+    assert SCHEME_URL_PATTERN in compiled
+
+    pattern = text_pattern()
+    assert MARKUP_PATTERN in pattern
+    assert SCHEME_URL_PATTERN in pattern
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ordinary prose about photosynthesis.",
+        "If a < b and b < c, then a < c",
+        "A passage\nspanning two lines, both fine.",
+    ],
+)
+def test_the_advertised_text_pattern_accepts_ordinary_content(text: str, library_validator):
+    arguments = {"manifest": manifest([example("true_false", prompt=text)])}
+
+    assert not rejected_by_library(library_validator, arguments)
+    assert not rejected_by_runtime(arguments)
 
 
 def test_the_runtime_stays_stricter_where_it_has_to_be(library_validator):

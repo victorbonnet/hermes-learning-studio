@@ -207,14 +207,17 @@ def test_consent_for_one_need_does_not_authorise_another(hermes_home: Path):
     assert count == 0
 
 
-# ── 4. Inferred sensitive traits became durable candidates ────────────────
+# ── 4. Sensitive traits became durable candidates ─────────────────────────
+#
+# First an inference could become one; then a model-written consent argument
+# could. Neither can now, because the category cannot be stored at all.
 
 
 @pytest.mark.parametrize(
     "statement",
     ["The learner has ADHD", "The learner has dyslexia", "The learner has a disability"],
 )
-def test_repeated_evidence_cannot_produce_a_diagnosis_candidate(hermes_home: Path, statement):
+def test_no_route_stores_a_diagnosis_candidate(hermes_home: Path, statement):
     result = service.save_context(
         principal=LEARNER,
         memory_candidates=[
@@ -227,35 +230,21 @@ def test_repeated_evidence_cannot_produce_a_diagnosis_candidate(hermes_home: Pat
                 "evidence_count": 9,
             }
         ],
-        accessibility_consent={"consent_statement": "ok", "needs": ["x"]},
+        accessibility_consent={"consent_statement": "ok", "needs": ["captions"]},
     )
 
     rejected = result["outcome"]["memory_candidates"]["rejected"]
     assert len(rejected) == 1
-    assert "repeated_evidence" in rejected[0]["reason"]
     assert result["outcome"]["memory_candidates"]["accepted"] == []
 
 
-def test_an_unconfirmed_sensitive_candidate_is_rejected(hermes_home: Path):
-    result = service.save_context(
-        principal=LEARNER,
-        memory_candidates=[
-            {
-                "category": "accessibility",
-                "statement": "Needs captions on audio",
-                "evidence_summary": "Mentioned it once.",
-                "origin": "explicit_durable_preference",
-                "confirmation_state": "unconfirmed",
-            }
-        ],
-        accessibility_consent={"consent_statement": "ok", "needs": ["captions"]},
-    )
+def test_an_accessibility_candidate_is_refused_however_it_is_dressed_up(hermes_home: Path):
+    """Confirmed, consented, exactly matched — and still not storable.
 
-    assert "learner_confirmed" in result["outcome"]["memory_candidates"]["rejected"][0]["reason"]
-
-
-def test_a_confirmed_consented_accessibility_candidate_is_accepted(hermes_home: Path):
-    """The statement is the consented need itself — see Option A in the README."""
+    Every one of those properties is asserted by the model in the same call.
+    A gate whose keys are held by the party being checked is not a gate, so
+    the category is refused outright and the reason says why.
+    """
     result = service.save_context(
         principal=LEARNER,
         memory_candidates=[
@@ -274,10 +263,94 @@ def test_a_confirmed_consented_accessibility_candidate_is_accepted(hermes_home: 
         },
     )
 
+    assert result["outcome"]["memory_candidates"]["accepted"] == []
+    reason = result["outcome"]["memory_candidates"]["rejected"][0]["reason"]
+    assert "written by you in the same call" in reason
+
+
+def test_a_confirmation_claim_is_recorded_as_unconfirmed(hermes_home: Path):
+    """A non-sensitive proposal is kept — labelled for what can be shown.
+
+    ``confirmed_long_term_goal`` and ``learner_confirmed`` are both written by
+    the model. The proposal is useful and is stored; what it must not do is
+    tell a later reader that the learner agreed, when nobody can show that.
+    """
+    result = service.save_context(
+        principal=LEARNER,
+        memory_candidates=[
+            {
+                "category": "long_term_goal",
+                "statement": "Become a surgeon",
+                "evidence_summary": "Allegedly confirmed",
+                "origin": "confirmed_long_term_goal",
+                "confirmation_state": "learner_confirmed",
+            }
+        ],
+    )
+
     accepted = result["outcome"]["memory_candidates"]["accepted"]
     assert len(accepted) == 1
-    assert accepted[0]["consent_reference"] == "yes, remember I need captions"
-    assert accepted[0]["consented_need"] == "captions on audio material"
+    assert accepted[0]["confirmation_state"] == "unconfirmed"
+
+    downgraded = result["outcome"]["memory_candidates"]["downgraded"]
+    assert downgraded[0]["claimed"] == "learner_confirmed"
+    assert "cannot verify" in downgraded[0]["reason"]
+
+    stored = service.get_context(principal=LEARNER, include_memory_candidates=True)
+    assert stored["memory_candidates"][0]["confirmation_state"] == "unconfirmed"
+
+
+def test_a_replacement_must_name_a_proposal_that_exists(hermes_home: Path):
+    """A change to a record nobody can find is not a change."""
+    result = service.save_context(
+        principal=LEARNER,
+        memory_candidates=[
+            {
+                "category": "durable_preference",
+                "statement": "Prefers diagrams",
+                "evidence_summary": "Said so",
+                "origin": "explicit_correction",
+                "recommended_action": "replace",
+                "replaces": "something nobody ever stored",
+            }
+        ],
+    )
+
+    assert result["outcome"]["memory_candidates"]["accepted"] == []
+    assert (
+        "does not match any proposal"
+        in (result["outcome"]["memory_candidates"]["rejected"][0]["reason"])
+    )
+
+
+def test_a_replacement_naming_a_stored_proposal_is_accepted(hermes_home: Path):
+    service.save_context(
+        principal=LEARNER,
+        memory_candidates=[
+            {
+                "category": "durable_preference",
+                "statement": "Prefers worked examples first",
+                "evidence_summary": "Said so directly",
+                "origin": "explicit_durable_preference",
+            }
+        ],
+    )
+
+    result = service.save_context(
+        principal=LEARNER,
+        memory_candidates=[
+            {
+                "category": "durable_preference",
+                "statement": "Prefers diagrams first",
+                "evidence_summary": "Corrected themselves",
+                "origin": "explicit_correction",
+                "recommended_action": "replace",
+                "replaces": "Prefers worked examples first",
+            }
+        ],
+    )
+
+    assert len(result["outcome"]["memory_candidates"]["accepted"]) == 1
 
 
 # ── 5. Migrations were not atomic ─────────────────────────────────────────
@@ -629,6 +702,19 @@ def test_candidate_provenance_survives_a_database_round_trip(hermes_home: Path):
 
 
 def test_a_replacement_target_survives_a_round_trip(hermes_home: Path):
+    # The target has to exist: a replacement now names a proposal already
+    # stored for this learner, rather than asserting one.
+    service.save_context(
+        principal=LEARNER,
+        memory_candidates=[
+            {
+                "category": "durable_preference",
+                "statement": "Prefers brief feedback.",
+                "evidence_summary": "Said so.",
+                "origin": "explicit_durable_preference",
+            }
+        ],
+    )
     service.save_context(
         principal=LEARNER,
         memory_candidates=[
@@ -643,11 +729,14 @@ def test_a_replacement_target_survives_a_round_trip(hermes_home: Path):
         ],
     )
 
-    candidate = service.get_context(principal=LEARNER, include_memory_candidates=True)[
-        "memory_candidates"
-    ][0]
+    candidate = next(
+        entry
+        for entry in service.get_context(principal=LEARNER, include_memory_candidates=True)[
+            "memory_candidates"
+        ]
+        if entry["recommended_action"] == "replace"
+    )
 
-    assert candidate["recommended_action"] == "replace"
     assert candidate["replaces"] == "Prefers brief feedback."
 
 
@@ -816,26 +905,29 @@ def test_config_cannot_raise_a_limit_above_the_advertised_schema():
         )
 
 
-# ── Consent bound to the exact sensitive fact ─────────────────────────────
+# ── Consent could be forged in the call that used it ──────────────────────
 #
-# Consent to remember captions authorised storing an ADHD diagnosis: the code
-# checked that *some* consent existed, never that it covered the fact being
-# proposed. Matching is now exact, on the canonical form of the need.
+# The previous fix bound consent to the exact need, which closed "captions
+# consent authorises an ADHD diagnosis". It did not close the larger hole
+# underneath: the consent statement, the needs it covered, the origin and the
+# confirmation all arrived in the same tool call, written by the model. There
+# is no host-supplied confirmation event in Hermes to check them against, so
+# the category is refused rather than gated.
 
 CAPTIONS_CONSENT = {
     "consent_statement": "Please remember that I need captions",
-    "needs": ["captions on audio"],
+    "needs": ["captions"],
 }
 
 
 def _candidate(**overrides):
     payload = {
         "category": "accessibility",
-        "statement": "captions on audio",
+        "statement": "captions",
         "evidence_summary": "The learner asked for this to be remembered",
         "origin": "explicit_durable_preference",
         "confirmation_state": "learner_confirmed",
-        "consented_need": "captions on audio",
+        "consented_need": "captions",
     }
     payload.update(overrides)
     return payload
@@ -859,210 +951,75 @@ def _rejection(result):
     return rejected[0]["reason"]
 
 
-def test_captions_consent_does_not_authorise_an_adhd_candidate(hermes_home: Path):
-    """The reported blocker, exactly as reported."""
-    result = _save(
-        statement="The learner has ADHD",
-        evidence_summary="The learner explicitly stated this diagnosis",
-        consented_need="ADHD",
-    )
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"statement": "The learner has ADHD", "consented_need": "ADHD"},
+        {"statement": "captions", "consented_need": "captions"},
+        {"statement": "captions", "confirmation_state": "unconfirmed"},
+        {"statement": "captions", "origin": "repeated_evidence", "evidence_count": 9},
+    ],
+    ids=["diagnosis", "exactly-consented", "unconfirmed", "from-evidence"],
+)
+def test_every_shape_of_accessibility_candidate_is_refused(hermes_home: Path, overrides):
+    result = _save(**overrides)
 
     assert _accepted(result) == []
-    assert "does not match any need" in _rejection(result)
+    assert _rejection(result)
 
 
-def test_captions_consent_does_not_authorise_a_screen_reader_candidate(hermes_home: Path):
-    result = _save(statement="needs a screen reader", consented_need="needs a screen reader")
-
-    assert _accepted(result) == []
-    assert "does not match any need" in _rejection(result)
-
-
-def test_case_and_whitespace_differences_still_match(hermes_home: Path):
-    """Normalisation is deterministic, not fuzzy."""
-    result = _save(statement="  Captions   On   Audio ", consented_need="CAPTIONS  on audio")
-
-    accepted = _accepted(result)
-    assert len(accepted) == 1
-    assert accepted[0]["consented_need"] == "captions on audio"
-
-
-def test_a_substring_is_not_consent(hermes_home: Path):
-    """ "captions" consented does not cover "captions on all video and audio"."""
+def test_the_forged_consent_reproduction_stores_nothing(hermes_home: Path):
+    """The reported reproduction, through the service, on a fresh principal."""
     result = service.save_context(
         principal=LEARNER,
-        accessibility_consent={"consent_statement": "remember captions", "needs": ["captions"]},
+        accessibility_consent={
+            "consent_statement": "Please remember I need ADHD",
+            "needs": ["ADHD"],
+        },
         memory_candidates=[
-            _candidate(
-                statement="captions on all video and audio",
-                consented_need="captions on all video and audio",
-            )
+            {
+                "category": "accessibility",
+                "statement": "ADHD",
+                "evidence_summary": "Learner allegedly said so",
+                "origin": "explicit_durable_preference",
+                "confirmation_state": "learner_confirmed",
+                "consented_need": "ADHD",
+            }
         ],
     )
 
     assert _accepted(result) == []
-    assert "does not match any need" in _rejection(result)
-
-
-def test_an_unconfirmed_candidate_with_a_matching_need_is_rejected(hermes_home: Path):
-    result = _save(confirmation_state="unconfirmed")
-
-    assert _accepted(result) == []
-    assert "learner_confirmed" in _rejection(result)
-
-
-def test_repeated_evidence_with_a_matching_need_is_rejected(hermes_home: Path):
-    result = _save(origin="repeated_evidence", evidence_count=9)
-
-    assert _accepted(result) == []
-    assert "repeated_evidence" in _rejection(result)
-
-
-def test_an_exact_confirmed_consented_candidate_is_accepted(hermes_home: Path):
-    result = _save()
-
-    accepted = _accepted(result)
-    assert len(accepted) == 1
-    assert accepted[0]["consented_need"] == "captions on audio"
-    assert accepted[0]["consent_reference"] == CAPTIONS_CONSENT["consent_statement"]
-
-
-def test_sensitive_content_under_a_non_accessibility_category_is_rejected(hermes_home: Path):
-    result = _save(
-        category="durable_preference",
-        statement="Has ADHD so prefers short sessions",
-        consented_need=None,
-    )
-
-    assert _accepted(result) == []
-    assert "sensitive health, disability" in _rejection(result)
-
-
-def test_an_accessibility_candidate_without_a_consented_need_is_rejected(hermes_home: Path):
-    result = _save(consented_need=None)
-
-    assert _accepted(result) == []
-    assert "requires 'consented_need'" in _rejection(result)
-
-
-def test_a_consented_need_without_any_consent_is_rejected(hermes_home: Path):
-    result = service.save_context(principal=LEARNER, memory_candidates=[_candidate()])
-
-    assert _accepted(result) == []
-    assert "requires accessibility_consent" in _rejection(result)
-
-
-def test_consented_need_is_refused_on_a_non_sensitive_category(hermes_home: Path):
-    result = _save(
-        category="durable_preference",
-        statement="Prefers worked examples",
-        evidence_summary="Said so directly",
-        consented_need="captions on audio",
-    )
-
-    assert _accepted(result) == []
-    assert "applies only to an accessibility candidate" in _rejection(result)
-
-
-def test_an_unknown_consent_property_is_refused_by_runtime_validation(hermes_home, gateway_session):
-    result = json.loads(
-        tools.handle_save_context(
-            {
-                "accessibility_consent": {
-                    "consent_statement": "s",
-                    "needs": ["n"],
-                    "scope": "everything",
-                }
-            }
-        )
-    )
-
-    assert result["ok"] is False
-    assert "scope" in result["error"]
-
-
-def test_an_unknown_candidate_consent_property_is_refused(hermes_home, gateway_session):
-    result = json.loads(
-        tools.handle_save_context(
-            {"memory_candidates": [dict(_candidate(), consent_override=True)]}
-        )
-    )
-
-    assert result["ok"] is False
-    assert "consent_override" in result["error"]
-
-
-def test_an_accepted_candidate_round_trips_its_consent_binding(hermes_home: Path):
-    _save()
-
     stored = service.get_context(principal=LEARNER, include_memory_candidates=True)
-    candidate = stored["memory_candidates"][0]
-
-    assert candidate["origin"] == "explicit_durable_preference"
-    assert candidate["confirmation_state"] == "learner_confirmed"
-    assert candidate["consent_reference"] == CAPTIONS_CONSENT["consent_statement"]
-    assert candidate["consented_need"] == "captions on audio"
-    assert candidate["created_at"] and candidate["updated_at"]
+    assert stored["memory_candidates"] == []
 
 
-def test_a_rejected_mismatch_persists_nothing(hermes_home: Path):
-    _save(statement="The learner has ADHD", consented_need="ADHD")
+def test_nothing_sensitive_survives_anywhere_after_the_attempt(hermes_home: Path):
+    """Not as a candidate, and not as a context value either."""
+    from learning_studio import storage
+
+    service.save_context(
+        principal=LEARNER,
+        accessibility_consent={
+            "consent_statement": "remember I have ADHD",
+            "needs": ["ADHD"],
+        },
+        temporary_context={"accessibility_needs": ["ADHD"]},
+        memory_candidates=[
+            {
+                "category": "accessibility",
+                "statement": "ADHD",
+                "evidence_summary": "stated",
+                "origin": "explicit_durable_preference",
+                "confirmation_state": "learner_confirmed",
+                "consented_need": "ADHD",
+            }
+        ],
+    )
 
     with storage.connect() as conn:
-        candidates = conn.execute("SELECT COUNT(*) AS n FROM memory_candidates").fetchone()["n"]
-        values = conn.execute(
-            "SELECT COUNT(*) AS n FROM context_values WHERE field = 'accessibility_needs'"
-        ).fetchone()["n"]
-        blob = " ".join(
-            str(row[0]) for row in conn.execute("SELECT statement FROM memory_candidates")
-        )
+        dump = "".join(line for line in conn.iterdump())
 
-    assert candidates == 0
-    assert values == 0
-    assert "ADHD" not in blob
-
-
-def test_each_consented_need_authorises_only_itself(hermes_home: Path):
-    """Listing two needs does not make either cover the other, or a third."""
-    consent = {
-        "consent_statement": "remember both of these",
-        "needs": ["captions on audio", "extra time on written tasks"],
-    }
-
-    result = service.save_context(
-        principal=LEARNER,
-        accessibility_consent=consent,
-        memory_candidates=[
-            _candidate(statement="captions on audio", consented_need="captions on audio"),
-            _candidate(
-                statement="extra time on written tasks",
-                consented_need="extra time on written tasks",
-            ),
-            _candidate(statement="a quiet room", consented_need="a quiet room"),
-        ],
-    )
-
-    accepted = sorted(item["consented_need"] for item in _accepted(result))
-    assert accepted == ["captions on audio", "extra time on written tasks"]
-    assert len(result["outcome"]["memory_candidates"]["rejected"]) == 1
-
-
-def test_the_statement_must_be_the_consented_need(hermes_home: Path):
-    """Presentation prose is never the authorisation."""
-    result = _save(statement="I will remember that you need captions on audio")
-
-    assert _accepted(result) == []
-    assert "must be exactly the consented need" in _rejection(result)
-
-
-def test_need_normalisation_is_deterministic_and_not_fuzzy():
-    from learning_studio.models import normalize_need
-
-    assert normalize_need("  Captions   On  Audio ") == "captions on audio"
-    assert normalize_need("CAPTIONS ON AUDIO") == normalize_need("captions on audio")
-    # NFKC folds compatibility forms; it does not fold different needs together.
-    assert normalize_need("ﬁne print") == "fine print"
-    assert normalize_need("captions") != normalize_need("captions on audio")
+    assert "ADHD" not in dump
 
 
 # ── Identity isolation between tests ──────────────────────────────────────

@@ -73,31 +73,35 @@ Three rules when you build the manifest:
   declare `accommodations` from a fixed list — `captions`, `transcript`,
   `text_alternatives`, `visual_description`, `keyboard_only`,
   `reduced_motion`, `no_time_limit`, `extended_time`, `plain_language` — and
-  must name the `source` each came from. The Studio then looks it up there: a
-  `confirmed_track` claim is checked against that track's confirmed context, a
-  `profile_config` claim against the operator's configuration, and an
-  `explicit_request` against what the learner has actually recorded. **Saying
-  the source is not the same as having one**, and a claim nothing backs is
-  refused.
+  must name the `source` each came from. There are **two** sources, and both
+  are outside your control:
 
-  In practice: to put an accommodation on an exercise, the need must already
-  be stored for this learner — which means the learner asked you to remember
-  it and you sent `accessibility_consent` (see *Memory*). If it is
-  session-only, leave `accessibility` off the manifest and honour the need in
-  conversation; that is the normal case, not a failure.
+  | Source | Checked against |
+  | --- | --- |
+  | `confirmed_track` | That track's confirmed context, which can only hold these same tokens |
+  | `profile_config` | The operator's `config.yaml` |
+
+  `explicit_request` is *not* a source. It used to be, and it was checked
+  against a context row **you** had written in an earlier call — so "the
+  learner asked for this" was authorised by your own earlier assertion. A
+  session-only need is honoured in conversation and simply not recorded on
+  the exercise; that is the normal case, not a failure.
 
   There is **no free-text accessibility field**, and there will not be one.
   Never write a diagnosis, a disability, or a sentence about the learner into
-  an exercise — component `alt_text` and `caption` describe the *component*,
-  and text describing a person is refused. Declaring an accommodation stores
-  nothing about the learner and creates no memory candidate.
+  an exercise — component `alt_text`, `caption` and `transcript` describe the
+  *component*, and text describing a person is refused. Declaring an
+  accommodation stores nothing about the learner and creates no memory
+  candidate.
 
 - **Declare only what the exercise can deliver.** `keyboard_only` with a
   hotspot, drag-ordering, or labelling component is refused unless that
-  component gives an `accessibility.keyboard_alternative`. `captions` and
-  `visual_description` need a caption and a long description on the components
-  carrying an asset. A claim the exercise cannot honour is worse than no
-  claim.
+  component gives an `accessibility.keyboard_alternative`. `captions` needs an
+  actual `caption`; `transcript` needs an actual `transcript`; asking for both
+  needs both, because they are different accommodations for different people
+  and neither substitutes for the other. `no_time_limit` cannot sit beside a
+  `delivery.time_limit_seconds`. A claim the exercise cannot honour is worse
+  than no claim.
 - **Attach a `track_id` only for sustained work.** A one-off exercise takes no
   track. Naming one you were not given, or one belonging to anybody else, is
   refused. If you also send `objective_id`, the manifest's `objective` must be
@@ -107,8 +111,18 @@ Three rules when you build the manifest:
 - **Never let the question give away its answer.** An accepted answer that
   already appears in the prompt, the content, or the alt text is refused, for
   every component where the learner has to produce text. `H2O` in "Type H2O"
-  counts. Selection components are fine: their key is an option id, and the
-  option text is meant to be read.
+  counts, and so does `P.a.r.i.s` for `Paris` — spelling it out with dots
+  does not hide it — and so does a symbol answer such as `+` printed in its
+  own prompt. Selection components are fine: their key is an option id, and
+  the option text is meant to be read.
+
+  When this is refused, the error names the *field*, never the value. Nothing
+  this tool returns will ever quote an answer back at you, including when it
+  is telling you the answer is the problem.
+
+- **Write no locators.** No URL, URI, host, address, or filesystem path — and
+  a leading slash is a path, so a slash-command goes in as "the help command"
+  rather than `/help`. Prose, arithmetic, dates and decimals are unaffected.
 
 - **Branches must be able to end.** At most one branch per outcome, no branch
   to itself, and no set of components the learner can never leave — if both
@@ -120,6 +134,13 @@ Three rules when you build the manifest:
   `sentence_order` is `ordered`; open work is `rubric`; a flashcard or a
   self-report is `self_check`. A mode that cannot mark that component is
   refused, and a self-report takes no rubric at all.
+
+- **Say the right number.** `error_correction`'s `error_count` must equal the
+  number of corrections in the key, each correction must actually appear in
+  the passage, and each must change something. `categorization` puts every
+  item in exactly one category unless `allow_multiple` is set — several items
+  may of course share a category, which is the usual shape of a grouping
+  task. `table_grid` accounts for every cell, prefilled or expected.
 
 ### Using the context tools
 
@@ -421,15 +442,31 @@ to retain the data at all. Both are required.
    saved** — the response says so, and you must not tell the learner it will
    be remembered.
 
-   To store one, the learner has to ask, and you send `accessibility_consent`
-   listing that exact need and quoting their words. A memory candidate for it
-   must also carry `consented_need` matching one of those needs **exactly**,
-   and its `statement` must be that need verbatim — put any friendlier
-   phrasing in your reply, not in the stored fact. Matching ignores case and
-   spacing and nothing else: consent for "captions" does not cover "captions
-   on all video", and consent for captions never authorises recording a
-   diagnosis. A repeated pattern across exercises is never grounds to record
-   that someone *has* a condition — only they can say that.
+   **A sensitive fact cannot be stored as a memory candidate at all.** An
+   `accessibility` candidate is refused however it is dressed up — confirmed,
+   consented, exactly matched. The reason is structural rather than a policy
+   choice: the consent statement, the needs it covers, the origin and the
+   confirmation are all written by *you*, in the same call, and Hermes gives
+   this plugin no way to check any of them. A gate whose every key is handed
+   over by the party being checked is not a gate, so nothing goes through it.
+
+   What can be stored is narrow and deliberately dull: one of the nine
+   accommodation tokens, on a confirmed track, with `accessibility_consent`
+   naming that exact token. The vocabulary is what makes it safe — none of
+   those tokens can express a fact about a person. Free-text needs are
+   honoured for the session and never written down.
+
+   **Confirmation you assert is recorded as unconfirmed.** Sending
+   `confirmation_state: learner_confirmed` on any candidate stores
+   `unconfirmed` instead, and the response tells you so under
+   `outcome.memory_candidates.downgraded`. The proposal is kept — your reading
+   of the conversation is real evidence — but the record will not tell a
+   reader in six months that the learner agreed when nobody can show that.
+
+   **A replacement must name something that exists.** `recommended_action` of
+   `replace` or `remove` requires `replaces` to match a proposal already
+   stored for this learner. A change to a record nobody can find is not a
+   change.
 4. **If consent or isolation is uncertain, do not persist.** Uncertainty
    resolves to no. There is no cost to asking again next session and a real
    cost to a wrong permanent record.

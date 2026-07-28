@@ -67,6 +67,13 @@ _INVISIBLE_RE = re.compile(
     "[" + "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in _INVISIBLE_RANGES) + "]"
 )
 
+#: The two rules a JSON Schema ``pattern`` can express exactly. Declared here
+#: as strings, compiled into the rule table below, *and* emitted into the
+#: advertised schema by :func:`text_pattern` — one declaration, three uses, so
+#: the schema and the validator cannot say different things about them.
+MARKUP_PATTERN = r"<[a-zA-Z/!?]"
+SCHEME_URL_PATTERN = r"[a-zA-Z][a-zA-Z0-9+.-]*:\s*//"
+
 #: Every rule, as ``(regex, explanation)``. Ordered so the most specific and
 #: most actionable message wins for a string that trips several.
 #:
@@ -76,7 +83,7 @@ _INVISIBLE_RE = re.compile(
 #: hazard it exists to prevent.
 _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
-        re.compile(r"<[a-zA-Z/!?]"),
+        re.compile(MARKUP_PATTERN),
         "must not contain markup; write the content as plain text "
         "(a comparison needs spaces around '<')",
     ),
@@ -96,31 +103,43 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         "must not contain a data URL",
     ),
     (
-        re.compile(r"\b[a-z][a-z0-9+.-]*:\s*//", re.IGNORECASE),
+        re.compile(SCHEME_URL_PATTERN, re.IGNORECASE),
         "must not contain a URL; describe the source instead of linking to it",
     ),
-    # Schemes with no authority component, which the ``://`` rule above cannot
-    # see. Each requires a non-space immediately after the colon so ordinary
-    # prose — "the file: notes.md", "Note: see below" — is not caught.
+    # URI syntax, generically. A finite list of schemes is a list somebody
+    # eventually gets past — ``intent:`` did. The shape is what is refused:
+    # a scheme name, a colon, and a non-space immediately after it. Ordinary
+    # prose puts a space after its colons ("Note: see below", "the file:
+    # notes.md"), and a leading digit excludes times and ratios.
     (
-        re.compile(
-            r"\b(?:mailto|ftp|ftps|file|tel|sms|ws|wss|ssh|sftp|git|smb|nfs|ldap|irc|"
-            r"magnet|gopher|blob|about|chrome|view-source):(?=\S)",
-            re.IGNORECASE,
-        ),
+        re.compile(r"\b[a-z][a-z0-9+.-]{1,31}:(?=[^\s:])", re.IGNORECASE),
         "must not contain a URI; describe the source instead of linking to it",
     ),
-    # A bare web locator is still a locator. Restricted to a leading ``www.``
-    # or a small set of well-known suffixes so that "Node.js" and "e.g." are
-    # not mistaken for hosts.
+    # A bare web locator is still a locator. Three shapes, chosen so that
+    # ``Node.js`` and ``3.14`` are not mistaken for hosts: anything under
+    # ``www.``, a domain carrying a path, and a three-or-more-label name.
     (
         re.compile(
             r"\bwww\.[a-z0-9-]+\.[a-z]{2,}|"
-            r"\b[a-z0-9][a-z0-9-]{1,}\.(?:com|net|org|io|dev|app|edu|gov|mil|info|biz|xyz|"
-            r"me|co|ai|sh)\b(?:/\S*)?",
+            r"\b[a-z0-9][a-z0-9-]{0,62}\.[a-z]{2,24}/\S|"
+            # Three or more labels, each at least two characters — so
+            # ``sub.example.com`` is a host while ``U.S.A`` and a name spelled
+            # out as ``P.a.r.i.s`` are not.
+            r"\b[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0-9][a-z0-9-]{1,62}){2,}\b",
             re.IGNORECASE,
         ),
         "must not contain a web address",
+    ),
+    # An address with a path or a port is a locator whether or not it has a
+    # name. A bare dotted-quad on its own is left alone: it is indistinguish-
+    # able from an ordinary sequence of numbers.
+    (
+        re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?/|\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}"),
+        "must not contain a network address",
+    ),
+    (
+        re.compile(r"\b[a-z][a-z0-9.-]{1,62}:\d{2,5}(?:/|\b)", re.IGNORECASE),
+        "must not contain a host and port",
     ),
     (
         re.compile(r"&(?:#x?[0-9a-f]+|lt|gt|quot|apos|amp|nbsp);", re.IGNORECASE),
@@ -141,14 +160,17 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"(?:^|[\s\"'(\[/\\])\.{1,2}[/\\]|%2e%2e", re.IGNORECASE),
         "must not contain a relative path",
     ),
-    # Three shapes of absolute path: a multi-segment POSIX path, a
-    # single-segment one carrying a file extension, and the Windows and UNC
-    # forms. The extension requirement is what lets "/help" and "3 / 4"
-    # through while still refusing "/secret.txt".
+    # Every shape of path: POSIX absolute (one segment or many, extension or
+    # not), home-relative, Windows, and UNC.
+    #
+    # ``/secret`` and ``/help`` are the same string, so a rule that refuses
+    # one refuses both. The contract says manifest strings contain no paths,
+    # and a leading slash is what a path looks like — so a slash-prefixed
+    # command has to be written without the slash ("the help command"). A
+    # slash with a space after it is division and is untouched.
     (
         re.compile(
-            r"(?:^|\s)~?/[A-Za-z0-9._-]+/|"
-            r"(?:^|\s)~?/[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,8}\b|"
+            r"(?:^|\s)~?/[A-Za-z0-9._-]+|"
             r"(?:^|\s)[A-Za-z]:[\\/]|\\\\[A-Za-z0-9]"
         ),
         "must not contain a filesystem path",
@@ -250,6 +272,47 @@ DATE_PATTERN = r"^[0-9]{4}(?:-[0-9]{2}(?:-[0-9]{2})?)?$"
 _IDENTIFIER_RE = re.compile(IDENTIFIER_PATTERN)
 _LOCALE_RE = re.compile(LOCALE_PATTERN)
 _DATE_RE = re.compile(DATE_PATTERN)
+
+
+#: The subset of the rules above that a JSON Schema ``pattern`` can express
+#: exactly, as a negative lookahead. Kept here, beside the rules themselves,
+#: so the advertised constraint and the enforced one are one declaration:
+#: markup and scheme-qualified URLs are refused on both sides.
+#:
+#: Only these two. The remaining rules span newlines, need alternation the
+#: two regex dialects disagree about, or would turn into a pattern no
+#: provider could be relied on to compile — and a schema constraint that is
+#: *nearly* right is worse than one that is honestly absent, because it
+#: invites a reader to stop checking.
+_EXPRESSIBLE_RULES: tuple[str, ...] = (MARKUP_PATTERN, SCHEME_URL_PATTERN)
+
+
+def text_pattern(*, multiline: bool = False) -> str:
+    r"""The ``pattern`` a bounded text field advertises.
+
+    Requires a non-whitespace character, because the runtime trims before it
+    measures and ``"   "`` is an empty string to it, and refuses the two
+    safety rules a pattern can state exactly.
+
+    Written with ``[\s\S]`` rather than ``.`` so the lookaheads cross
+    newlines. ``.`` stops at one in both regex dialects, which would leave a
+    multiline passage able to carry markup on its second line — advertised as
+    valid and then refused, which is the disagreement this exists to close.
+    The *multiline* argument is kept for callers that describe their field,
+    and deliberately changes nothing: the rules are the same either way.
+    """
+    del multiline
+    refusals = "".join(f"(?![\\s\\S]*{rule})" for rule in _EXPRESSIBLE_RULES)
+    return rf"^(?=[\s\S]*\S){refusals}"
+
+
+def expressible_rule_summary() -> str:
+    """Prose naming what the schema pattern enforces, for a field description."""
+    return (
+        "Plain text: no markup and no URLs. Filesystem paths, other URI schemes, "
+        "stylesheet syntax and credential-shaped values are refused too, by the "
+        "same validator, though a JSON Schema pattern cannot express them."
+    )
 
 
 def safe_text(
@@ -360,6 +423,41 @@ def tokens(text: str) -> list[str]:
     are the same sequence, and so that a full stop cannot hide a leak.
     """
     return re.findall(r"\w+", unicodedata.normalize("NFC", text).casefold(), flags=re.UNICODE)
+
+
+#: Separators an author might scatter between an answer's characters to hide
+#: it in plain sight — ``P.a.r.i.s`` for ``Paris``. Two at most, so that two
+#: unrelated words are not read as one obfuscated one.
+_SEPARATED_GAP = r"[\W_]{0,2}"
+
+
+def separated_spelling_pattern(answer: str) -> re.Pattern[str] | None:
+    """A regex matching *answer* spelled out with separators between letters.
+
+    ``Paris`` becomes ``\\bP[\\W_]{0,2}a[\\W_]{0,2}r…s\\b``, which catches
+    ``P.a.r.i.s``, ``P-a-r-i-s`` and ``P a r i s`` while still requiring word
+    boundaries at both ends — so ``Na`` does not match inside ``national``.
+
+    Returns ``None`` when the rule does not apply: purely numeric answers
+    (``4.2`` is a different number from ``42``, not an obfuscation of it) and
+    answers too short for the pattern to mean anything.
+    """
+    characters = re.findall(r"\w", unicodedata.normalize("NFKC", answer).casefold())
+    if len(characters) < 3 or not any(character.isalpha() for character in characters):
+        return None
+    body = _SEPARATED_GAP.join(re.escape(character) for character in characters)
+    return re.compile(rf"\b{body}\b", re.IGNORECASE)
+
+
+def symbol_form(text: str) -> str:
+    """The comparable form of a string that contains no word characters.
+
+    Tokenising ``+`` or ``===`` yields nothing, so a token comparison cannot
+    see them at all — which is how a symbol-only answer used to be printable
+    in its own prompt. Compared as a normalised, whitespace-free string
+    instead; a symbol is not a word, so there are no boundaries to respect.
+    """
+    return "".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
 def contains_token_sequence(haystack: list[str], needle: list[str]) -> bool:

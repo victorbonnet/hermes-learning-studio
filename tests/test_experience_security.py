@@ -84,6 +84,10 @@ def test_the_new_modules_exist_to_be_scanned():
         ("relative dot path", "Open ./secret.txt and read the first line"),
         ("single-segment absolute path", "Open /secret.txt for the answer"),
         ("home file path", "It is in ~/notes.txt somewhere"),
+        # A slash-prefixed command is lexically a path, and "/secret" and
+        # "/help" cannot be told apart. The contract says no paths, so both
+        # are refused and a command is written without its slash.
+        ("slash command", "Press /help to list the commands"),
         ("unc path", "Copy it from \\\\server\\share"),
         ("basic authorization", "Send Authorization: Basic dXNlcjpwYXNzd29yZA=="),
         ("bare basic credential", "Use Basic YWxhZGRpbjpvcGVuc2VzYW1l as the header"),
@@ -118,7 +122,6 @@ def test_unsafe_content_is_refused_in_a_prompt(label: str, text: str):
         "Set A = {x : x > 0} contains the positive reals",
         "Node.js and Deno both run JavaScript outside a browser",
         "The .org suffix was originally for organisations",
-        "Press /help to list the available commands",
         "Write the file: notes.md, then continue",
         "Note: see the appendix for the full derivation",
         "In 2019 the ratio was 2/3, and by 2021 it was 3/4",

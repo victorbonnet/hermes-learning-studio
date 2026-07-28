@@ -16,9 +16,13 @@ than by convention:
    that allowlist does not mention. Nobody has to remember to delete anything,
    because nothing is ever deleted: the safe payload is constructed, not
    filtered.
-3. **One source of truth.** The JSON Schema the model sees and the validation
-   the handler runs are generated from the same specifications below, so they
-   cannot drift into disagreement.
+3. **One source of truth for what a schema can state.** The JSON Schema the
+   model sees and the validation the handler runs are generated from the same
+   specifications below — the same bounds, enums, patterns and required
+   fields. Where JSON Schema cannot express a rule (an answer that must
+   reference a declared option; a passage whose gaps must match its blanks)
+   the runtime is stricter and the schema says so in a description, rather
+   than pretending. ``tests/test_schema_parity.py`` checks both directions.
 
 The families are deliberately subject-neutral. ``fill_blank`` is as useful for
 a chemistry equation as for a Spanish conjugation; ``timeline`` orders the
@@ -49,6 +53,9 @@ from .safety import (
     safe_identifier,
     safe_locale,
     safe_text,
+    separated_spelling_pattern,
+    symbol_form,
+    text_pattern,
     tokens,
 )
 
@@ -175,7 +182,17 @@ class Text(Field):
         return text
 
     def schema(self) -> dict[str, Any]:
-        return self._described({"type": "string", "minLength": 1, "maxLength": self.max_chars})
+        # ``minLength`` alone would accept "   ", which the runtime trims to
+        # nothing and refuses. The pattern closes that, and carries the two
+        # safety rules a schema can state exactly.
+        return self._described(
+            {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": self.max_chars,
+                "pattern": text_pattern(multiline=self.multiline),
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -308,6 +325,7 @@ class EnumList(Field):
                 "type": "array",
                 "minItems": 1,
                 "maxItems": len(self.choices),
+                "uniqueItems": True,
                 "items": {"type": "string", "enum": list(self.choices)},
             }
         )
@@ -332,7 +350,12 @@ class TextList(Field):
                 "type": "array",
                 "minItems": 1,
                 "maxItems": self.max_items,
-                "items": {"type": "string", "minLength": 1, "maxLength": self.max_chars},
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": self.max_chars,
+                    "pattern": text_pattern(multiline=self.multiline),
+                },
             }
         )
 
@@ -346,12 +369,16 @@ class IdentList(Field):
         return [safe_identifier(item, f"{path}[{index}]") for index, item in enumerate(items)]
 
     def schema(self) -> dict[str, Any]:
+        # The identifier definition, not a second copy of it — and unique,
+        # because every list of identifiers in this registry is either a set
+        # or a permutation, and the runtime refuses a repeat in both.
         return self._described(
             {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": self.max_items,
-                "items": {"type": "string", "minLength": 1, "maxLength": 64},
+                "uniqueItems": True,
+                "items": {"$ref": f"#/$defs/{IDENTIFIER_DEF}"},
             }
         )
 
@@ -586,16 +613,28 @@ COMPONENT_ACCESSIBILITY: tuple[Field, ...] = (
     Text("caption", max_chars=TEXT_MAX, about_the_component=True),
     Text("long_description", max_chars=PASSAGE_MAX, multiline=True, about_the_component=True),
     Text(
+        "transcript",
+        max_chars=PASSAGE_MAX,
+        multiline=True,
+        about_the_component=True,
+        description="The spoken content of any audio or video, written out.",
+    ),
+    Text(
         "keyboard_alternative",
         max_chars=TEXT_MAX,
         about_the_component=True,
         description="How to answer without dragging or pointing.",
     ),
-    Bool("transcript_required"),
-    Bool("captions_required"),
     Bool("reduced_motion"),
     Bool("no_time_limit"),
 )
+
+# ``transcript_required`` and ``captions_required`` used to sit here as
+# booleans. They are gone on purpose: a flag saying a transcript is required
+# is not a transcript, and an experience that promised one could be satisfied
+# by a component merely asserting that somebody ought to provide it. The
+# fields now hold the content itself, so the promise and the thing promised
+# are the same object.
 
 _ACCESSIBILITY = shared(
     "component_accessibility",
@@ -934,10 +973,11 @@ SPECS: tuple[ComponentSpec, ...] = (
             ),
             Bool("partial_credit"),
         ),
-        refs=(
-            Ref("assignments[].item_id", "items", mode="permutation"),
-            Ref("assignments[].category_ids[]", "categories"),
-        ),
+        # ``category_ids`` is deliberately *not* a generic reference: flattened
+        # across every assignment, two items placed in the same category read
+        # as a duplicate, which is the commonest correct answer there is. See
+        # :func:`_check_categorization`.
+        refs=(Ref("assignments[].item_id", "items", mode="permutation"),),
     ),
     # ── Recall ────────────────────────────────────────────────────────────
     ComponentSpec(
@@ -1522,7 +1562,13 @@ class Component:
 
 
 def build_component(raw: Any, path: str) -> Component:
-    """Validate one component and return its two separated halves."""
+    """Validate one component and return its two separated halves.
+
+    Every refusal raised from here passes through :func:`_without_hidden_data`
+    first. The messages below are already written to name a field rather than
+    a value, but "written carefully" is not a property anyone can check later:
+    the scrub is, and it is what a canary test asserts.
+    """
     if not isinstance(raw, dict):
         raise ComponentError(f"{path} must be an object")
 
@@ -1533,6 +1579,13 @@ def build_component(raw: Any, path: str) -> Component:
         )
     spec = SPEC_BY_TYPE[declared_type]
 
+    try:
+        return _build_checked(spec, raw, path)
+    except ComponentError as exc:
+        raise ComponentError(_without_hidden_data(str(exc), raw, path)) from None
+
+
+def _build_checked(spec: ComponentSpec, raw: dict[str, Any], path: str) -> Component:
     validated = validate_object(component_members(spec), raw, path)
     content = validated.get("content", {})
     answer = validated.get("answer", {})
@@ -1558,6 +1611,93 @@ def build_component(raw: Any, path: str) -> Component:
     return component
 
 
+#: Values that may appear in an error even though they live in the hidden
+#: half: they are closed vocabularies the caller itself chose from, and a
+#: message that cannot name the invalid enum it is rejecting is not a message.
+#: Nothing here can carry content — every entry is a fixed keyword.
+_ECHOABLE = frozenset(
+    {*SCORING_MODES, *BRANCH_CONDITIONS, "rectangle", "circle", "polygon", "true", "false"}
+)
+
+
+def _without_hidden_data(message: str, raw: Any, path: str) -> str:
+    """Replace an error that quotes evaluator-only content with a safe one.
+
+    The tool promises the model that answers, rubrics, scoring rules, hints
+    and feedback never come back. An error message is a response like any
+    other, so a refusal that says "'Paris' is already readable" hands over
+    exactly what the check was protecting. This is the structural guarantee
+    behind that promise: if any evaluator-only string is present in the
+    message, the message does not go out.
+    """
+    message_tokens = tokens(message)
+    for value in _hidden_strings(raw):
+        if _appears_in(value, message, message_tokens):
+            return (
+                f"{path} was refused, and the reason quotes evaluator-only content, so it "
+                "has been withheld. Check the component's answer and evaluation against "
+                "the schema."
+            )
+    return message
+
+
+#: Below this length a hidden value is indistinguishable from ordinary
+#: message vocabulary — "2" is a token of "2 cell(s)", "no" of "no options" —
+#: and scrubbing on it would withhold almost every refusal while proving
+#: nothing. The primary protection is that no message interpolates a value
+#: from the hidden half in the first place; this scrub is the backstop that
+#: makes that checkable, not the mechanism itself.
+_SCRUB_MIN_CHARS = 3
+
+
+def _appears_in(value: str, message: str, message_tokens: list[str]) -> bool:
+    """True when *value* is readable in *message*, on token boundaries.
+
+    Boundaries rather than substrings, for the same reason the leak check
+    uses them: a hidden ``Na`` must not match inside "national".
+    """
+    if len(value.strip()) < _SCRUB_MIN_CHARS:
+        return False
+    value_tokens = tokens(value)
+    if value_tokens:
+        return contains_token_sequence(message_tokens, value_tokens)
+    symbols = symbol_form(value)
+    return len(symbols) >= _SCRUB_MIN_CHARS and symbols in symbol_form(message)
+
+
+def _hidden_strings(raw: Any) -> list[str]:
+    """Strings that are *only* in the hidden half, and are not fixed keywords.
+
+    A value the learner can already read is not a disclosure: an option id, a
+    blank id, a row header. Those appear on both sides, so naming one in an
+    error tells nobody anything they were not already shown — and a scrub that
+    withheld them would make almost every message unusable.
+    """
+    if not isinstance(raw, dict):
+        return []
+    visible = {
+        value.casefold() for key in LEARNER_VISIBLE_KEYS for value in _all_strings(raw.get(key))
+    }
+    found: list[str] = []
+    for key in HIDDEN_KEYS:
+        found.extend(_all_strings(raw.get(key)))
+    return [
+        value
+        for value in found
+        if value and value.casefold() not in _ECHOABLE and value.casefold() not in visible
+    ]
+
+
+def _all_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for item in value.values() for s in _all_strings(item)]
+    if isinstance(value, list):
+        return [s for item in value for s in _all_strings(item)]
+    return []
+
+
 def _check_answer_references(
     spec: ComponentSpec, content: dict[str, Any], answer: dict[str, Any], path: str
 ) -> None:
@@ -1567,11 +1707,13 @@ def _check_answer_references(
     for ref in spec.refs:
         declared = _content_ids(content, ref.content_field)
         referenced = [str(value) for value in _walk(answer, ref.answer_path)]
-        unknown = sorted({value for value in referenced if value not in declared})
+        unknown = {value for value in referenced if value not in declared}
         if unknown:
+            # The count, not the ids. Which option an answer names *is* the
+            # answer, so echoing it back would disclose the key.
             raise ComponentError(
-                f"{path}.answer.{ref.answer_path} names "
-                f"{', '.join(unknown)}, which {ref.content_field} does not declare"
+                f"{path}.answer.{ref.answer_path} names {len(unknown)} id(s) that "
+                f"{ref.content_field} does not declare"
             )
         if ref.mode == "permutation" and sorted(referenced) != sorted(declared):
             raise ComponentError(
@@ -1604,8 +1746,7 @@ def _check_decision_path(content: dict[str, Any], answer: dict[str, Any], path: 
         available = options_by_step.get(entry["step_id"], set())
         if entry["option_id"] not in available:
             raise ComponentError(
-                f"{path}.answer.decisions[{index}].option_id is not an option of "
-                f"step '{entry['step_id']}'"
+                f"{path}.answer.decisions[{index}].option_id is not an option of that step"
             )
 
 
@@ -1726,9 +1867,69 @@ def _check_confidence_scale(content: dict[str, Any], answer: dict[str, Any], pat
         )
 
 
+def _check_categorization(content: dict[str, Any], answer: dict[str, Any], path: str) -> None:
+    """Grouping rules, which are per item rather than across the whole answer.
+
+    Two items in one category is the normal shape of a grouping task. What is
+    not allowed is the same category twice *for one item*, an item placed in
+    several categories when the component did not say that was possible, or a
+    category nobody declared.
+    """
+    declared = set(_content_ids(content, "categories"))
+    allow_multiple = content.get("allow_multiple", False)
+
+    for index, entry in enumerate(answer.get("assignments", [])):
+        where = f"{path}.answer.assignments[{index}].category_ids"
+        chosen = entry.get("category_ids", [])
+        unknown = {value for value in chosen if value not in declared}
+        if unknown:
+            raise ComponentError(
+                f"{where} names {len(unknown)} id(s) that categories does not declare"
+            )
+        if len(set(chosen)) != len(chosen):
+            raise ComponentError(f"{where} names the same category more than once")
+        if not allow_multiple and len(chosen) != 1:
+            raise ComponentError(
+                f"{where} places one item in {len(chosen)} categories, but this component "
+                "did not set content.allow_multiple"
+            )
+
+
+def _check_error_correction(content: dict[str, Any], answer: dict[str, Any], path: str) -> None:
+    """The stated number of errors must be the number the key actually fixes.
+
+    A learner told to find two errors, in a passage whose key holds one, is
+    being marked against a question nobody can answer correctly.
+    """
+    corrections = answer.get("corrections", [])
+    declared = content.get("error_count")
+    if declared is not None and declared != len(corrections):
+        raise ComponentError(
+            f"{path}.content.error_count says {declared}, but the answer defines "
+            f"{len(corrections)} correction(s). They must be the same number."
+        )
+
+    seen: set[str] = set()
+    for index, correction in enumerate(corrections):
+        where = f"{path}.answer.corrections[{index}]"
+        wrong = " ".join(correction["incorrect"].split()).casefold()
+        if wrong in seen:
+            raise ComponentError(f"{where} corrects the same text twice")
+        seen.add(wrong)
+        if wrong == " ".join(correction["correct"].split()).casefold():
+            raise ComponentError(f"{where} leaves the text unchanged, so there is nothing to fix")
+        if not contains_token_sequence(tokens(content.get("text", "")), tokens(wrong)):
+            raise ComponentError(
+                f"{where}.incorrect does not appear in content.text, so the learner has "
+                "nothing to correct"
+            )
+
+
 #: Per-type checks that need to see the whole component at once.
 _CROSS_CHECKS: dict[str, tuple[Any, ...]] = {
     "decision_path": (_check_decision_path,),
+    "categorization": (_check_categorization,),
+    "error_correction": (_check_error_correction,),
     "fill_blank": (_check_fill_blank,),
     "table_grid": (_check_table_grid,),
     "hotspot": (_check_hotspot,),
@@ -1792,9 +1993,9 @@ def _check_feedback(spec: ComponentSpec, content: dict[str, Any], evaluation, pa
         option_id = entry["option_id"]
         where = f"{path}.evaluation.feedback.per_option[{index}].option_id"
         if option_id not in declared:
-            raise ComponentError(f"{where} names '{option_id}', which options does not declare")
+            raise ComponentError(f"{where} names an id that options does not declare")
         if option_id in seen:
-            raise ComponentError(f"{where} gives '{option_id}' feedback twice")
+            raise ComponentError(f"{where} gives the same option feedback twice")
         seen.add(option_id)
 
 
@@ -1808,26 +2009,56 @@ def _check_answer_leak(spec: ComponentSpec, component: Component, path: str) -> 
     is an opaque option id — the option *text* is meant to be visible, and
     that is the whole format.
 
-    The comparison is over the complete recursive learner-visible projection —
-    prompt, content, labels, captions, alt text, everything — and matches on
-    token boundaries rather than substrings. That is what lets a two-character
-    answer such as ``Na`` be checked without it matching inside "national",
-    and what keeps "Define photosynthesis" legal while refusing "Type Paris.
-    The answer is Paris."
+    Three comparisons, over the complete recursive learner-visible projection:
+
+    1. **Token sequence.** The answer's words, in order, on word boundaries.
+       That is what lets ``Na`` be checked without matching inside
+       "national", and keeps "Define photosynthesis" legal while refusing
+       "Type Paris. The answer is Paris."
+    2. **Separated spelling.** The same characters with separators between
+       them — ``P.a.r.i.s`` is ``Paris`` written to defeat a tokeniser, and a
+       learner reads it as the answer either way.
+    3. **Symbol form.** An answer with no word characters at all (``+``,
+       ``===``, a tick) tokenises to nothing, so it is compared as a
+       normalised symbol string instead.
+
+    None of these is fuzzy: no edit distance, no similarity, no substring
+    rule over words, and nothing asks a model. And the refusal names the
+    field, never the value — an error that quoted the answer back would be
+    the disclosure this check exists to prevent.
     """
     if not spec.leak_paths:
         return
-    visible = tokens(_flatten_text(_leak_surface(spec, component)))
+    visible = _flatten_text(_leak_surface(spec, component))
+    visible_tokens = tokens(visible)
+    visible_symbols = symbol_form(visible)
+
     for leak_path in spec.leak_paths:
         for value in _walk(component.answer, leak_path):
             for text in value if isinstance(value, list) else [value]:
-                if not isinstance(text, str):
-                    continue
-                if contains_token_sequence(visible, tokens(text)):
+                if isinstance(text, str) and _is_readable(
+                    text, visible, visible_tokens, visible_symbols
+                ):
                     raise ComponentError(
-                        f"{path} shows its own answer: '{text}' is already readable in the "
-                        "part the learner sees before answering"
+                        f"{path}.answer.{leak_path} is already readable in the part the "
+                        "learner sees before answering. Rewrite the question so it does "
+                        "not contain what it is asking for."
                     )
+
+
+def _is_readable(
+    answer: str, visible: str, visible_tokens: list[str], visible_symbols: str
+) -> bool:
+    """True when *answer* can be read off the visible half, by any of the three rules."""
+    answer_tokens = tokens(answer)
+    if answer_tokens:
+        if contains_token_sequence(visible_tokens, answer_tokens):
+            return True
+        separated = separated_spelling_pattern(answer)
+        return bool(separated and separated.search(visible))
+
+    symbols = symbol_form(answer)
+    return bool(symbols) and symbols in visible_symbols
 
 
 def _leak_surface(spec: ComponentSpec, component: Component) -> dict[str, Any]:
