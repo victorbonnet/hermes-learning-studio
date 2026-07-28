@@ -112,19 +112,31 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     # prose puts a space after its colons ("Note: see below", "the file:
     # notes.md"), and a leading digit excludes times and ratios.
     (
-        re.compile(r"\b[a-z][a-z0-9+.-]{1,31}:(?=[^\s:])", re.IGNORECASE),
+        # RFC 3986 scheme grammar: one letter, then any of letter/digit/+/-/.
+        # — so a *one-letter* scheme such as ``x:`` is a scheme too. The
+        # payload must start with something that is neither a space nor a
+        # digit, which is what keeps "12:30", "3:4" and "H:1" out of it.
+        re.compile(r"\b[a-z][a-z0-9+.-]{0,31}:(?=[^\s:\d])", re.IGNORECASE),
         "must not contain a URI; describe the source instead of linking to it",
     ),
     # A bare web locator is still a locator. Three shapes, chosen so that
     # ``Node.js`` and ``3.14`` are not mistaken for hosts: anything under
     # ``www.``, a domain carrying a path, and a three-or-more-label name.
     (
+        # Four shapes, and no list of top-level domains anywhere: a list has
+        # to be maintained, and ``.museum`` is exactly what falls off the end
+        # of one. What is matched is the *shape* of a hostname.
+        #
+        # A two-label name is the hard case, because ``Node.js`` and
+        # ``example.fr`` are the same shape. The discriminator is the length
+        # of the last label: three or more letters is a domain
+        # (``example.museum``, ``malware.tech``), two is left alone unless it
+        # carries a path or a ``www.``. That keeps file-extension prose —
+        # ``Node.js``, ``index.md`` — readable while refusing the locators.
         re.compile(
             r"\bwww\.[a-z0-9-]+\.[a-z]{2,}|"
             r"\b[a-z0-9][a-z0-9-]{0,62}\.[a-z]{2,24}/\S|"
-            # Three or more labels, each at least two characters — so
-            # ``sub.example.com`` is a host while ``U.S.A`` and a name spelled
-            # out as ``P.a.r.i.s`` are not.
+            r"\b[a-z0-9][a-z0-9-]{1,62}\.[a-z]{3,24}\b|"
             r"\b[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0-9][a-z0-9-]{1,62}){2,}\b",
             re.IGNORECASE,
         ),
@@ -135,6 +147,13 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     # able from an ordinary sequence of numbers.
     (
         re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?/|\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}"),
+        "must not contain a network address",
+    ),
+    (
+        # A bracketed IPv6 literal, with or without a port or a path. At least
+        # three colon-separated groups, so an interval such as ``[1:2]`` is
+        # not mistaken for one.
+        re.compile(r"\[[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,}\](?::\d{1,5})?", re.IGNORECASE),
         "must not contain a network address",
     ),
     (
@@ -157,7 +176,7 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         "must not contain a stylesheet rule",
     ),
     (
-        re.compile(r"(?:^|[\s\"'(\[/\\])\.{1,2}[/\\]|%2e%2e", re.IGNORECASE),
+        re.compile(r"(?:^|[\s\"'(\[{«‹“”‘’/\\])\.{1,2}[/\\]|%2e%2e", re.IGNORECASE),
         "must not contain a relative path",
     ),
     # Every shape of path: POSIX absolute (one segment or many, extension or
@@ -169,9 +188,13 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     # command has to be written without the slash ("the help command"). A
     # slash with a space after it is division and is untouched.
     (
+        # The leading context is any opening punctuation, not only whitespace:
+        # ``(/etc/passwd)`` and ``"/etc/hosts"`` are paths however they are
+        # wrapped, and the quotes may be the typographic ones a word processor
+        # produces.
         re.compile(
-            r"(?:^|\s)~?/[A-Za-z0-9._-]+|"
-            r"(?:^|\s)[A-Za-z]:[\\/]|\\\\[A-Za-z0-9]"
+            r"(?:^|[\s\"'(\[{«‹“”‘’])~?/[A-Za-z0-9._-]+|"
+            r"(?:^|[\s\"'(\[{«‹“”‘’])[A-Za-z]:[\\/]|\\\\[A-Za-z0-9]"
         ),
         "must not contain a filesystem path",
     ),
@@ -333,6 +356,14 @@ def safe_text(
     if not isinstance(raw, str):
         raise UnsafeContent(f"{label} must be a string")
 
+    # Measured before trimming, because the advertised ``maxLength`` applies
+    # to the string as sent. Trimming first would let a title 200 characters
+    # long plus four spaces be refused by the schema and accepted by the
+    # builder — the same value, two answers, depending which door it came
+    # through.
+    if len(raw) > max_chars:
+        raise UnsafeContent(f"{label} must be at most {max_chars} characters")
+
     text = unicodedata.normalize("NFC", raw).strip()
 
     if _CONTROL_RE.search(text):
@@ -343,9 +374,6 @@ def safe_text(
         raise UnsafeContent(f"{label} must be a single line")
     if len(text) < min_chars:
         raise UnsafeContent(f"{label} must be at least {min_chars} character(s)")
-    if len(text) > max_chars:
-        raise UnsafeContent(f"{label} must be at most {max_chars} characters")
-
     for pattern, explanation in _RULES:
         if pattern.search(text):
             raise UnsafeContent(f"{label} {explanation}")
@@ -362,34 +390,38 @@ def safe_identifier(raw: Any, label: str) -> str:
     """
     if not isinstance(raw, str):
         raise UnsafeContent(f"{label} must be a string")
-    text = raw.strip()
-    if not _IDENTIFIER_RE.match(text):
+    # Not trimmed. The advertised pattern anchors at both ends, so `" item "`
+    # is invalid there; silently accepting it here would mean the schema and
+    # the builder disagreeing about the same string.
+    if not _IDENTIFIER_RE.match(raw):
         raise UnsafeContent(
-            f"{label} must be 1-64 characters of lowercase letters, digits, '-' or '_'"
+            f"{label} must be 1-64 characters of lowercase letters, digits, '-' or '_', "
+            "with no surrounding spaces"
         )
-    return text
+    return raw
 
 
 def safe_locale(raw: Any, label: str) -> str:
     """Validate a language tag: ``en``, ``pt-BR``, ``zh-Hant-TW``."""
     if not isinstance(raw, str):
         raise UnsafeContent(f"{label} must be a string")
-    text = raw.strip()
-    if not _LOCALE_RE.match(text):
+    if not _LOCALE_RE.match(raw):
         raise UnsafeContent(
-            f"{label} must be a language tag such as 'en', 'pt-BR', or 'zh-Hant-TW'"
+            f"{label} must be a language tag such as 'en', 'pt-BR', or 'zh-Hant-TW', "
+            "with no surrounding spaces"
         )
-    return text
+    return raw
 
 
 def safe_date(raw: Any, label: str) -> str:
     """Validate a publication date as ``YYYY``, ``YYYY-MM``, or ``YYYY-MM-DD``."""
     if not isinstance(raw, str):
         raise UnsafeContent(f"{label} must be a string")
-    text = raw.strip()
-    if not _DATE_RE.match(text):
-        raise UnsafeContent(f"{label} must be a date as YYYY, YYYY-MM, or YYYY-MM-DD")
-    return text
+    if not _DATE_RE.match(raw):
+        raise UnsafeContent(
+            f"{label} must be a date as YYYY, YYYY-MM, or YYYY-MM-DD, with no surrounding spaces"
+        )
+    return raw
 
 
 def serialized_size(value: Any) -> int:
@@ -425,28 +457,41 @@ def tokens(text: str) -> list[str]:
     return re.findall(r"\w+", unicodedata.normalize("NFC", text).casefold(), flags=re.UNICODE)
 
 
-#: Separators an author might scatter between an answer's characters to hide
-#: it in plain sight — ``P.a.r.i.s`` for ``Paris``. Two at most, so that two
-#: unrelated words are not read as one obfuscated one.
-_SEPARATED_GAP = r"[\W_]{0,2}"
+def spelled_out_pattern(answer: str) -> re.Pattern[str] | None:
+    r"""A regex matching *answer* written with separators between its characters.
 
+    ``Paris`` becomes ``\bP[\W_]*a[\W_]*r[\W_]*i[\W_]*s\b``, which catches
+    ``P.a.r.i.s``, ``P-----a-----r-----i-----s``, ``P a r i s`` and
+    ``P·a·r·i·s`` alike. The run between characters is **unbounded on
+    purpose**: any fixed limit is a number an author can simply exceed, and
+    the previous two-separator cap was defeated by typing three dots.
 
-def separated_spelling_pattern(answer: str) -> re.Pattern[str] | None:
-    """A regex matching *answer* spelled out with separators between letters.
+    Unbounded is still safe, because the run may contain only non-word
+    characters. It cannot cross a letter or a digit, so ``Na`` does not match
+    inside ``national`` and two unrelated words cannot be read as one
+    obfuscated one. Word boundaries are anchored at each end whenever the
+    answer starts or ends with a word character.
 
-    ``Paris`` becomes ``\\bP[\\W_]{0,2}a[\\W_]{0,2}r…s\\b``, which catches
-    ``P.a.r.i.s``, ``P-a-r-i-s`` and ``P a r i s`` while still requiring word
-    boundaries at both ends — so ``Na`` does not match inside ``national``.
-
-    Returns ``None`` when the rule does not apply: purely numeric answers
-    (``4.2`` is a different number from ``42``, not an obfuscation of it) and
-    answers too short for the pattern to mean anything.
+    Returns ``None`` where the rule would say nothing useful: fewer than two
+    significant characters, or an answer that is only digits — ``4.2`` is a
+    different number from ``42``, not a disguise for it.
     """
-    characters = re.findall(r"\w", unicodedata.normalize("NFKC", answer).casefold())
-    if len(characters) < 3 or not any(character.isalpha() for character in characters):
+    characters = [
+        character
+        for character in unicodedata.normalize("NFKC", answer).casefold()
+        if not character.isspace()
+    ]
+    if len(characters) < 2:
         return None
-    body = _SEPARATED_GAP.join(re.escape(character) for character in characters)
-    return re.compile(rf"\b{body}\b", re.IGNORECASE)
+    if all(character.isdigit() for character in characters):
+        return None
+    if any(character.isalnum() for character in characters) and len(characters) < 3:
+        return None
+
+    body = r"[\W_]*".join(re.escape(character) for character in characters)
+    prefix = r"\b" if characters[0].isalnum() else ""
+    suffix = r"\b" if characters[-1].isalnum() else ""
+    return re.compile(rf"{prefix}{body}{suffix}", re.IGNORECASE)
 
 
 def symbol_form(text: str) -> str:

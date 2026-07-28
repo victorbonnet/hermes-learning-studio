@@ -97,6 +97,16 @@ def test_the_new_modules_exist_to_be_scanned():
         ("google api key", "Use AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ012345 for maps"),
         ("slack app token", "Use xapp-1-ABCDEFGHIJKLMNOP for the socket"),
         ("huggingface token", "Use hf_ABCDEFGHIJKLMNOPQRSTUVWXYZ01 to download"),
+        # Bypasses found in the final adversarial review.
+        ("long top-level domain", "Visit example.museum for the archive"),
+        ("uncommon top-level domain", "Visit malware.tech today"),
+        ("one-letter scheme", "Use x:payload now"),
+        ("two-letter scheme", "Open ms:settings here"),
+        ("path after a bracket", "Open (/etc/passwd) now"),
+        ("path after a straight quote", 'Open "/etc/hosts" now'),
+        ("path after a typographic quote", "Open “/etc/shadow” now"),
+        ("bracketed ipv6 with a port", "Connect to [::1]:8080/admin"),
+        ("bracketed ipv6 alone", "Connect to [2001:db8::1] first"),
     ],
 )
 def test_unsafe_content_is_refused_in_a_prompt(label: str, text: str):
@@ -128,6 +138,18 @@ def test_unsafe_content_is_refused_in_a_prompt(label: str, text: str):
         "The basic idea is that pressure and volume vary inversely",
         "A secret ballot is one where nobody can see how you voted",
         "Compare the mean and the median of the data set",
+        # Near misses for the rules tightened in the final review. Ordinary
+        # punctuation must not turn prose into a locator.
+        "He said “the answer is four” loudly",
+        "Use the (correct) form of the verb",
+        "The interval [1:2] is half-open",
+        "Node.js and index.md are both file names",
+        "U.S.A. was formed in 1776",
+        "e.g. i.e. and etc. are abbreviations",
+        "Chapter 3: the aftermath",
+        "The ratio 3:4 applies here",
+        "Meet at 12:30 sharp",
+        "Solve for x: the value is 7",
     ],
 )
 def test_ordinary_content_is_not_mistaken_for_an_attack(text: str):
@@ -294,6 +316,8 @@ def test_the_new_modules_import_only_the_standard_library_and_this_package():
     """A dependency here would be installed into every Hermes environment."""
     allowed = {
         "__future__",
+        "collections",
+        "contextlib",
         "dataclasses",
         "typing",
         "json",

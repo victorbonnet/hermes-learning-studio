@@ -291,13 +291,19 @@ def test_a_confirmation_claim_is_recorded_as_unconfirmed(hermes_home: Path):
     accepted = result["outcome"]["memory_candidates"]["accepted"]
     assert len(accepted) == 1
     assert accepted[0]["confirmation_state"] == "unconfirmed"
+    assert accepted[0]["origin"] == "model_proposed"
 
     downgraded = result["outcome"]["memory_candidates"]["downgraded"]
-    assert downgraded[0]["claimed"] == "learner_confirmed"
+    assert downgraded[0]["claimed"]["origin"] == "confirmed_long_term_goal"
+    assert downgraded[0]["recorded"]["origin"] == "model_proposed"
     assert "cannot verify" in downgraded[0]["reason"]
 
-    stored = service.get_context(principal=LEARNER, include_memory_candidates=True)
-    assert stored["memory_candidates"][0]["confirmation_state"] == "unconfirmed"
+    # The truthful provenance survives the round trip to SQLite and back.
+    stored = service.get_context(principal=LEARNER, include_memory_candidates=True)[
+        "memory_candidates"
+    ][0]
+    assert stored["confirmation_state"] == "unconfirmed"
+    assert stored["origin"] == "model_proposed"
 
 
 def test_a_replacement_must_name_a_proposal_that_exists(hermes_home: Path):

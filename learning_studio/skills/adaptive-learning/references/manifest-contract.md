@@ -31,11 +31,14 @@ these are rejected wherever they appear:
   with or without its trailing semicolon;
 - URLs and URIs of any scheme, including `mailto:`, `ftp:` and `file:`;
 - bare web addresses such as `www.example.com` or `example.com/page`;
-- filesystem paths — `/etc/hosts`, `/secret.txt`, `/secret`, `./notes`,
-  `../up`, `~/notes`, `C:\Users`, `\\server\share`. A leading slash is a
-  path, so a slash-command is written as "the help command", not `/help`;
-- hosts and addresses — `example.fr/path`, `sub.example.com`,
-  `192.168.1.1/admin`, `localhost:8080/admin`;
+- filesystem paths — `/etc/hosts`, `/secret`, `./notes`, `../up`, `~/notes`,
+  `C:\Users`, `\\server\share` — however they are wrapped, including
+  `(/etc/passwd)` and `"/secret"`. A leading slash is a path, so a
+  slash-command is written as "the help command", not `/help`;
+- hosts and addresses — `example.fr/path`, `example.museum`,
+  `sub.example.com`, `192.168.1.1/admin`, `localhost:8080/admin`,
+  `[::1]:8080/admin`;
+- any URI scheme, one letter upwards: `x:payload` as much as `mailto:`;
 - credential-shaped values — `api_key=…`, `password: …`, `Authorization:
   Basic …`, bearer tokens, and current prefixed token shapes;
 - invisible and bidirectional characters.
@@ -141,14 +144,18 @@ for you:
   cloze gaps, short answers, translations, corrections, recall cues, flashcard
   backs, reference solutions, grid cells. The whole visible half is compared,
   three ways: as a token sequence, so `H2O` in "Type H2O" is caught and `Na`
-  does not match inside "national"; as a separated spelling, so `P.a.r.i.s`
-  does not hide `Paris`; and as a symbol string, so an answer of `+` or `===`
-  cannot be printed in its own prompt. Selection components are exempt: their
-  key is an option id, and the option text is meant to be read.
+  does not match inside "national"; as a spelled-out form with any run of
+  separators between the characters, so `P.a.r.i.s`, `P...a...r...i...s` and
+  `P-----a-----r-----i-----s` are all `Paris`; and as a symbol string, so an
+  answer of `+` or `===` cannot be printed in its own prompt. Selection
+  components are exempt: their key is an option id, and the option text is
+  meant to be read.
 - **A refusal never quotes what it is protecting.** Errors name the field —
-  `answer.accepted` — and never the value. Nothing this tool returns will
-  quote an answer, a rubric, a hint, or a note, including when one of them is
-  the reason for the refusal.
+  `answer.accepted` — and never the value. That holds for whole-manifest
+  checks too: an invalid branch target is reported as "component X has an
+  incorrect branch whose go_to is not a component of this experience", never
+  by naming the target. Nothing this tool returns will quote an answer, a
+  rubric, a hint, a note, or a branch target.
 - **Release hints one at a time**, and send feedback in response to an attempt
   rather than alongside the question.
 
@@ -184,9 +191,11 @@ A few types carry their own rules:
 - **`categorization`** — every item assigned exactly once, no category twice
   for one item, and one category per item unless `allow_multiple` is set.
   Several *items* may share a category; that is what grouping is.
-- **`error_correction`** — `error_count`, if given, equals the number of
-  corrections; each corrected phrase appears in the passage; each correction
-  changes something.
+- **`error_correction`** — each correction resolves to a *distinct place* in
+  the passage. `error_count`, if given, equals the number of distinct places;
+  each corrected phrase appears there; each changes something. `are` and
+  `are.` are the same place and are refused; a word that genuinely occurs
+  twice may be corrected twice.
 - **`feedback.per_option`** — each entry must name an option this component
   has, and no option twice.
 
@@ -254,17 +263,16 @@ list — there is no free-text field:
 `transcript`, `text_alternatives`, `visual_description`, `keyboard_only`,
 `reduced_motion`, `no_time_limit`, `extended_time`, `plain_language`.
 
-`source` is `confirmed_track` or `profile_config`, and **the claim is verified
-against that source**: a `confirmed_track` claim against that track's confirmed
-context, `profile_config` against the operator's configuration. Naming a source
-that says nothing is refused, and there is no value meaning "I inferred it".
+`source` is `profile_config`, and **the claim is verified against the
+operator's configuration**. Naming a source that says nothing is refused, and
+there is no value meaning "I inferred it".
 
-`explicit_request` is deliberately absent. It was checked against the
-learner's temporary context — a row *the agent* had written earlier — so it
-amounted to the model authorising itself. Hermes exposes no per-request
-accessibility signal to check instead, so the source is gone rather than
-faked. A session-only need is honoured in conversation and not recorded on
-the exercise.
+`explicit_request` and `confirmed_track` are both deliberately absent. Each was
+checked against a row the *agent* had written — a temporary context in one
+case, a confirmed track and its context in the other — so each amounted to the
+model authorising itself, one turn apart or in the same call. Hermes exposes no
+signal to check instead, so the sources are gone rather than faked. A session
+need is honoured in conversation and not recorded on the exercise.
 
 **The experience must be able to deliver what it declares.** `keyboard_only`
 alongside a hotspot, labelling, matching or drag-ordering component is refused

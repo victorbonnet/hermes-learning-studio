@@ -169,7 +169,7 @@ def test_migrations_are_contiguous_and_the_version_is_the_last_one():
     versions = [m.version for m in storage.MIGRATIONS]
 
     assert versions == list(range(1, len(versions) + 1))
-    assert storage.SCHEMA_VERSION == versions[-1] == 4
+    assert storage.SCHEMA_VERSION == versions[-1] == 5
 
 
 def test_migration_two_adds_the_column():
@@ -316,9 +316,10 @@ def test_the_candidate_round_trips_after_the_upgrade(hermes_home: Path):
     candidate = stored["memory_candidates"][0]
 
     assert candidate["statement"] == "Prefers worked examples first"
-    assert candidate["origin"] == "explicit_durable_preference"
-    # Claimed as confirmed, recorded as unconfirmed: nothing in the call can
-    # show that the learner agreed, so the row does not say that they did.
+    # Claimed as an explicit durable preference and confirmed by the learner;
+    # recorded as what can actually be shown, which is that a model proposed
+    # it. Both halves are downgraded, not just the confirmation flag.
+    assert candidate["origin"] == "model_proposed"
     assert candidate["confirmation_state"] == "unconfirmed"
     assert candidate["created_at"] and candidate["updated_at"]
 
@@ -917,3 +918,258 @@ def test_a_supported_database_is_still_configured_normally(hermes_home: Path):
     with storage.connect() as conn:
         assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+# ── The exact v4 → v5 upgrade ─────────────────────────────────────────────
+
+
+def _build_v4_database() -> None:
+    """Create a database at schema version 4 — the state the last commit left."""
+    _build_database_at(4)
+
+
+def _candidate_under_v4() -> str:
+    """Seed a candidate row the way schema 4 stored one.
+
+    Written with SQL rather than through ``save_context``: the service is the
+    *current* code, and inserting through it would write an ``expires_at`` a
+    v4 database has no column for. What a v4 profile actually holds is a row
+    without that column, which is what this creates.
+    """
+    _build_v4_database()
+    now = "2026-01-01T00:00:00+00:00"
+    with storage.connect() as conn:
+        conn.execute(
+            "INSERT INTO learners"
+            " (id, profile_id, principal_digest, platform, created_at, updated_at)"
+            " VALUES ('L4', 'default', 'digest-4', 'telegram', ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO memory_candidates"
+            " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
+            "  origin, evidence_count, confidence, durability, confirmation_state,"
+            "  recommended_action, replaces, consent_reference, consented_need,"
+            "  created_at, updated_at)"
+            " VALUES ('MC-v4', 'L4', 'default', NULL, 'durable_preference',"
+            " 'Carried across the upgrade', 'Said so directly', 'repeated_evidence', 5,"
+            " 'medium', 'durable', 'unconfirmed', 'add', NULL, NULL, NULL, ?, ?)",
+            (now, now),
+        )
+        conn.commit()
+    return "MC-v4"
+
+
+def test_a_v4_database_reports_version_4_without_the_expiry_column(hermes_home: Path):
+    _build_v4_database()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 4
+        assert "expires_at" not in _columns(conn, "memory_candidates")
+
+
+def test_initialize_upgrades_a_v4_database_to_the_current_version(hermes_home: Path):
+    _build_v4_database()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+        assert "expires_at" in _columns(conn, "memory_candidates")
+
+
+def test_the_v4_upgrade_preserves_candidates(hermes_home: Path):
+    candidate_id = _candidate_under_v4()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM memory_candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+
+    assert row is not None, "the candidate was lost in the upgrade"
+    assert row["statement"] == "Carried across the upgrade"
+    # Pre-existing rows are durable: an expiry cannot be invented for them.
+    assert row["expires_at"] is None
+
+
+def test_the_v4_upgrade_is_idempotent(hermes_home: Path):
+    _candidate_under_v4()
+
+    storage.initialize()
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+        assert conn.execute("SELECT COUNT(*) AS n FROM memory_candidates").fetchone()["n"] == 1
+
+
+def test_migration_five_uses_only_ordinary_statements(hermes_home: Path):
+    fifth = next(m for m in storage.MIGRATIONS if m.version == 5)
+
+    assert all(isinstance(statement, str) for statement in fifth.statements)
+    assert "executescript" not in " ".join(fifth.statements).lower()
+
+
+def test_migrations_one_to_four_were_not_edited_by_the_rebuild(hermes_home: Path):
+    """Applied history stays byte-for-byte, however many rebuilds follow."""
+    for version in (1, 2, 3, 4):
+        body = " ".join(next(m for m in storage.MIGRATIONS if m.version == version).statements)
+        assert "_v5" not in body, f"migration {version} was edited by the v5 rebuild"
+
+
+def test_a_failing_migration_five_rolls_back_completely(hermes_home: Path, monkeypatch):
+    candidate_id = _candidate_under_v4()
+
+    real = list(storage.MIGRATIONS)
+    monkeypatch.setattr(
+        storage,
+        "MIGRATIONS",
+        [
+            *real[:4],
+            storage.Migration(version=5, statements=(*real[4].statements, "THIS IS NOT SQL")),
+        ],
+    )
+
+    with pytest.raises(storage.MigrationError):
+        storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 4
+        row = conn.execute(
+            "SELECT statement FROM memory_candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        objects = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+
+    assert row is not None, "the candidate was lost by a rolled-back migration"
+    assert not any(name.endswith("_v5") for name in objects), "a scratch table survived"
+
+
+def test_two_callers_upgrading_a_v4_database_both_succeed(hermes_home: Path):
+    _build_v4_database()
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def upgrade() -> None:
+        try:
+            barrier.wait(timeout=5)
+            storage.initialize()
+        except BaseException as exc:  # noqa: BLE001 - recorded and asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=upgrade) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == [], f"concurrent upgrade failed: {errors}"
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+
+
+# ── Deleting a track no longer breaks its candidates ──────────────────────
+
+
+def test_deleting_a_track_with_an_attached_candidate_succeeds(hermes_home: Path):
+    """v4 raised ``NOT NULL constraint failed: memory_candidates.learner_id``.
+
+    The composite key used ``ON DELETE SET NULL``, which tried to null the
+    owner columns as well as ``track_id``.
+    """
+    track_id = service.save_context(principal=LEARNER, track={"name": "Doomed", "confirmed": True})[
+        "outcome"
+    ]["track"]["track_id"]
+    service.save_context(
+        principal=LEARNER,
+        memory_candidates=[
+            {
+                "category": "durable_preference",
+                "statement": "About the doomed track",
+                "evidence_summary": "Said so",
+                "origin": "repeated_evidence",
+                "evidence_count": 5,
+                "track_id": track_id,
+            }
+        ],
+    )
+
+    with storage.connect() as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
+        conn.commit()
+
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM memory_candidates").fetchone()["n"] == 0
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_an_unattached_candidate_survives_a_track_deletion(hermes_home: Path):
+    """Only the track's own proposals go with it."""
+    track_id = service.save_context(principal=LEARNER, track={"name": "Doomed", "confirmed": True})[
+        "outcome"
+    ]["track"]["track_id"]
+    for extra in ({"track_id": track_id}, {}):
+        service.save_context(
+            principal=LEARNER,
+            memory_candidates=[
+                {
+                    "category": "durable_preference",
+                    "statement": f"Candidate {'with' if extra else 'without'} a track",
+                    "evidence_summary": "Said so",
+                    "origin": "repeated_evidence",
+                    "evidence_count": 5,
+                    **extra,
+                }
+            ],
+        )
+
+    with storage.connect() as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
+        conn.commit()
+
+    remaining = service.get_context(principal=LEARNER, include_memory_candidates=True)[
+        "memory_candidates"
+    ]
+    assert [c["statement"] for c in remaining] == ["Candidate without a track"]
+    assert remaining[0]["track_id"] is None
+
+
+def test_deleting_a_learner_still_cascades_to_their_candidates(hermes_home: Path):
+    service.save_context(
+        principal=LEARNER,
+        memory_candidates=[
+            {
+                "category": "durable_preference",
+                "statement": "Anything",
+                "evidence_summary": "Said so",
+                "origin": "repeated_evidence",
+                "evidence_count": 5,
+            }
+        ],
+    )
+
+    with storage.connect() as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM learners")
+        conn.commit()
+
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM memory_candidates").fetchone()["n"] == 0
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_every_historical_version_upgrades_and_passes_a_foreign_key_check(
+    hermes_home: Path, version: int
+):
+    _build_database_at(version)
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

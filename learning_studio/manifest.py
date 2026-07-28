@@ -28,6 +28,8 @@ the enforced one are the same object.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +51,7 @@ from .components import (
     build_component,
     object_schema,
     validate_object,
+    without_hidden_data_across,
 )
 from .models import OBJECTIVE_TEXT_MAX, Provenance
 from .safety import UnsafeContent, serialized_size
@@ -109,23 +112,24 @@ TEXT_ALTERNATIVES = "text_alternatives"
 VISUAL_DESCRIPTION = "visual_description"
 NO_TIME_LIMIT = "no_time_limit"
 
-#: Where accessibility metadata on an exercise may come from.
+#: Where accessibility metadata on an exercise may come from. One source.
 #:
-#: Two sources, not three. ``explicit_request`` was here, and it could not
-#: stay: what it checked was a context row the model had written in an earlier
-#: call, so "the learner asked for this" was authorised by the model's own
-#: previous assertion. Hermes supplies no per-request accessibility signal to
-#: check instead, so the source is gone rather than faked.
+#: ``explicit_request`` went first: it was checked against a context row the
+#: model had written in an earlier call, so the model was authorising itself
+#: across two turns. ``confirmed_track`` went the same way for the same
+#: reason, one turn shorter — ``track.confirmed: true``, the consent
+#: statement, and the need are all fields of a single tool call the model
+#: composes, so a "confirmed track" carrying an accommodation is a claim about
+#: a claim. Restricting the value to a fixed vocabulary stops a diagnosis
+#: being written down; it does not make the learner's agreement true.
 #:
-#: What remains is genuinely outside the model's control: an operator's
-#: configuration file, and a confirmed track whose stored value can only be
-#: one of the fixed accommodation tokens. A session-only need is still
-#: honoured — in conversation, and through ``current_request`` — it simply
-#: cannot be recorded on the exercise.
-ACCESSIBILITY_SOURCES: tuple[str, ...] = (
-    Provenance.CONFIRMED_TRACK.value,
-    Provenance.PROFILE_CONFIG.value,
-)
+#: What is left is the operator's ``config.yaml`` — a file a person edits,
+#: which no tool call can reach.
+#:
+#: A learner's accessibility need is still honoured in full: pass it in
+#: ``current_request`` and the Studio applies it to that call. What cannot
+#: happen is a durable record claiming they agreed to have it kept.
+ACCESSIBILITY_SOURCES: tuple[str, ...] = (Provenance.PROFILE_CONFIG.value,)
 
 
 class ManifestError(ValueError):
@@ -340,14 +344,21 @@ def build_manifest(raw: Any) -> Manifest:
         )
 
     components = _build_components(raw.get("components"))
-    validate_branching(components)
 
-    accessibility = validated.get("accessibility", {})
-    validate_accessibility_support(
-        tuple(accessibility.get("accommodations", ())),
-        components,
-        validated.get("delivery", {}),
-    )
+    # Cross-component validation happens inside the scrub, not outside it.
+    # Component-level checks are redacted where they are raised, but a branch
+    # target lives in one component's ``evaluation`` and is validated against
+    # *all* of them — so an invalid ``go_to`` used to travel back to the
+    # caller verbatim, past every per-component guard.
+    with _hidden_data_withheld(raw.get("components")):
+        validate_branching(components)
+
+        accessibility = validated.get("accessibility", {})
+        validate_accessibility_support(
+            tuple(accessibility.get("accommodations", ())),
+            components,
+            validated.get("delivery", {}),
+        )
 
     references = tuple(validated.get("source_references", []))
 
@@ -377,6 +388,22 @@ def build_manifest(raw: Any) -> Manifest:
         }
     )
     return manifest
+
+
+@contextmanager
+def _hidden_data_withheld(components: Any) -> Iterator[None]:
+    """Redact evaluator-only values from any error raised inside the block.
+
+    Applied across the whole component list, because whole-manifest checks
+    compare one component's hidden fields against another's visible ones and
+    an error can therefore name either.
+    """
+    try:
+        yield
+    except ManifestError as exc:
+        raise ManifestError(
+            without_hidden_data_across(str(exc), components, "this experience")
+        ) from None
 
 
 def _check_size(payload: Any) -> None:
@@ -460,9 +487,12 @@ def _check_branch_shape(component: Component, known: set[str]) -> None:
             )
         seen.add(condition)
         if target not in known:
+            # The target itself is evaluator-only — which component a wrong
+            # answer leads to is part of the answer — so the message names the
+            # branch, not where it points.
             raise ManifestError(
-                f"component '{component.id}' branches to '{target}', which is not a "
-                "component of this experience"
+                f"component '{component.id}' has an '{condition}' branch whose go_to is "
+                "not a component of this experience"
             )
         if target == component.id:
             raise ManifestError(f"component '{component.id}' branches to itself")

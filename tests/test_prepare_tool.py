@@ -623,4 +623,191 @@ def test_a_confirmation_claim_comes_back_labelled_truthfully(hermes_home, gatewa
 
     accepted = result["outcome"]["memory_candidates"]["accepted"]
     assert accepted[0]["confirmation_state"] == "unconfirmed"
-    assert result["outcome"]["memory_candidates"]["downgraded"][0]["claimed"] == "learner_confirmed"
+    assert accepted[0]["origin"] == "model_proposed"
+
+    downgraded = result["outcome"]["memory_candidates"]["downgraded"][0]
+    assert downgraded["claimed"] == {
+        "origin": "confirmed_long_term_goal",
+        "confirmation_state": "learner_confirmed",
+    }
+    assert downgraded["recorded"] == {
+        "origin": "model_proposed",
+        "confirmation_state": "unconfirmed",
+    }
+
+
+# ── Whole-manifest errors are scrubbed too ────────────────────────────────
+
+
+def test_a_dangling_branch_target_is_not_echoed(hermes_home, gateway_session):
+    """Cross-component validation runs after the per-component scrub.
+
+    A ``go_to`` lives in one component's ``evaluation`` and is checked against
+    every other component, so its error used to travel back to the caller
+    verbatim — past every guard that only looked at one component at a time.
+    Which component a wrong answer leads to is part of the answer.
+    """
+    component = example("multiple_choice", id="one")
+    component["evaluation"]["branching"] = [{"on": "incorrect", "go_to": "secret-answer-route"}]
+
+    result = call(manifest=manifest([component, example("short_answer", id="two")]))
+
+    assert result["ok"] is False
+    assert "secret-answer-route" not in json.dumps(result)
+    assert "one" in result["error"], "the component is still named"
+
+
+def test_a_cross_component_error_still_names_the_components(hermes_home, gateway_session):
+    """The scrub must not withhold ordinary structural errors.
+
+    A component id is visible wherever it appears, so naming component
+    ``two`` in an error about component ``one`` discloses nothing.
+    """
+    first = example("multiple_choice", id="one")
+    first["evaluation"]["branching"] = [
+        {"on": "correct", "go_to": "two"},
+        {"on": "incorrect", "go_to": "two"},
+    ]
+    second = example("short_answer", id="two")
+    second["evaluation"]["branching"] = [
+        {"on": "correct", "go_to": "one"},
+        {"on": "incorrect", "go_to": "one"},
+    ]
+
+    result = call(manifest=manifest([first, second]))
+
+    assert result["ok"] is False
+    assert "can never reach the end" in result["error"]
+    assert "one" in result["error"] and "two" in result["error"]
+
+
+def test_no_canary_survives_a_cross_component_failure(hermes_home, gateway_session):
+    first = example("multiple_choice", id="one")
+    first["evaluation"]["branching"] = [{"on": "always", "go_to": "two"}]
+    second = example("short_answer", id="two")
+    second["evaluation"]["branching"] = [{"on": "always", "go_to": "one"}]
+    body = manifest([first, second])
+
+    result = call(manifest=body)
+
+    assert result["ok"] is False
+    blob = json.dumps(result)
+    for canary in hidden_canaries(body):
+        assert canary not in blob
+
+
+def test_an_obfuscated_answer_refusal_reveals_nothing(hermes_home, gateway_session):
+    result = call(
+        manifest=manifest(
+            [
+                example(
+                    "short_answer",
+                    prompt="Type P...a...r...i...s with no dots.",
+                    answer={"accepted": ["Paris"]},
+                )
+            ]
+        )
+    )
+
+    assert result["ok"] is False
+    assert "Paris" not in json.dumps(result)
+
+
+# ── The exploit, through the real handlers ────────────────────────────────
+
+
+def test_a_model_written_confirmed_track_cannot_authorise_accessibility(
+    hermes_home, gateway_session
+):
+    """The reported exploit, end to end, through the tools an agent calls."""
+    from learning_studio import storage
+
+    saved = json.loads(
+        tools.handle_save_context(
+            {
+                "track": {
+                    "name": "Claimed track",
+                    "confirmed": True,
+                    "context": {"accessibility_needs": ["captions"]},
+                },
+                "accessibility_consent": {
+                    "consent_statement": "remember captions",
+                    "needs": ["captions"],
+                },
+            }
+        )
+    )
+    assert saved["ok"] is True
+    track_id = saved["outcome"]["track"]["track_id"]
+
+    # No durable accessibility row, and no confirmed provenance claim.
+    with storage.connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM context_values WHERE field = 'accessibility_needs'"
+        ).fetchall()
+    assert rows == []
+
+    # And the manifest cannot launder the assertion.
+    result = call(
+        manifest=manifest(
+            accessibility={"source": "confirmed_track", "accommodations": ["captions"]}
+        ),
+        track_id=track_id,
+    )
+    assert result["ok"] is False
+    assert "must be one of" in result["error"]
+
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM experiences").fetchone()["n"] == 0
+
+
+def test_a_forged_withdrawal_is_recorded_as_a_model_proposal(hermes_home, gateway_session):
+    result = json.loads(
+        tools.handle_save_context(
+            {
+                "memory_candidates": [
+                    {
+                        "category": "durable_preference",
+                        "statement": "No longer wants spaced repetition",
+                        "evidence_summary": "Allegedly withdrew",
+                        "origin": "explicit_withdrawal",
+                        "confirmation_state": "learner_declined",
+                    }
+                ]
+            }
+        )
+    )
+
+    accepted = result["outcome"]["memory_candidates"]["accepted"][0]
+    assert accepted["origin"] == "model_proposed"
+    assert accepted["confirmation_state"] == "unconfirmed"
+
+    stored = json.loads(tools.handle_get_context({"include_memory_candidates": True}))
+    assert stored["memory_candidates"][0]["origin"] == "model_proposed"
+
+
+def test_a_session_candidate_is_returned_but_not_stored(hermes_home, gateway_session):
+    result = json.loads(
+        tools.handle_save_context(
+            {
+                "memory_candidates": [
+                    {
+                        "category": "durable_preference",
+                        "statement": "A note for this conversation only",
+                        "evidence_summary": "Said so",
+                        "origin": "repeated_evidence",
+                        "evidence_count": 5,
+                        "durability": "session",
+                    }
+                ]
+            }
+        )
+    )
+
+    assert result["outcome"]["memory_candidates"]["accepted"] == []
+    returned = result["outcome"]["memory_candidates"]["returned_not_stored"]
+    assert returned[0]["stored"] is False
+    assert "no session-scoped store" in returned[0]["reason"]
+
+    stored = json.loads(tools.handle_get_context({"include_memory_candidates": True}))
+    assert stored["memory_candidates"] == []

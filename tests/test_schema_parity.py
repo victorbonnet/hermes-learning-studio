@@ -363,3 +363,85 @@ def test_the_runtime_stays_stricter_where_it_has_to_be(library_validator):
     assert not rejected_by_library(library_validator, arguments)
     with pytest.raises(ManifestError, match="does not declare"):
         build_manifest(arguments["manifest"])
+
+
+# ── Trimming: one policy, both sides ──────────────────────────────────────
+#
+# Runtime helpers used to trim before measuring, so a title 200 characters
+# long plus four spaces was refused by the advertised schema and accepted by
+# ``build_manifest``. The same value, two answers, depending which door it
+# came through. Nothing is trimmed now: what is sent is what is checked.
+
+TRIMMING_CASES: list[tuple[str, dict]] = [
+    ("overlong raw title with trailing padding", manifest_with(title="T" * 200 + "    ")),
+    ("padded component identifier", {"manifest": manifest([example("true_false", id=" item ")])}),
+    ("padded locale", manifest_with(ui_locale=" en ")),
+    (
+        "padded date",
+        manifest_with(source_references=[{"title": "A book", "published_on": " 2019 "}]),
+    ),
+    (
+        "padded nested identifier",
+        {"manifest": manifest([example("multi_select", answer={"option_ids": [" flares "]})])},
+    ),
+    (
+        "title that is only padding",
+        manifest_with(title="    "),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "arguments"), TRIMMING_CASES, ids=[label for label, _ in TRIMMING_CASES]
+)
+def test_padding_is_refused_by_the_schema_and_the_builder_alike(
+    label, arguments, library_validator
+):
+    assert rejected_by_library(library_validator, arguments), (
+        f"the advertised schema accepts {label}"
+    )
+    assert rejected_by_runtime(arguments), f"the plugin's validator accepts {label}"
+    with pytest.raises(ManifestError):
+        build_manifest(arguments["manifest"])
+
+
+def test_an_unpadded_value_at_the_exact_bound_is_accepted(library_validator):
+    """The limit is a limit, not a trap: 200 characters is still 200."""
+    arguments = manifest_with(title="T" * 200)
+
+    assert not rejected_by_library(library_validator, arguments)
+    assert not rejected_by_runtime(arguments)
+    assert build_manifest(arguments["manifest"]).title == "T" * 200
+
+
+def test_internal_whitespace_is_untouched(library_validator):
+    """Only surrounding padding is refused; ordinary text is left alone."""
+    arguments = manifest_with(title="A  spaced   title")
+
+    assert not rejected_by_library(library_validator, arguments)
+    assert build_manifest(arguments["manifest"]).title == "A  spaced   title"
+
+
+# ── Locator rules stay runtime-only, and are stated as such ───────────────
+
+
+@pytest.mark.parametrize(
+    ("label", "prompt"),
+    [
+        ("long top-level domain", "Visit example.museum for the archive"),
+        ("one-letter scheme", "Use x:payload now"),
+        ("path after a bracket", "Open (/etc/passwd) now"),
+        ("path after a typographic quote", "Open “/etc/hosts” now"),
+        ("bracketed ipv6", "Connect to [::1]:8080/admin"),
+    ],
+)
+def test_locator_rules_are_enforced_by_the_builder(label, prompt):
+    with pytest.raises(ManifestError):
+        build_manifest(manifest([example("true_false", prompt=prompt)]))
+
+
+def test_the_error_correction_span_rule_is_documented_not_advertised():
+    """JSON Schema cannot express "distinct occurrence in the passage"."""
+    blob = json.dumps(PARAMETERS).lower()
+
+    assert "each gap written as" in blob or "placeholder" in blob

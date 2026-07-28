@@ -1085,3 +1085,191 @@ def test_a_correction_of_text_that_is_not_in_the_passage_is_refused():
 
     with pytest.raises(ComponentError, match="nothing to correct"):
         build_component(payload, "component")
+
+
+# ── Obfuscation with unbounded separator runs ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("component_type", "overrides"),
+    [
+        (
+            "short_answer",
+            {"prompt": "Type P...a...r...i...s with no dots.", "answer": {"accepted": ["Paris"]}},
+        ),
+        (
+            "short_answer",
+            {
+                "prompt": "Spell it P-----a-----r-----i-----s here.",
+                "answer": {"accepted": ["Paris"]},
+            },
+        ),
+        (
+            "short_answer",
+            {"prompt": "Write P _ a _ r _ i _ s out.", "answer": {"accepted": ["Paris"]}},
+        ),
+        (
+            "short_answer",
+            {"prompt": "Type P·a·r·i·s exactly.", "answer": {"accepted": ["Paris"]}},
+        ),
+        (
+            "short_answer",
+            {"prompt": "Enter =.=.= but omit the dots.", "answer": {"accepted": ["==="]}},
+        ),
+        (
+            "typed_recall",
+            {"content": {"cue": "It is H..2..O"}, "answer": {"accepted": ["H2O"]}},
+        ),
+        (
+            "flashcard",
+            {
+                "content": {"front": "The reading is y-a-m-a"},
+                "answer": {"back": "yama"},
+            },
+        ),
+    ],
+)
+def test_a_separator_run_of_any_length_is_still_a_leak(component_type, overrides):
+    """The old rule capped the run at two, which three dots defeated."""
+    with pytest.raises(ComponentError, match="already readable"):
+        build(component_type, **overrides)
+
+
+def test_the_obfuscation_refusal_does_not_quote_the_answer():
+    with pytest.raises(ComponentError) as refusal:
+        build(
+            "short_answer",
+            prompt="Type P...a...r...i...s with no dots.",
+            answer={"accepted": ["Paris"]},
+        )
+
+    assert "Paris" not in str(refusal.value)
+
+
+@pytest.mark.parametrize(
+    ("component_type", "overrides"),
+    [
+        # The separator run may not cross a word character, so an answer
+        # cannot be assembled out of unrelated words.
+        (
+            "typed_recall",
+            {"content": {"cue": "Pack a rack in Silesia"}, "answer": {"accepted": ["Paris"]}},
+        ),
+        (
+            "typed_recall",
+            {"content": {"cue": "The national anthem"}, "answer": {"accepted": ["Na"]}},
+        ),
+        (
+            "short_answer",
+            {"prompt": "Explain what is different here.", "answer": {"accepted": ["if"]}},
+        ),
+        (
+            "short_answer",
+            {"prompt": "The mean was 4.2 overall.", "answer": {"accepted": ["42"]}},
+        ),
+        (
+            "short_answer",
+            {"prompt": "Which city is the capital of France?", "answer": {"accepted": ["Paris"]}},
+        ),
+    ],
+)
+def test_separator_matching_does_not_cross_word_characters(component_type, overrides):
+    assert build(component_type, **overrides).type == component_type
+
+
+# ── Corrections must claim distinct source spans ──────────────────────────
+
+
+def correcting(text: str, count, corrections):
+    payload = example("error_correction", prompt="Correct the passage.")
+    payload["content"] = {"text": text}
+    if count is not None:
+        payload["content"]["error_count"] = count
+    payload["answer"] = {"corrections": corrections}
+    return payload
+
+
+def test_two_corrections_of_the_same_occurrence_are_rejected():
+    """``are`` and ``are.`` are one word in one place once punctuation goes."""
+    payload = correcting(
+        "They are ready.",
+        2,
+        [
+            {"incorrect": "are", "correct": "was-ready"},
+            {"incorrect": "are.", "correct": "became-ready"},
+        ],
+    )
+
+    with pytest.raises(ComponentError, match="no other correction has already claimed"):
+        build_component(payload, "component")
+
+
+@pytest.mark.parametrize(
+    "second",
+    ["are.", "ARE", "“are”", "are,", "  are  "],
+)
+def test_punctuation_case_and_spacing_do_not_create_a_second_span(second: str):
+    payload = correcting(
+        "They are ready.",
+        2,
+        [
+            {"incorrect": "are", "correct": "was-ready"},
+            {"incorrect": second, "correct": "became-ready"},
+        ],
+    )
+
+    with pytest.raises(ComponentError):
+        build_component(payload, "component")
+
+
+def test_a_word_that_genuinely_appears_twice_may_be_corrected_twice():
+    payload = correcting(
+        "The the cat sat on the mat.",
+        2,
+        [
+            {"incorrect": "the", "correct": "a-first"},
+            {"incorrect": "the", "correct": "a-second"},
+        ],
+    )
+
+    assert build_component(payload, "component").type == "error_correction"
+
+
+def test_two_genuinely_different_spans_are_accepted():
+    payload = correcting(
+        "They are ready and they are set.",
+        2,
+        [
+            {"incorrect": "They are ready", "correct": "They were ready"},
+            {"incorrect": "they are set", "correct": "they were set"},
+        ],
+    )
+
+    assert build_component(payload, "component").type == "error_correction"
+
+
+def test_the_error_count_is_the_number_of_distinct_spans():
+    payload = correcting(
+        "They are ready.",
+        2,
+        [{"incorrect": "are", "correct": "were"}],
+    )
+
+    with pytest.raises(ComponentError, match="distinct place"):
+        build_component(payload, "component")
+
+
+def test_a_span_mismatch_does_not_quote_the_correction():
+    payload = correcting(
+        "They are ready.",
+        2,
+        [
+            {"incorrect": "are", "correct": "was-ready"},
+            {"incorrect": "are.", "correct": "became-ready"},
+        ],
+    )
+
+    with pytest.raises(ComponentError) as refusal:
+        build_component(payload, "component")
+
+    assert "became-ready" not in str(refusal.value)

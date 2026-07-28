@@ -75,7 +75,7 @@ def test_a_manifest_may_carry_every_optional_field():
                 }
             ],
             accessibility={
-                "source": "confirmed_track",
+                "source": "profile_config",
                 "accommodations": ["captions", "no_time_limit"],
             },
             delivery={"mode": "practice", "allow_back": True, "time_limit_seconds": 0},
@@ -303,8 +303,11 @@ def test_a_branch_to_a_component_that_does_not_exist_is_rejected():
         example("short_answer", id="two"),
     ]
 
-    with pytest.raises(ManifestError, match="not a component of this experience"):
+    with pytest.raises(ManifestError, match="not a component of this experience") as refusal:
         build_manifest(manifest(components))
+
+    # The component is named; where its branch pointed is not.
+    assert "ghost" not in str(refusal.value)
 
 
 def test_a_branch_to_itself_is_rejected():
@@ -453,7 +456,7 @@ def test_accessibility_metadata_must_declare_where_it_came_from():
 
 def test_accessibility_metadata_must_name_what_it_asks_for():
     with pytest.raises(ManifestError, match="accommodations"):
-        build_manifest(manifest(accessibility={"source": "confirmed_track"}))
+        build_manifest(manifest(accessibility={"source": "profile_config"}))
 
 
 @pytest.mark.parametrize("source", ACCESSIBILITY_SOURCES)
@@ -473,9 +476,11 @@ def test_the_three_authoritative_sources_parse(source: str):
         Provenance.RECENT_EVIDENCE.value,
         Provenance.DEFAULT.value,
         Provenance.CONFIRMED_PREFERENCE.value,
-        # Removed as a source: it was authorised by a row the model itself
-        # wrote, so it proved nothing about what the learner asked for.
+        # Both removed as sources, and for the same reason: each was checked
+        # against a row the model itself had written, so it proved nothing
+        # about what the learner said.
         Provenance.EXPLICIT_REQUEST.value,
+        Provenance.CONFIRMED_TRACK.value,
         "guessed",
     ],
 )
@@ -493,15 +498,14 @@ def test_an_inferred_accessibility_source_is_rejected(source: str):
 def test_only_sources_outside_the_models_control_are_accepted():
     """A source the model can write into is not a source.
 
-    ``explicit_request`` used to be here and was checked against a context
-    row — which the model had written in an earlier call. What is left is an
-    operator's configuration file and a confirmed track whose stored value
-    can only be one of the fixed accommodation tokens.
+    ``explicit_request`` went first — checked against a context row the model
+    had written in an earlier call. ``confirmed_track`` followed, for the same
+    reason one turn shorter: ``track.confirmed``, the consent statement and
+    the need are all fields of a single call the model composes.
+
+    What is left is the operator's configuration file.
     """
-    assert set(ACCESSIBILITY_SOURCES) == {
-        Provenance.CONFIRMED_TRACK.value,
-        Provenance.PROFILE_CONFIG.value,
-    }
+    assert set(ACCESSIBILITY_SOURCES) == {Provenance.PROFILE_CONFIG.value}
 
 
 def test_an_unknown_accessibility_field_is_rejected():
@@ -509,7 +513,7 @@ def test_an_unknown_accessibility_field_is_rejected():
         build_manifest(
             manifest(
                 accessibility={
-                    "source": "confirmed_track",
+                    "source": "profile_config",
                     "accommodations": ["captions"],
                     "diagnosis": "dyslexia",
                 }
@@ -532,7 +536,7 @@ def test_there_is_no_free_text_field_in_accessibility_metadata():
 def test_an_accommodation_outside_the_vocabulary_is_rejected(accommodation: str):
     with pytest.raises(ManifestError, match="must be one of"):
         build_manifest(
-            manifest(accessibility={"source": "confirmed_track", "accommodations": [accommodation]})
+            manifest(accessibility={"source": "profile_config", "accommodations": [accommodation]})
         )
 
 
@@ -648,7 +652,16 @@ def test_a_branch_forward_past_a_component_is_allowed():
 
 
 def accessible(*accommodations: str) -> dict:
-    return {"source": "confirmed_track", "accommodations": list(accommodations)}
+    """Manifest accessibility metadata, from the one authoritative source.
+
+    ``profile_config`` is the only one left: it is a file an operator edits,
+    which no tool call can reach. These tests exercise the *shape* rules —
+    whether the components can deliver what is declared — so they need only a
+    well-formed source. Whether the configuration actually holds the
+    accommodation is checked in ``test_accessibility_provenance.py``, through
+    the service.
+    """
+    return {"source": "profile_config", "accommodations": list(accommodations)}
 
 
 @pytest.mark.parametrize(

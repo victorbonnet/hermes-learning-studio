@@ -410,36 +410,43 @@ from over 140 KB. That is the price of a schema that refuses what the runtime
 refuses; a future PR could trade it for a per-type lookup tool if the prompt
 cost proves too high in practice.
 
-**Accessibility metadata is authorised, not asserted.** An experience declares
-`accommodations` from a closed vocabulary — captions, transcript, text
-alternatives, visual description, keyboard-only, reduced motion, no time limit,
-extended time, plain language — and names the `source` each came from. Two
-sources exist, and both are outside the model's control: a confirmed track's
-own context, and the operator's configuration file. Matching is exact on the
-canonical form, with no fuzzy, substring, or semantic step.
+**Accessibility metadata has one authoritative source: the operator.** An
+experience declares `accommodations` from a closed vocabulary — captions,
+transcript, text alternatives, visual description, keyboard-only, reduced
+motion, no time limit, extended time, plain language — with
+`source: profile_config`, checked against the profile's `config.yaml`. Matching
+is exact on the canonical form, with no fuzzy, substring, or semantic step.
 
-`explicit_request` was a third source and has been removed. It was checked
-against the learner's temporary context — a row the model had written in an
-earlier call — so "the learner asked for this" was authorised by the model's
-own earlier assertion. Hermes exposes no per-request accessibility signal to
-check instead, so the source is gone rather than faked; a session-only need is
-honoured in conversation and not recorded on the exercise.
+Two other sources existed and were removed, both for the same reason.
+`explicit_request` was checked against the learner's temporary context — a row
+the model had written in an earlier call. `confirmed_track` was checked against
+a track's context, and one `save_context` call can create the track, set
+`confirmed: true`, write the context, and supply the consent that supposedly
+authorises it. A source a model can populate is not a source, so what remains
+is a file a person edits.
 
-**Nothing sensitive can become a durable record.** An `accessibility` memory
-candidate is refused however it is presented — confirmed, consented, exactly
-matched — because the consent statement, the needs it covers, the origin and
-the confirmation all arrive in the same tool call, written by the same model,
-and no host-supplied confirmation event exists to check them against. A gate
-whose every key is held by the party being checked is not a gate. What remains
-storable is one of the nine accommodation tokens on a confirmed track: a
-vocabulary that cannot express a fact about a person.
+**Nothing about a person is stored at all.** An accessibility need is never
+written to storage, whatever consent accompanies it, and an `accessibility`
+memory candidate is refused however it is presented. The consent statement, the
+need, the track flag, the origin and the confirmation all arrive in one tool
+call, written by one model, and Hermes exposes no confirmation event to check
+them against. A gate whose every key is held by the party being checked is not
+a gate. The need is honoured for the request that carries it, and the response
+says plainly that nothing was kept.
 
-**A confirmation the model asserts is recorded as unconfirmed.** Any candidate
-sent with `confirmation_state: learner_confirmed` is stored as `unconfirmed`,
-and the response reports the downgrade. The proposal is kept — the agent's
-reading of the conversation is real evidence — but a record months later will
-not claim the learner agreed when nobody can show that. A replacement or
+**What the model asserts about the learner is recorded as the model's
+proposal.** An `origin` claiming the learner stated, confirmed, corrected or
+withdrew something is stored as `model_proposed`, and
+`learner_confirmed`/`learner_declined` as `unconfirmed`, unless an owned record
+backs it — a confirmed long-term goal on a named track is the one case that
+does. `repeated_evidence` is stored as sent, because it reports the agent's own
+observation. Every downgrade is reported in the response. A replacement or
 removal must name a proposal already stored for that learner.
+
+**Candidate durability describes what actually happens.** `session` is returned
+and never written, because this plugin has only durable SQLite and no
+session-scoped store to be honest about. `short_term` is stored with an expiry
+and swept on the next read. `durable` is kept.
 
 There is deliberately **no free-text accessibility field** on the manifest. A
 box to type in is a box a diagnosis eventually gets typed into, and this

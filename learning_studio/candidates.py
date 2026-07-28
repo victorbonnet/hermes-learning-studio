@@ -46,13 +46,40 @@ class Category(StrEnum):
 
 
 class Origin(StrEnum):
-    """Where the proposal came from. Only these five may produce a candidate."""
+    """Where the proposal came from. Only these may produce a candidate.
+
+    Four of them describe something the *learner* did — said, corrected,
+    withdrew, confirmed — and the plugin cannot see any of it. They stay in
+    the vocabulary because they are how an agent describes what it observed,
+    but what gets *stored* is :data:`MODEL_PROPOSED` unless an owned record
+    backs the claim. See :data:`AUTHORITATIVE_ORIGINS`.
+    """
 
     EXPLICIT_DURABLE_PREFERENCE = "explicit_durable_preference"
     CONFIRMED_LONG_TERM_GOAL = "confirmed_long_term_goal"
     REPEATED_EVIDENCE = "repeated_evidence"
     EXPLICIT_CORRECTION = "explicit_correction"
     EXPLICIT_WITHDRAWAL = "explicit_withdrawal"
+    #: What the agent believes, recorded as the agent's belief. Never sent by
+    #: a caller — it is what an unverifiable claim becomes on the way to disk.
+    MODEL_PROPOSED = "model_proposed"
+
+
+#: Origins that assert the learner did something. None can be checked: the
+#: flag, the evidence summary and the statement are all written by the model
+#: in one call, and Hermes carries no confirmation event.
+#:
+#: ``repeated_evidence`` is deliberately absent. It claims nothing about the
+#: learner's words — it reports the agent's own observation across exercises,
+#: which is exactly what it is, so it is stored as sent.
+AUTHORITATIVE_ORIGINS: frozenset[Origin] = frozenset(
+    {
+        Origin.EXPLICIT_DURABLE_PREFERENCE,
+        Origin.CONFIRMED_LONG_TERM_GOAL,
+        Origin.EXPLICIT_CORRECTION,
+        Origin.EXPLICIT_WITHDRAWAL,
+    }
+)
 
 
 #: Categories carrying information about someone's health, disability, or
@@ -115,6 +142,14 @@ class ConfirmationState(StrEnum):
     UNCONFIRMED = "unconfirmed"
     LEARNER_CONFIRMED = "learner_confirmed"
     LEARNER_DECLINED = "learner_declined"
+
+
+#: Both of these say the learner reached a decision, and neither can be
+#: shown. A declined proposal is as much a claim about a person as a
+#: confirmed one — it records that they said no.
+AUTHORITATIVE_STATES: frozenset[ConfirmationState] = frozenset(
+    {ConfirmationState.LEARNER_CONFIRMED, ConfirmationState.LEARNER_DECLINED}
+)
 
 
 # ── Content boundaries ────────────────────────────────────────────────────

@@ -563,12 +563,88 @@ _MIGRATION_004 = (
 )
 
 
+# Version 5 rebuilds ``memory_candidates`` for two reasons.
+#
+# 1. **Track deletion was impossible.** The track foreign key used
+#    ``ON DELETE SET NULL`` over a composite that includes ``profile_id`` and
+#    ``learner_id``, both ``NOT NULL`` — so deleting a track that had a
+#    candidate attached raised ``NOT NULL constraint failed:
+#    memory_candidates.learner_id``. The same defect the experiences table had
+#    at v3, in a table the v4 rebuild did not touch.
+#
+#    The action is now ``CASCADE``. A candidate that names a track is a
+#    proposal *about that track's* work, so removing the track removes it;
+#    candidates with no track are untouched, because the child key is NULL and
+#    a composite foreign key with a NULL column is satisfied trivially.
+#
+# 2. **``short_term`` had no expiry.** A candidate labelled short-term was
+#    stored forever, which made the label a lie. ``expires_at`` is nullable —
+#    ``NULL`` means durable — and the service sets it for short-term rows and
+#    sweeps them on read.
+#
+# Rebuilt rather than altered because a foreign-key action cannot be changed
+# with ``ALTER TABLE``. Same shape as migration 4: build, copy, drop, rename,
+# all as ordinary statements inside the caller's transaction.
+_MIGRATION_005 = (
+    """
+    CREATE TABLE memory_candidates_v5 (
+        id                 TEXT PRIMARY KEY,
+        learner_id         TEXT NOT NULL,
+        profile_id         TEXT NOT NULL,
+        track_id           TEXT,
+        category           TEXT NOT NULL,
+        statement          TEXT NOT NULL,
+        evidence_summary   TEXT NOT NULL,
+        origin             TEXT NOT NULL,
+        evidence_count     INTEGER,
+        confidence         TEXT NOT NULL CHECK (confidence IN ('low', 'medium', 'high')),
+        durability         TEXT NOT NULL
+                           CHECK (durability IN ('session', 'short_term', 'durable')),
+        confirmation_state TEXT NOT NULL
+                           CHECK (confirmation_state IN (
+                               'unconfirmed', 'learner_confirmed', 'learner_declined'
+                           )),
+        recommended_action TEXT NOT NULL
+                           CHECK (recommended_action IN (
+                               'add', 'replace', 'remove', 'no_action'
+                           )),
+        replaces           TEXT,
+        consent_reference  TEXT,
+        consented_need     TEXT,
+        expires_at         TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        FOREIGN KEY (learner_id, profile_id)
+            REFERENCES learners (id, profile_id) ON DELETE CASCADE,
+        FOREIGN KEY (track_id, profile_id, learner_id)
+            REFERENCES tracks (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    INSERT INTO memory_candidates_v5
+        SELECT id, learner_id, profile_id, track_id, category, statement, evidence_summary,
+               origin, evidence_count, confidence, durability, confirmation_state,
+               recommended_action, replaces, consent_reference, consented_need,
+               NULL, created_at, updated_at
+          FROM memory_candidates
+    """,
+    "DROP TABLE memory_candidates",
+    "ALTER TABLE memory_candidates_v5 RENAME TO memory_candidates",
+    "CREATE INDEX idx_candidates_owner ON memory_candidates (profile_id, learner_id)",
+    """
+    CREATE INDEX idx_candidates_expiry
+        ON memory_candidates (profile_id, expires_at) WHERE expires_at IS NOT NULL
+    """,
+)
+
+
 #: Ordered, contiguous from 1. The list order is the application order.
 MIGRATIONS: list[Migration] = [
     Migration(version=1, statements=_MIGRATION_001),
     Migration(version=2, statements=_MIGRATION_002),
     Migration(version=3, statements=_MIGRATION_003),
     Migration(version=4, statements=_MIGRATION_004),
+    Migration(version=5, statements=_MIGRATION_005),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

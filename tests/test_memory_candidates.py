@@ -410,7 +410,7 @@ def test_the_response_says_the_need_was_not_stored(hermes_home: Path):
     )
 
     reason = result["outcome"]["not_stored"][0]["reason"]
-    assert "NOT stored" in reason
+    assert "never written to storage" in reason
     assert "current_request" in reason
 
 
@@ -435,51 +435,26 @@ def test_an_accessibility_need_is_honoured_through_the_current_request(hermes_ho
     assert resolved["provenance"] == "explicit_request"
 
 
-def test_a_consented_accommodation_token_is_stored(hermes_home: Path):
-    """Only the fixed vocabulary reaches storage, and only with consent.
+@pytest.mark.parametrize("need", ["captions", "captions on all audio", "ADHD"])
+def test_no_accessibility_need_is_ever_stored(hermes_home: Path, need: str):
+    """Not with consent, not from the fixed vocabulary, not at all.
 
-    "captions on all audio" is honoured for the session and never written
-    down; "captions" is a token that cannot express anything about a person,
-    so it can be. That restriction is what makes a diagnosis unstorable
-    through a consent-shaped argument rather than merely discouraged.
+    A vocabulary restriction stopped a *diagnosis* being written down, which
+    was worth having, but it never showed that the learner agreed to a durable
+    record — the consent statement and the need are written by the model in
+    the same call. So none of them is stored.
     """
     service.save_context(
         principal=LEARNER,
-        temporary_context={"accessibility_needs": ["captions"]},
+        temporary_context={"accessibility_needs": [need]},
         accessibility_consent={
-            "consent_statement": "please remember I need captions",
-            "needs": ["captions"],
+            "consent_statement": f"please remember I need {need}",
+            "needs": [need],
         },
-    )
-
-    result = service.get_context(principal=LEARNER)
-    assert result["temporary_context"]["accessibility_needs"]["value"] == ["captions"]
-
-
-def test_a_free_text_need_is_never_stored_even_with_consent(hermes_home: Path):
-    service.save_context(
-        principal=LEARNER,
-        temporary_context={"accessibility_needs": ["captions on all audio"]},
-        accessibility_consent=CONSENT,
     )
 
     result = service.get_context(principal=LEARNER)
     assert "accessibility_needs" not in result["temporary_context"]
-
-
-def test_a_diagnosis_cannot_be_stored_as_an_accessibility_need(hermes_home: Path):
-    """The vocabulary restriction, from the direction that matters."""
-    outcome = service.save_context(
-        principal=LEARNER,
-        temporary_context={"accessibility_needs": ["ADHD"]},
-        accessibility_consent={
-            "consent_statement": "remember I have ADHD",
-            "needs": ["ADHD"],
-        },
-    )["outcome"]
-
-    assert [entry["field"] for entry in outcome["not_stored"]] == ["accessibility_needs"]
-    assert "accessibility_needs" not in service.get_context(principal=LEARNER)["temporary_context"]
 
 
 def test_consent_for_one_need_does_not_store_a_different_one(hermes_home: Path):
@@ -548,3 +523,183 @@ def test_the_evidence_threshold_follows_configuration(hermes_home: Path):
     )
 
     assert "at least 5" in result["outcome"]["memory_candidates"]["rejected"][0]["reason"]
+
+
+# ── Durability labels describe what actually happens ──────────────────────
+
+
+def _proposal(**overrides):
+    payload = {
+        "category": "durable_preference",
+        "statement": "Prefers worked examples",
+        "evidence_summary": "Observed repeatedly",
+        "origin": "repeated_evidence",
+        "evidence_count": 5,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_a_session_candidate_is_never_inserted(hermes_home: Path):
+    """It used to be stored in SQLite and returned forever after."""
+    from learning_studio import storage
+
+    outcome = service.save_context(
+        principal=LEARNER, memory_candidates=[_proposal(durability="session")]
+    )["outcome"]["memory_candidates"]
+
+    assert outcome["accepted"] == []
+    assert outcome["returned_not_stored"][0]["durability"] == "session"
+
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM memory_candidates").fetchone()["n"] == 0
+
+
+def test_a_session_candidate_is_absent_from_a_later_read(hermes_home: Path):
+    service.save_context(principal=LEARNER, memory_candidates=[_proposal(durability="session")])
+
+    stored = service.get_context(principal=LEARNER, include_memory_candidates=True)
+    assert stored["memory_candidates"] == []
+
+
+def test_a_short_term_candidate_is_given_an_expiry(hermes_home: Path):
+    service.save_context(principal=LEARNER, memory_candidates=[_proposal(durability="short_term")])
+
+    candidate = service.get_context(principal=LEARNER, include_memory_candidates=True)[
+        "memory_candidates"
+    ][0]
+
+    assert candidate["durability"] == "short_term"
+    assert candidate["expires_at"], "a short-term candidate stored with no expiry"
+
+
+def test_an_expired_short_term_candidate_is_swept(hermes_home: Path):
+    """Simulated by moving the expiry into the past — a restart's worth of time."""
+    from learning_studio import storage
+
+    service.save_context(principal=LEARNER, memory_candidates=[_proposal(durability="short_term")])
+    with storage.connect() as conn:
+        conn.execute("UPDATE memory_candidates SET expires_at = '2020-01-01T00:00:00+00:00'")
+        conn.commit()
+
+    stored = service.get_context(principal=LEARNER, include_memory_candidates=True)
+
+    assert stored["memory_candidates"] == []
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM memory_candidates").fetchone()["n"] == 0
+
+
+def test_a_durable_candidate_has_no_expiry_and_survives(hermes_home: Path):
+    service.save_context(principal=LEARNER, memory_candidates=[_proposal(durability="durable")])
+
+    candidate = service.get_context(principal=LEARNER, include_memory_candidates=True)[
+        "memory_candidates"
+    ][0]
+
+    assert candidate["durability"] == "durable"
+    assert candidate["expires_at"] is None
+
+
+def test_an_expiry_sweep_does_not_touch_another_learners_rows(hermes_home: Path):
+    from learning_studio import storage
+
+    other = Principal(
+        profile="default", platform="telegram", user_id="9999", source="gateway_session"
+    )
+    service.save_context(principal=other, memory_candidates=[_proposal(durability="durable")])
+    service.save_context(principal=LEARNER, memory_candidates=[_proposal(durability="short_term")])
+    with storage.connect() as conn:
+        conn.execute(
+            "UPDATE memory_candidates SET expires_at = '2020-01-01T00:00:00+00:00'"
+            " WHERE durability = 'short_term'"
+        )
+        conn.commit()
+
+    service.get_context(principal=LEARNER, include_memory_candidates=True)
+
+    assert (
+        len(
+            service.get_context(principal=other, include_memory_candidates=True)[
+                "memory_candidates"
+            ]
+        )
+        == 1
+    )
+
+
+# ── Provenance is downgraded, not only confirmation ───────────────────────
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "explicit_durable_preference",
+        "confirmed_long_term_goal",
+        "explicit_correction",
+        "explicit_withdrawal",
+    ],
+)
+def test_an_authoritative_origin_becomes_a_model_proposal(hermes_home: Path, origin: str):
+    """Each of these asserts the learner did something nobody can verify."""
+    extra = {"recommended_action": "no_action"} if origin == "explicit_withdrawal" else {}
+    accepted = service.save_context(
+        principal=LEARNER,
+        memory_candidates=[
+            _proposal(origin=origin, evidence_count=1, statement=f"About {origin}", **extra)
+        ],
+    )["outcome"]["memory_candidates"]["accepted"]
+
+    assert accepted[0]["origin"] == "model_proposed"
+
+
+def test_repeated_evidence_is_stored_as_sent(hermes_home: Path):
+    """It reports the agent's own observation, which is exactly what it is."""
+    accepted = service.save_context(
+        principal=LEARNER, memory_candidates=[_proposal(origin="repeated_evidence")]
+    )["outcome"]["memory_candidates"]["accepted"]
+
+    assert accepted[0]["origin"] == "repeated_evidence"
+
+
+def test_a_goal_backed_by_an_owned_confirmed_track_keeps_its_origin(hermes_home: Path):
+    """The one claim with a stored record behind it rather than a flag."""
+    track_id = service.save_context(
+        principal=LEARNER, track={"name": "Surgery", "confirmed": True}
+    )["outcome"]["track"]["track_id"]
+
+    accepted = service.save_context(
+        principal=LEARNER,
+        memory_candidates=[
+            _proposal(
+                category="long_term_goal",
+                statement="Become a surgeon",
+                origin="confirmed_long_term_goal",
+                track_id=track_id,
+            )
+        ],
+    )["outcome"]["memory_candidates"]["accepted"]
+
+    assert accepted[0]["origin"] == "confirmed_long_term_goal"
+
+
+def test_another_learners_track_cannot_back_a_goal(hermes_home: Path):
+    other = Principal(
+        profile="default", platform="telegram", user_id="9998", source="gateway_session"
+    )
+    track_id = service.save_context(principal=other, track={"name": "Surgery", "confirmed": True})[
+        "outcome"
+    ]["track"]["track_id"]
+
+    # Refused as an ownership failure, before provenance is even considered.
+    with pytest.raises(service.NotFoundError):
+        service.save_context(
+            principal=LEARNER,
+            memory_candidates=[
+                _proposal(
+                    category="long_term_goal",
+                    statement="Become a surgeon",
+                    origin="confirmed_long_term_goal",
+                    track_id=track_id,
+                )
+            ],
+        )

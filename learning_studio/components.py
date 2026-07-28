@@ -53,7 +53,7 @@ from .safety import (
     safe_identifier,
     safe_locale,
     safe_text,
-    separated_spelling_pattern,
+    spelled_out_pattern,
     symbol_form,
     text_pattern,
     tokens,
@@ -1620,6 +1620,35 @@ _ECHOABLE = frozenset(
 )
 
 
+def without_hidden_data_across(message: str, components: Any, path: str) -> str:
+    """Scrub a whole-manifest error against every component at once.
+
+    Visibility is a property of the *manifest*, not of one component: a
+    component id is visible wherever it appears, so naming component ``two``
+    in an error about component ``one`` discloses nothing. Scrubbing
+    component-by-component would treat every other component's id as hidden
+    and withhold ordinary structural errors.
+    """
+    if not isinstance(components, list):
+        return message
+
+    visible = {
+        value.casefold()
+        for component in components
+        if isinstance(component, dict)
+        for key in LEARNER_VISIBLE_KEYS
+        for value in _all_strings(component.get(key))
+    }
+    message_tokens = tokens(message)
+    for component in components:
+        for value in _hidden_strings(component):
+            if value.casefold() in visible:
+                continue
+            if _appears_in(value, message, message_tokens):
+                return _withheld(path)
+    return message
+
+
 def _without_hidden_data(message: str, raw: Any, path: str) -> str:
     """Replace an error that quotes evaluator-only content with a safe one.
 
@@ -1633,12 +1662,15 @@ def _without_hidden_data(message: str, raw: Any, path: str) -> str:
     message_tokens = tokens(message)
     for value in _hidden_strings(raw):
         if _appears_in(value, message, message_tokens):
-            return (
-                f"{path} was refused, and the reason quotes evaluator-only content, so it "
-                "has been withheld. Check the component's answer and evaluation against "
-                "the schema."
-            )
+            return _withheld(path)
     return message
+
+
+def _withheld(path: str) -> str:
+    return (
+        f"{path} was refused, and the reason quotes evaluator-only content, so it has been "
+        "withheld. Check the component's answer and evaluation against the schema."
+    )
 
 
 #: Below this length a hidden value is indistinguishable from ordinary
@@ -1896,33 +1928,55 @@ def _check_categorization(content: dict[str, Any], answer: dict[str, Any], path:
 
 
 def _check_error_correction(content: dict[str, Any], answer: dict[str, Any], path: str) -> None:
-    """The stated number of errors must be the number the key actually fixes.
+    """Each correction must claim a real, distinct place in the passage.
 
-    A learner told to find two errors, in a passage whose key holds one, is
-    being marked against a question nobody can answer correctly.
+    Resolved to a *span* — a range of token positions in the passage — rather
+    than compared as strings. Two entries reading ``are`` and ``are.`` are the
+    same word in the same place once punctuation is normalised away, and a
+    string comparison that normalises differently from the occurrence search
+    lets both through: the learner is told to find two errors where there is
+    one, and one of the two can never be marked correct.
+
+    Spans are claimed in order, so a word that genuinely appears twice can be
+    corrected twice — the second entry takes the second occurrence.
     """
     corrections = answer.get("corrections", [])
-    declared = content.get("error_count")
-    if declared is not None and declared != len(corrections):
-        raise ComponentError(
-            f"{path}.content.error_count says {declared}, but the answer defines "
-            f"{len(corrections)} correction(s). They must be the same number."
-        )
+    passage = tokens(content.get("text", ""))
+    claimed: set[int] = set()
 
-    seen: set[str] = set()
     for index, correction in enumerate(corrections):
         where = f"{path}.answer.corrections[{index}]"
-        wrong = " ".join(correction["incorrect"].split()).casefold()
-        if wrong in seen:
-            raise ComponentError(f"{where} corrects the same text twice")
-        seen.add(wrong)
-        if wrong == " ".join(correction["correct"].split()).casefold():
+        wrong = tokens(correction["incorrect"])
+        if not wrong:
+            raise ComponentError(f"{where}.incorrect must name the text to be corrected")
+        if wrong == tokens(correction["correct"]):
             raise ComponentError(f"{where} leaves the text unchanged, so there is nothing to fix")
-        if not contains_token_sequence(tokens(content.get("text", "")), tokens(wrong)):
+
+        span = _first_unclaimed_span(passage, wrong, claimed)
+        if span is None:
             raise ComponentError(
-                f"{where}.incorrect does not appear in content.text, so the learner has "
-                "nothing to correct"
+                f"{where}.incorrect does not appear in content.text at a place no other "
+                "correction has already claimed, so the learner has nothing to correct there"
             )
+        claimed.add(span)
+
+    declared = content.get("error_count")
+    if declared is not None and declared != len(claimed):
+        raise ComponentError(
+            f"{path}.content.error_count says {declared}, but the answer corrects "
+            f"{len(claimed)} distinct place(s) in the passage. They must be the same number."
+        )
+
+
+def _first_unclaimed_span(passage: list[str], wrong: list[str], claimed: set[int]) -> int | None:
+    """The start index of the first occurrence of *wrong* nobody has taken."""
+    span = len(wrong)
+    for start in range(len(passage) - span + 1):
+        if start in claimed:
+            continue
+        if passage[start : start + span] == wrong:
+            return start
+    return None
 
 
 #: Per-type checks that need to see the whole component at once.
@@ -2051,14 +2105,15 @@ def _is_readable(
 ) -> bool:
     """True when *answer* can be read off the visible half, by any of the three rules."""
     answer_tokens = tokens(answer)
-    if answer_tokens:
-        if contains_token_sequence(visible_tokens, answer_tokens):
-            return True
-        separated = separated_spelling_pattern(answer)
-        return bool(separated and separated.search(visible))
+    if answer_tokens and contains_token_sequence(visible_tokens, answer_tokens):
+        return True
 
     symbols = symbol_form(answer)
-    return bool(symbols) and symbols in visible_symbols
+    if not answer_tokens and symbols and symbols in visible_symbols:
+        return True
+
+    spelled = spelled_out_pattern(answer)
+    return bool(spelled and spelled.search(visible))
 
 
 def _leak_surface(spec: ComponentSpec, component: Component) -> dict[str, Any]:

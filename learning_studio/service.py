@@ -230,41 +230,32 @@ class AccessibilityConsent:
 
 
 def _consent_allows(field: str, value: Any, consent: AccessibilityConsent | None) -> bool:
-    """True when this exact value may be written to disk.
+    """Whether this value may be written to disk. For a need, never.
 
-    Two conditions, and the second is what stops a diagnosis reaching storage
-    through a consent-shaped argument. Consent is written by the model, so on
-    its own it proves nothing; what the *vocabulary* proves is that whatever
-    gets stored is one of nine fixed accommodation tokens, none of which can
-    express a fact about somebody's health. Any other need is honoured for the
-    session and never written down.
+    The vocabulary restriction that used to sit here stopped a *diagnosis*
+    from being stored — a real gain — but it never answered the question it
+    appeared to. ``accessibility_consent`` is written by the model, in the
+    same call as the need it authorises, and so is ``track.confirmed``. One
+    request could therefore create a row reading ``accessibility_needs =
+    captions, provenance = confirmed_track, confirmed = 1``, and a later
+    manifest could cite that row as proof the learner had agreed. Nothing
+    outside the model was involved at any point.
+
+    Hermes exposes no consent event to check against, so the honest answer is
+    that this plugin cannot record an accessibility need at all. It is
+    honoured for the call that carries it, and nowhere else.
     """
-    if field not in SESSION_ONLY_FIELDS:
-        return True
-    if consent is None or not consent.covers(value):
-        return False
-    return _is_accommodation_vocabulary(value)
-
-
-def _is_accommodation_vocabulary(value: Any) -> bool:
-    from .manifest import ACCOMMODATIONS
-    from .models import normalize_need
-
-    values = value if isinstance(value, list) else [value]
-    try:
-        return all(normalize_need(item) in ACCOMMODATIONS for item in values)
-    except ValueError:  # pragma: no cover - values are validated before this
-        return False
+    del consent, value
+    return field not in SESSION_ONLY_FIELDS
 
 
 SESSION_ONLY_NOT_STORED = (
-    "Accessibility needs are session-only: this was honoured for the current request but "
-    "NOT stored, and will not be available in a later call. Pass it in current_request each "
-    "session. The only values that can be stored at all are the fixed accommodation tokens "
-    "(captions, transcript, text_alternatives, visual_description, keyboard_only, "
-    "reduced_motion, no_time_limit, extended_time, plain_language), on a confirmed track, "
-    "with accessibility_consent naming that exact token. Nothing describing a person is "
-    "storable through this tool."
+    "Accessibility needs are session-only and are never written to storage. This one was "
+    "honoured for the current request and will not be available in a later call: pass it in "
+    "current_request each session. There is no argument that changes this. Consent, a "
+    "confirmed track, and the need itself are all things you write in the same call, so "
+    "none of them can show that the learner agreed to a durable record, and this plugin "
+    "will not create one that says otherwise."
 )
 
 
@@ -696,6 +687,7 @@ def get_context(
     with storage.connect(config) as conn:
         with storage.transaction(conn):
             purge_expired(conn, profile)
+            purge_expired_candidates(conn, profile)
 
         learner_id = _find_learner(conn, principal)
         if learner_id is None:
@@ -883,6 +875,7 @@ def _candidates_json(
             "replaces": row["replaces"],
             "consent_reference": row["consent_reference"],
             "consented_need": row["consented_need"],
+            "expires_at": row["expires_at"],
             "track_id": row["track_id"],
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
@@ -929,6 +922,7 @@ def save_context(
     storage.initialize(config)
     with storage.connect(config) as conn, storage.transaction(conn):
         purge_expired(conn, profile)
+        purge_expired_candidates(conn, profile)
         learner_id = _get_or_create_learner(conn, principal)
 
         track_row = _save_track(conn, profile, learner_id, track, config, outcome, consent)
@@ -1481,7 +1475,12 @@ def _save_candidates(
             )
             continue
 
-        recorded_state = _recorded_confirmation(candidate, outcome, proposal)
+        recorded_origin, recorded_state = _recorded_provenance(
+            conn, profile, learner_id, candidate, outcome, proposal
+        )
+        expires_at = _candidate_expiry(candidate, config, outcome, proposal)
+        if expires_at is _NOT_STORED:
+            continue
         candidate_id = _new_id()
         timestamp = _now()
         conn.execute(
@@ -1489,8 +1488,8 @@ def _save_candidates(
             " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
             "  origin, evidence_count, confidence, durability, confirmation_state,"
             "  recommended_action, replaces, consent_reference, consented_need,"
-            "  created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  expires_at, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 candidate_id,
                 learner_id,
@@ -1499,7 +1498,7 @@ def _save_candidates(
                 candidate.category.value,
                 candidate.statement,
                 candidate.evidence_summary,
-                candidate.origin.value,
+                recorded_origin.value,
                 candidate.evidence_count,
                 candidate.confidence.value,
                 candidate.durability.value,
@@ -1508,13 +1507,16 @@ def _save_candidates(
                 candidate.replaces,
                 candidate.consent_reference,
                 candidate.consented_need,
+                expires_at,
                 timestamp,
                 timestamp,
             ),
         )
         accepted = candidate.to_json()
+        accepted["origin"] = recorded_origin.value
         accepted["confirmation_state"] = recorded_state.value
         accepted["candidate_id"] = candidate_id
+        accepted["expires_at"] = expires_at
         outcome["memory_candidates"]["accepted"].append(accepted)
 
 
@@ -1530,32 +1532,84 @@ def _save_candidates(
 #: The proposal is still stored — it is useful, and the agent's own reading of
 #: the conversation is real evidence — but labelled for what it is.
 CONFIRMATION_NOT_VERIFIABLE = (
-    "Stored as 'unconfirmed'. This plugin cannot verify that a learner confirmed anything: "
-    "the confirmation flag, the origin and the evidence all come from you, in this call, and "
-    "Hermes supplies no confirmation event to check them against. The proposal is kept — "
-    "labelled truthfully — so that a later reader is not told the learner agreed when nobody "
-    "can show that they did."
+    "Recorded as a model proposal. This plugin cannot verify that a learner said, confirmed, "
+    "corrected, or withdrew anything: the origin, the confirmation flag and the evidence all "
+    "come from you, in this call, and Hermes supplies no confirmation event to check them "
+    "against. The proposal is kept — labelled truthfully — so that a later reader is not told "
+    "the learner agreed when nobody can show that they did."
 )
 
 
-def _recorded_confirmation(
-    candidate: Any, outcome: dict[str, Any], proposal: dict[str, Any]
-) -> Any:
-    """The confirmation state actually written, which is never a claim of consent."""
-    from .candidates import ConfirmationState
+def _recorded_provenance(
+    conn: sqlite3.Connection,
+    profile: str,
+    learner_id: str,
+    candidate: Any,
+    outcome: dict[str, Any],
+    proposal: dict[str, Any],
+) -> tuple[Any, Any]:
+    """The origin and confirmation state actually written down.
 
-    if candidate.confirmation_state is not ConfirmationState.LEARNER_CONFIRMED:
-        return candidate.confirmation_state
+    Downgrading only the confirmation state left the row still *claiming*
+    authority: ``origin = confirmed_long_term_goal`` beside
+    ``confirmation_state = unconfirmed`` reads as "the learner confirmed this
+    long-term goal, we just have not ticked the box". Both halves say
+    something about the learner, so both are checked.
 
-    outcome["memory_candidates"].setdefault("downgraded", []).append(
-        {
-            "statement": _safe_echo(proposal.get("statement")),
-            "claimed": ConfirmationState.LEARNER_CONFIRMED.value,
-            "recorded": ConfirmationState.UNCONFIRMED.value,
-            "reason": CONFIRMATION_NOT_VERIFIABLE,
-        }
+    One claim can be backed: ``confirmed_long_term_goal`` on a track this
+    learner owns and confirmed. The track is itself created from a model
+    flag, so it is not proof the learner spoke — but it *is* an owned,
+    previously stored record rather than a value invented in this call, and it
+    is the supporting record the goal is about. Everything else becomes
+    ``model_proposed`` and ``unconfirmed``.
+    """
+    from .candidates import (
+        AUTHORITATIVE_ORIGINS,
+        AUTHORITATIVE_STATES,
+        ConfirmationState,
+        Origin,
     )
-    return ConfirmationState.UNCONFIRMED
+
+    origin = candidate.origin
+    state = candidate.confirmation_state
+    supported = _has_supporting_track(conn, profile, learner_id, candidate)
+
+    recorded_origin = origin
+    if origin in AUTHORITATIVE_ORIGINS and not (
+        origin is Origin.CONFIRMED_LONG_TERM_GOAL and supported
+    ):
+        recorded_origin = Origin.MODEL_PROPOSED
+
+    recorded_state = state
+    if state in AUTHORITATIVE_STATES and not supported:
+        recorded_state = ConfirmationState.UNCONFIRMED
+
+    if recorded_origin is not origin or recorded_state is not state:
+        outcome["memory_candidates"].setdefault("downgraded", []).append(
+            {
+                "statement": _safe_echo(proposal.get("statement")),
+                "claimed": {"origin": origin.value, "confirmation_state": state.value},
+                "recorded": {
+                    "origin": recorded_origin.value,
+                    "confirmation_state": recorded_state.value,
+                },
+                "reason": CONFIRMATION_NOT_VERIFIABLE,
+            }
+        )
+    return recorded_origin, recorded_state
+
+
+def _has_supporting_track(
+    conn: sqlite3.Connection, profile: str, learner_id: str, candidate: Any
+) -> bool:
+    """True when the proposal names a track this learner owns and confirmed."""
+    if not candidate.track_id:
+        return False
+    row = conn.execute(
+        "SELECT status FROM tracks WHERE id = ? AND profile_id = ? AND learner_id = ?",
+        (candidate.track_id, profile, learner_id),
+    ).fetchone()
+    return row is not None and str(row["status"]) == TrackStatus.ACTIVE.value
 
 
 def _check_replacement_target(
@@ -1588,6 +1642,70 @@ def _check_replacement_target(
             "existing statement exactly, or propose this as a new candidate instead of a "
             "replacement — a change to a record nobody can find is not a change."
         )
+
+
+#: Sentinel meaning "do not write this row at all".
+_NOT_STORED = object()
+
+#: What ``durability`` actually does, now that it does something.
+#:
+#: ``session`` was the plain lie: a candidate labelled session-scoped was
+#: inserted into SQLite and came back on every later call, forever. There is
+#: no trustworthy per-session store here — a "session" this plugin could key
+#: on would be another model-supplied string — so the honest implementation is
+#: to return the proposal in the response and write nothing.
+#:
+#: ``short_term`` now expires, on the same window as temporary context, and
+#: expired rows are swept before any read. ``durable`` is unchanged.
+DURABILITY_NOT_STORED = (
+    "Returned to you, and deliberately not stored. A 'session' candidate is scoped to this "
+    "conversation, and this plugin has no session-scoped store to put it in — only durable "
+    "SQLite. Keep it in the conversation, or propose it as 'short_term' if it should outlive "
+    "the call."
+)
+
+
+def _candidate_expiry(
+    candidate: Any, config: LearningStudioConfig, outcome: dict[str, Any], proposal: dict[str, Any]
+) -> Any:
+    """When this candidate stops being readable, or the not-stored sentinel."""
+    from .candidates import Durability
+
+    if candidate.durability is Durability.SESSION:
+        entry = candidate.to_json()
+        entry["stored"] = False
+        entry["reason"] = DURABILITY_NOT_STORED
+        outcome["memory_candidates"].setdefault("returned_not_stored", []).append(entry)
+        return _NOT_STORED
+
+    if candidate.durability is Durability.SHORT_TERM:
+        return (datetime.now(UTC) + timedelta(hours=config.temporary_context_ttl_hours)).isoformat()
+
+    return None
+
+
+def purge_expired_candidates(conn: sqlite3.Connection, profile: str, limit: int = 500) -> int:
+    """Delete short-term candidates whose window has closed.
+
+    Profile-wide and bounded, exactly as :func:`purge_expired` is, and for the
+    same reason: the learner whose proposal expired is the one who has not
+    come back, so a per-learner sweep would never reach it.
+    """
+    rows = conn.execute(
+        "SELECT id FROM memory_candidates"
+        " WHERE profile_id = ? AND expires_at IS NOT NULL AND expires_at <= ?"
+        " LIMIT ?",
+        (profile, _now(), limit),
+    ).fetchall()
+    if not rows:
+        return 0
+    ids = [str(row["id"]) for row in rows]
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute(
+        f"DELETE FROM memory_candidates WHERE id IN ({placeholders}) AND profile_id = ?",
+        (*ids, profile),
+    )
+    return len(ids)
 
 
 def _safe_echo(value: Any) -> str:
@@ -1825,64 +1943,7 @@ def _recorded_needs(
     if source == Provenance.PROFILE_CONFIG.value:
         return canonical(config.profile_context.get("accessibility_needs", []))
 
-    if source == Provenance.CONFIRMED_TRACK.value:
-        if track_id is None:
-            return set()
-        # Writable, not merely owned: a track the learner archived or withdrew
-        # is one they said they were finished with, and its context is not a
-        # live statement of what they need.
-        try:
-            _writable_track(conn, profile, learner_id, track_id)
-        except ServiceError:
-            return set()
-        context = _track_context(conn, profile, learner_id, track_id)
-        if context is None:
-            return set()
-        return _needs_in_context(conn, profile, learner_id, str(context["id"]), CONFIRMED_SOURCES)
-
     return set()  # pragma: no cover - the enum admits nothing else
-
-
-#: Provenances that count as the learner having confirmed a need on a track,
-#: and as their having asked for one outright. Both are drawn from PR 03's
-#: vocabulary rather than restated, so the precedence rules stay one thing.
-CONFIRMED_SOURCES: frozenset[str] = frozenset(
-    {
-        Provenance.CONFIRMED_TRACK.value,
-        Provenance.EXPLICIT_REQUEST.value,
-        Provenance.EXPLICIT_CORRECTION.value,
-        Provenance.CONFIRMED_PREFERENCE.value,
-    }
-)
-
-
-def _needs_in_context(
-    conn: sqlite3.Connection,
-    profile: str,
-    learner_id: str,
-    context_id: str,
-    provenances: frozenset[str],
-) -> set[str]:
-    """Recorded accessibility needs in one context, from trusted provenances."""
-    from .models import normalize_need
-
-    rows = conn.execute(
-        "SELECT value, provenance FROM context_values"
-        " WHERE context_id = ? AND field = 'accessibility_needs'"
-        "   AND profile_id = ? AND learner_id = ?",
-        (context_id, profile, learner_id),
-    ).fetchall()
-
-    found: set[str] = set()
-    for row in rows:
-        if str(row["provenance"]) not in provenances:
-            continue
-        for item in decode_value("accessibility_needs", str(row["value"])):
-            try:
-                found.add(normalize_need(item))
-            except ValueError:  # pragma: no cover - stored values are validated
-                continue
-    return found
 
 
 def _insert_experience(
