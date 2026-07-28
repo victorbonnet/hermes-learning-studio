@@ -251,10 +251,9 @@ learning_studio:
   # memory candidate (2–50).
   memory_candidate_min_evidence: 3
 
-  # Operator policy, not consent. Accessibility needs are session-only by
-  # default regardless; this only decides whether they *may* be stored
-  # durably when a learner explicitly asks. Set false on a shared or managed
-  # profile to refuse even on request.
+  # Deprecated compatibility switch. Accessibility is never stored. True
+  # accepts and validates the old accessibility_consent audit payload for the
+  # response only; false rejects that payload. Neither value permits storage.
   allow_durable_accessibility_needs: true
 
   # Longest single context value, in characters (80–20000).
@@ -437,11 +436,12 @@ says plainly that nothing was kept.
 **What the model asserts about the learner is recorded as the model's
 proposal.** An `origin` claiming the learner stated, confirmed, corrected or
 withdrew something is stored as `model_proposed`, and
-`learner_confirmed`/`learner_declined` as `unconfirmed`, unless an owned record
-backs it — a confirmed long-term goal on a named track is the one case that
-does. `repeated_evidence` is stored as sent, because it reports the agent's own
-observation. Every downgrade is reported in the response. A replacement or
-removal must name a proposal already stored for that learner.
+`learner_confirmed`/`learner_declined` as `unconfirmed`. Hermes currently exposes
+no host-backed confirmation event that could establish those claims. An owned
+track proves scope, not that the learner spoke. `repeated_evidence` is
+stored as sent, because it reports the agent's own observation. Every downgrade
+is reported in the response. A replacement or removal must name a proposal
+already stored for that learner.
 
 **Candidate durability describes what actually happens.** `session` is returned
 and never written, because this plugin has only durable SQLite and no
@@ -557,12 +557,13 @@ score, raw attempts, or session state — and it may never carry raw answers,
 transcripts, session identifiers, tokens, credentials, or an inferred
 disability or diagnosis.
 
-Accessibility needs are **session-only by default**, and session-only means
-absent from the database rather than merely short-lived in it. Send them in
-`current_request` to have them applied without being stored.
+Accessibility needs are **always session-only**, and session-only means absent
+from the database rather than merely short-lived in it. Send them in
+`current_request` to guide context resolution without storing them.
 
-Storing one requires `accessibility_consent`, which names the exact needs the
-learner agreed to and quotes what they said:
+`accessibility_consent` is retained only as a compatibility/audit input. It is
+validated and reported back, but cannot authorise persistence because the
+statement and the need are both model-controlled:
 
 ```json
 {
@@ -581,19 +582,11 @@ learner agreed to and quotes what they said:
 }
 ```
 
-A sensitive candidate must satisfy **five** independent conditions: category
-`accessibility`; an origin that is the learner stating it (never
-`repeated_evidence`); `confirmation_state: learner_confirmed`; consent that
-exists; and `consented_need` matching one of the agreed needs exactly. The
-`statement` must *be* the consented need — presentation wording belongs in
-your reply to the learner, never in the stored fact.
-
-Matching is on the canonical form only: NFKC, trimmed, internal whitespace
-collapsed, case-folded. **No fuzzy matching, no substrings, no model.** So
-`Captions On Audio` matches `captions on audio`, while `captions` does **not**
-cover `captions on all video and audio` — those are different needs, and only
-the learner can say which they agreed to. Consent to remember captions never
-authorises storing a diagnosis.
+The candidate in that example is returned as rejected and no accessibility
+row is written. There is no model argument, consent quotation, confirmation
+flag, or track record that changes this. Manifest accessibility metadata is
+authorised only by operator profile configuration, which a tool call cannot
+create or modify.
 
 ## Roadmap
 

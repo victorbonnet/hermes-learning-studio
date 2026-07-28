@@ -102,11 +102,17 @@ PARITY_CASES: list[tuple[str, dict]] = [
     ("identifier with a space", component_with(id="two words")),
     ("identifier with a slash", component_with(id="a/b")),
     ("identifier that is too long", component_with(id="a" * 80)),
+    ("identifier with a trailing newline", component_with(id="item\n")),
     ("malformed locale", manifest_with(ui_locale="english")),
     ("locale with an underscore", manifest_with(ui_locale="en_GB")),
+    ("locale with a trailing newline", manifest_with(ui_locale="en\n")),
     (
         "malformed publication date",
         manifest_with(source_references=[{"title": "A book", "published_on": "last year"}]),
+    ),
+    (
+        "publication date with a trailing newline",
+        manifest_with(source_references=[{"title": "A book", "published_on": "2026\n"}]),
     ),
     ("unknown top-level field", manifest_with(smuggled="value")),
     (

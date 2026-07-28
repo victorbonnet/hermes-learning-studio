@@ -393,10 +393,10 @@ def test_sensitive_information_needs_affirmative_permission(skill_md: str):
     )
 
 
-def test_accessibility_needs_are_session_only_by_default(skill_md: str):
+def test_accessibility_needs_are_always_session_only(skill_md: str):
     assert_states(
         skill_md,
-        (r"accessibility needs are session-only", r"explicitly asks"),
+        (r"accessibility needs are always session-only", r"no accessibility need is ever stored"),
         "session-only accessibility",
     )
 

@@ -440,9 +440,9 @@ to retain the data at all. Both are required.
    as the answer. Learning difficulties, disabilities, diagnoses, assessment
    results, professional weaknesses, and the reasons behind a goal are
    sensitive. So is anything the learner would not volunteer to a stranger.
-3. **Accessibility needs are session-only by default.** Honour them fully for
-   this session; persist them only if the learner explicitly asks you to
-   remember them. Never record an accessibility need as an inference.
+3. **Accessibility needs are always session-only.** Honour them fully for this
+   session, but never claim Studio will persist them. Never record an
+   accessibility need as an inference.
 
    In practice: send an accessibility need in `current_request` each session
    and the Studio will apply it without storing it. If you send it to
@@ -466,13 +466,13 @@ to retain the data at all. Both are required.
    `origin` of `explicit_durable_preference`, `confirmed_long_term_goal`,
    `explicit_correction` or `explicit_withdrawal` is stored as
    `model_proposed`, and `learner_confirmed`/`learner_declined` as
-   `unconfirmed`, unless an owned record backs the claim — a confirmed long
-   term goal on a track you name is the one case that does. The response
+   `unconfirmed`. An owned track proves scope, not that the learner spoke, and
+   Hermes currently exposes no host-backed confirmation event. The response
    reports every downgrade under `outcome.memory_candidates.downgraded`. The
-   proposal is kept, because your reading of the conversation is real
-   evidence; what it must not do is tell a reader in six months that the
-   learner agreed when nobody can show that. `repeated_evidence` is stored as
-   sent: it reports your own observation, which is exactly what it is.
+   proposal is kept, because your reading of the conversation is real evidence;
+   what it must not do is tell a reader in six months that the learner agreed
+   when nobody can show that. `repeated_evidence` is stored as sent: it reports
+   your own observation, which is exactly what it is.
 
    **Durability means something.** `session` is returned to you and never
    written — there is no session-scoped store here, only durable SQLite, so

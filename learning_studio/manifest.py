@@ -126,9 +126,10 @@ NO_TIME_LIMIT = "no_time_limit"
 #: What is left is the operator's ``config.yaml`` — a file a person edits,
 #: which no tool call can reach.
 #:
-#: A learner's accessibility need is still honoured in full: pass it in
-#: ``current_request`` and the Studio applies it to that call. What cannot
-#: happen is a durable record claiming they agreed to have it kept.
+#: A learner's accessibility need can still guide the current conversation:
+#: pass it in ``current_request`` when resolving context. It does not authorise
+#: manifest accessibility metadata; that remains operator-configured only.
+#: What cannot happen is a durable record claiming they agreed to have it kept.
 ACCESSIBILITY_SOURCES: tuple[str, ...] = (Provenance.PROFILE_CONFIG.value,)
 
 
@@ -186,17 +187,18 @@ _ACCESSIBILITY = Obj(
             required=True,
             choices=ACCESSIBILITY_SOURCES,
             description=(
-                "Where this came from. Only an explicit request the learner made, a "
-                "confirmed track, or operator configuration - and the claim is checked "
-                "against that source, so a label alone authorises nothing. Never your "
-                "own inference."
+                "Where this came from. Only operator profile configuration is accepted: "
+                "a tool call cannot create or alter that source. Explicit requests and "
+                "model-created tracks do not authorise durable accessibility metadata."
             ),
         ),
         EnumList(
             "accommodations",
             required=True,
             choices=ACCOMMODATIONS,
-            description="Each one must already be recorded for this learner by the named source.",
+            description=(
+                "Each one must already be recorded in the operator's profile configuration."
+            ),
         ),
     ),
 )

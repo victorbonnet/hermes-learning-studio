@@ -39,6 +39,7 @@ answer, and there is no code path here that could — see
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -2113,7 +2114,7 @@ def _is_readable(
         return True
 
     spelled = spelled_out_pattern(answer)
-    return bool(spelled and spelled.search(visible))
+    return bool(spelled and spelled.search(unicodedata.normalize("NFKC", visible)))
 
 
 def _leak_surface(spec: ComponentSpec, component: Component) -> dict[str, Any]:

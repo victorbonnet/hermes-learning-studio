@@ -169,7 +169,7 @@ def test_migrations_are_contiguous_and_the_version_is_the_last_one():
     versions = [m.version for m in storage.MIGRATIONS]
 
     assert versions == list(range(1, len(versions) + 1))
-    assert storage.SCHEMA_VERSION == versions[-1] == 5
+    assert storage.SCHEMA_VERSION == versions[-1] == 6
 
 
 def test_migration_two_adds_the_column():
@@ -994,6 +994,70 @@ def test_the_v4_upgrade_preserves_candidates(hermes_home: Path):
     assert row["expires_at"] is None
 
 
+def test_the_v4_upgrade_drops_legacy_non_durable_candidates(hermes_home: Path):
+    """v4 persisted both labels forever; v5 must not make that mistake permanent."""
+    _build_v4_database()
+    now = "2026-01-01T00:00:00+00:00"
+    with storage.connect() as conn:
+        conn.execute(
+            "INSERT INTO learners"
+            " (id, profile_id, principal_digest, platform, created_at, updated_at)"
+            " VALUES ('L4', 'default', 'digest-4', 'telegram', ?, ?)",
+            (now, now),
+        )
+        for candidate_id, durability in (("session-old", "session"), ("short-old", "short_term")):
+            conn.execute(
+                "INSERT INTO memory_candidates"
+                " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
+                "  origin, evidence_count, confidence, durability, confirmation_state,"
+                "  recommended_action, replaces, consent_reference, consented_need,"
+                "  created_at, updated_at)"
+                " VALUES (?, 'L4', 'default', NULL, 'durable_preference', ?, 'Legacy row',"
+                " 'repeated_evidence', 5, 'medium', ?, 'unconfirmed', 'add', NULL, NULL,"
+                " NULL, ?, ?)",
+                (candidate_id, candidate_id, durability, now, now),
+            )
+        conn.commit()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        rows = conn.execute("SELECT id FROM memory_candidates").fetchall()
+    assert rows == []
+
+
+def test_the_v4_upgrade_downgrades_legacy_authority_claims(hermes_home: Path):
+    _build_v4_database()
+    now = "2026-01-01T00:00:00+00:00"
+    with storage.connect() as conn:
+        conn.execute(
+            "INSERT INTO learners"
+            " (id, profile_id, principal_digest, platform, created_at, updated_at)"
+            " VALUES ('L4', 'default', 'digest-4', 'telegram', ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO memory_candidates"
+            " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
+            "  origin, evidence_count, confidence, durability, confirmation_state,"
+            "  recommended_action, replaces, consent_reference, consented_need,"
+            "  created_at, updated_at)"
+            " VALUES ('authority-old', 'L4', 'default', NULL, 'long_term_goal',"
+            " 'Become a surgeon', 'Allegedly confirmed', 'confirmed_long_term_goal', NULL,"
+            " 'medium', 'durable', 'learner_confirmed', 'add', NULL, NULL, NULL, ?, ?)",
+            (now, now),
+        )
+        conn.commit()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        row = conn.execute(
+            "SELECT origin, confirmation_state FROM memory_candidates WHERE id = 'authority-old'"
+        ).fetchone()
+    assert dict(row) == {"origin": "model_proposed", "confirmation_state": "unconfirmed"}
+
+
 def test_the_v4_upgrade_is_idempotent(hermes_home: Path):
     _candidate_under_v4()
 
@@ -1017,6 +1081,113 @@ def test_migrations_one_to_four_were_not_edited_by_the_rebuild(hermes_home: Path
     for version in (1, 2, 3, 4):
         body = " ".join(next(m for m in storage.MIGRATIONS if m.version == version).statements)
         assert "_v5" not in body, f"migration {version} was edited by the v5 rebuild"
+
+
+def test_migration_five_was_not_rewritten_for_semantic_cleanup(hermes_home: Path):
+    """Profiles that already reached v5 must receive cleanup through v6."""
+    body = " ".join(next(m for m in storage.MIGRATIONS if m.version == 5).statements)
+
+    assert "model_proposed" not in body
+    assert "WHERE durability = 'durable'" not in body
+
+
+def test_a_v5_database_receives_lifecycle_and_provenance_cleanup(hermes_home: Path):
+    _build_database_at(5)
+    now = "2026-01-01T00:00:00+00:00"
+    with storage.connect() as conn:
+        conn.execute(
+            "INSERT INTO learners"
+            " (id, profile_id, principal_digest, platform, created_at, updated_at)"
+            " VALUES ('L5', 'default', 'digest-5', 'telegram', ?, ?)",
+            (now, now),
+        )
+        for candidate_id, durability in (("session-v5", "session"), ("short-v5", "short_term")):
+            conn.execute(
+                "INSERT INTO memory_candidates"
+                " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
+                "  origin, evidence_count, confidence, durability, confirmation_state,"
+                "  recommended_action, replaces, consent_reference, consented_need, expires_at,"
+                "  created_at, updated_at)"
+                " VALUES (?, 'L5', 'default', NULL, 'durable_preference', ?, 'Legacy row',"
+                " 'repeated_evidence', 5, 'medium', ?, 'unconfirmed', 'add', NULL, NULL, NULL,"
+                " NULL, ?, ?)",
+                (candidate_id, candidate_id, durability, now, now),
+            )
+        conn.execute(
+            "INSERT INTO memory_candidates"
+            " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
+            "  origin, evidence_count, confidence, durability, confirmation_state,"
+            "  recommended_action, replaces, consent_reference, consented_need, expires_at,"
+            "  created_at, updated_at)"
+            " VALUES ('authority-v5', 'L5', 'default', NULL, 'long_term_goal',"
+            " 'Become a surgeon', 'Allegedly confirmed', 'confirmed_long_term_goal', NULL,"
+            " 'medium', 'durable', 'learner_confirmed', 'add', NULL, NULL, NULL, NULL, ?, ?)",
+            (now, now),
+        )
+        conn.commit()
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, origin, confirmation_state FROM memory_candidates ORDER BY id"
+        ).fetchall()
+        version = storage.read_schema_version(conn)
+
+    assert version == 6
+    assert [dict(row) for row in rows] == [
+        {
+            "id": "authority-v5",
+            "origin": "model_proposed",
+            "confirmation_state": "unconfirmed",
+        }
+    ]
+
+
+def test_a_failing_migration_six_rolls_back_cleanup(hermes_home: Path, monkeypatch):
+    _build_database_at(5)
+    now = "2026-01-01T00:00:00+00:00"
+    with storage.connect() as conn:
+        conn.execute(
+            "INSERT INTO learners"
+            " (id, profile_id, principal_digest, platform, created_at, updated_at)"
+            " VALUES ('L5', 'default', 'digest-5', 'telegram', ?, ?)",
+            (now, now),
+        )
+        conn.execute(
+            "INSERT INTO memory_candidates"
+            " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
+            "  origin, evidence_count, confidence, durability, confirmation_state,"
+            "  recommended_action, replaces, consent_reference, consented_need, expires_at,"
+            "  created_at, updated_at)"
+            " VALUES ('session-v5', 'L5', 'default', NULL, 'durable_preference', 'Legacy',"
+            " 'Legacy row', 'repeated_evidence', 5, 'medium', 'session', 'unconfirmed',"
+            " 'add', NULL, NULL, NULL, NULL, ?, ?)",
+            (now, now),
+        )
+        conn.commit()
+
+    real = list(storage.MIGRATIONS)
+    monkeypatch.setattr(
+        storage,
+        "MIGRATIONS",
+        [
+            *real[:5],
+            storage.Migration(version=6, statements=(*real[5].statements, "THIS IS NOT SQL")),
+        ],
+    )
+
+    with pytest.raises(storage.MigrationError):
+        storage.initialize()
+
+    with storage.connect() as conn:
+        version = storage.read_schema_version(conn)
+        row = conn.execute(
+            "SELECT durability FROM memory_candidates WHERE id = 'session-v5'"
+        ).fetchone()
+
+    assert version == 5
+    assert row["durability"] == "session"
 
 
 def test_a_failing_migration_five_rolls_back_completely(hermes_home: Path, monkeypatch):

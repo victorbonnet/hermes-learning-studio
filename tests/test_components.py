@@ -1117,6 +1117,17 @@ def test_a_correction_of_text_that_is_not_in_the_passage_is_refused():
             {"prompt": "Enter =.=.= but omit the dots.", "answer": {"accepted": ["==="]}},
         ),
         (
+            "short_answer",
+            {
+                "prompt": "Type Ｐ...ａ...ｒ...ｉ...ｓ with no dots.",
+                "answer": {"accepted": ["Paris"]},
+            },
+        ),
+        (
+            "short_answer",
+            {"prompt": "Enter ＝.＝.＝ but omit the dots.", "answer": {"accepted": ["==="]}},
+        ),
+        (
             "typed_recall",
             {"content": {"cue": "It is H..2..O"}, "answer": {"accepted": ["H2O"]}},
         ),

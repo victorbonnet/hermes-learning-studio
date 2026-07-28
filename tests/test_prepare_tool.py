@@ -636,6 +636,36 @@ def test_a_confirmation_claim_comes_back_labelled_truthfully(hermes_home, gatewa
     }
 
 
+def test_a_model_created_track_does_not_make_candidate_provenance_authoritative(
+    hermes_home, gateway_session
+):
+    """Persisting a caller assertion does not turn it into host-backed proof."""
+    result = json.loads(
+        tools.handle_save_context(
+            {
+                "track": {"name": "Model-created track", "confirmed": True},
+                "memory_candidates": [
+                    {
+                        "category": "long_term_goal",
+                        "statement": "Become a surgeon",
+                        "evidence_summary": "Allegedly confirmed",
+                        "origin": "confirmed_long_term_goal",
+                        "confirmation_state": "learner_confirmed",
+                    }
+                ],
+            }
+        )
+    )
+
+    accepted = result["outcome"]["memory_candidates"]["accepted"][0]
+    assert accepted["origin"] == "model_proposed"
+    assert accepted["confirmation_state"] == "unconfirmed"
+
+    stored = json.loads(tools.handle_get_context({"include_memory_candidates": True}))
+    assert stored["memory_candidates"][0]["origin"] == "model_proposed"
+    assert stored["memory_candidates"][0]["confirmation_state"] == "unconfirmed"
+
+
 # ── Whole-manifest errors are scrubbed too ────────────────────────────────
 
 
@@ -703,6 +733,23 @@ def test_an_obfuscated_answer_refusal_reveals_nothing(hermes_home, gateway_sessi
                 example(
                     "short_answer",
                     prompt="Type P...a...r...i...s with no dots.",
+                    answer={"accepted": ["Paris"]},
+                )
+            ]
+        )
+    )
+
+    assert result["ok"] is False
+    assert "Paris" not in json.dumps(result)
+
+
+def test_a_compatibility_form_answer_is_refused_by_the_real_handler(hermes_home, gateway_session):
+    result = call(
+        manifest=manifest(
+            [
+                example(
+                    "short_answer",
+                    prompt="Type Ｐ...ａ...ｒ...ｉ...ｓ with no dots.",
                     answer={"accepted": ["Paris"]},
                 )
             ]

@@ -168,8 +168,9 @@ _TRACK = {
             ),
         },
         "context": context_object(
-            "Durable context for this track. Accessibility needs are dropped unless the "
-            "same call carries accessibility_consent naming that specific need."
+            "Durable context for this track. Accessibility needs are session-only and are "
+            "always returned without being stored; accessibility_consent cannot authorise "
+            "durable storage because it is model-controlled too."
         ),
     },
 }
@@ -240,9 +241,9 @@ _MEMORY_CANDIDATE = {
                 "What produced this proposal. Only these origins may. One error, one slow "
                 "reply, a single inference, momentary frustration, a raw score, or session "
                 "state must never become a candidate. Note that an origin asserting the "
-                "learner said, confirmed, corrected or withdrew something is stored as "
-                "'model_proposed' unless an owned record backs it - the response reports "
-                "the downgrade."
+                "learner said, confirmed, corrected or withdrew something is always stored "
+                "as 'model_proposed' - an owned track proves scope, not what the learner "
+                "said. The response reports the downgrade."
             ),
         },
         "recommended_action": {"type": "string", "enum": [a.value for a in Action]},
@@ -261,8 +262,8 @@ _MEMORY_CANDIDATE = {
             "type": "string",
             "enum": [s.value for s in ConfirmationState],
             "description": (
-                "'learner_confirmed' and 'learner_declined' are both stored as "
-                "'unconfirmed' unless an owned record backs them: nothing in a tool call "
+                "'learner_confirmed' and 'learner_declined' are always stored as "
+                "'unconfirmed': neither an owned track nor anything else in a tool call "
                 "can show that a learner reached a decision."
             ),
         },

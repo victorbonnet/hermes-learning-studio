@@ -638,6 +638,34 @@ _MIGRATION_005 = (
 )
 
 
+# Migration 6 changes lifecycle and provenance *semantics*, not table shape.
+# Migration 5 may already have run on a database created while this PR was
+# under review, so it remains byte-for-byte unchanged and cleanup is appended:
+#
+# - legacy ``session`` and ``short_term`` rows have no trustworthy session id
+#   or expiry timestamp and are removed rather than made permanent;
+# - legacy learner-authority claims are downgraded because no host-backed
+#   confirmation event existed when they were stored.
+_MIGRATION_006 = (
+    "DELETE FROM memory_candidates WHERE durability IN ('session', 'short_term')",
+    """
+    UPDATE memory_candidates
+       SET origin = 'model_proposed'
+     WHERE origin IN (
+         'explicit_durable_preference',
+         'confirmed_long_term_goal',
+         'explicit_correction',
+         'explicit_withdrawal'
+     )
+    """,
+    """
+    UPDATE memory_candidates
+       SET confirmation_state = 'unconfirmed'
+     WHERE confirmation_state IN ('learner_confirmed', 'learner_declined')
+    """,
+)
+
+
 #: Ordered, contiguous from 1. The list order is the application order.
 MIGRATIONS: list[Migration] = [
     Migration(version=1, statements=_MIGRATION_001),
@@ -645,6 +673,7 @@ MIGRATIONS: list[Migration] = [
     Migration(version=3, statements=_MIGRATION_003),
     Migration(version=4, statements=_MIGRATION_004),
     Migration(version=5, statements=_MIGRATION_005),
+    Migration(version=6, statements=_MIGRATION_006),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

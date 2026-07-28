@@ -470,13 +470,13 @@ def test_consent_for_one_need_does_not_store_a_different_one(hermes_home: Path):
     assert "accessibility_needs" not in stored
 
 
-def test_an_operator_may_block_durable_accessibility_entirely(hermes_home: Path):
-    """A shared or managed profile can refuse even on request."""
+def test_an_operator_may_reject_the_legacy_consent_payload(hermes_home: Path):
+    """The compatibility switch never grants storage authority."""
     config = LearningStudioConfig.from_mapping(
         {"learning_studio": {"allow_durable_accessibility_needs": False}}
     )
 
-    with pytest.raises(service.ConsentError, match="configured never to store"):
+    with pytest.raises(service.ConsentError, match="deprecated accessibility_consent"):
         service.save_context(
             principal=LEARNER,
             temporary_context={"accessibility_needs": ["captions on all audio"]},
@@ -661,8 +661,8 @@ def test_repeated_evidence_is_stored_as_sent(hermes_home: Path):
     assert accepted[0]["origin"] == "repeated_evidence"
 
 
-def test_a_goal_backed_by_an_owned_confirmed_track_keeps_its_origin(hermes_home: Path):
-    """The one claim with a stored record behind it rather than a flag."""
+def test_an_owned_model_created_track_cannot_back_a_confirmation_claim(hermes_home: Path):
+    """Ownership proves scope; persisting a model flag does not prove learner speech."""
     track_id = service.save_context(
         principal=LEARNER, track={"name": "Surgery", "confirmed": True}
     )["outcome"]["track"]["track_id"]
@@ -679,7 +679,8 @@ def test_a_goal_backed_by_an_owned_confirmed_track_keeps_its_origin(hermes_home:
         ],
     )["outcome"]["memory_candidates"]["accepted"]
 
-    assert accepted[0]["origin"] == "confirmed_long_term_goal"
+    assert accepted[0]["origin"] == "model_proposed"
+    assert accepted[0]["confirmation_state"] == "unconfirmed"
 
 
 def test_another_learners_track_cannot_back_a_goal(hermes_home: Path):

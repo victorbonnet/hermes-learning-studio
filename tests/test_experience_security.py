@@ -107,6 +107,14 @@ def test_the_new_modules_exist_to_be_scanned():
         ("path after a typographic quote", "Open “/etc/shadow” now"),
         ("bracketed ipv6 with a port", "Connect to [::1]:8080/admin"),
         ("bracketed ipv6 alone", "Connect to [2001:db8::1] first"),
+        ("one-letter scheme with digit payload", "Use x:1 now"),
+        ("hyphenated domain with two-letter tld", "Visit example-site.io"),
+        ("one-character domain label", "Visit x.museum"),
+        ("path after CJK corner brackets", "Open 「/etc/passwd」"),
+        ("path after CJK lenticular brackets", "Open 【/etc/passwd】"),
+        ("unicode absolute path", "Open /école/data"),
+        ("compatibility-form uri", "Use ｘ：１ now"),
+        ("compatibility-form path", "Open ／etc／passwd"),
     ],
 )
 def test_unsafe_content_is_refused_in_a_prompt(label: str, text: str):

@@ -205,8 +205,8 @@ class AccessibilityConsent:
             )
         if not config.allow_durable_accessibility_needs:
             raise ConsentError(
-                "This profile is configured never to store accessibility needs durably. "
-                "The need still applies for this session; nothing was stored."
+                "This profile rejects the deprecated accessibility_consent compatibility "
+                "payload. Accessibility needs are always session-only; nothing was stored."
             )
         from .models import clean_text
 
@@ -1475,9 +1475,7 @@ def _save_candidates(
             )
             continue
 
-        recorded_origin, recorded_state = _recorded_provenance(
-            conn, profile, learner_id, candidate, outcome, proposal
-        )
+        recorded_origin, recorded_state = _recorded_provenance(candidate, outcome, proposal)
         expires_at = _candidate_expiry(candidate, config, outcome, proposal)
         if expires_at is _NOT_STORED:
             continue
@@ -1541,12 +1539,7 @@ CONFIRMATION_NOT_VERIFIABLE = (
 
 
 def _recorded_provenance(
-    conn: sqlite3.Connection,
-    profile: str,
-    learner_id: str,
-    candidate: Any,
-    outcome: dict[str, Any],
-    proposal: dict[str, Any],
+    candidate: Any, outcome: dict[str, Any], proposal: dict[str, Any]
 ) -> tuple[Any, Any]:
     """The origin and confirmation state actually written down.
 
@@ -1556,12 +1549,11 @@ def _recorded_provenance(
     long-term goal, we just have not ticked the box". Both halves say
     something about the learner, so both are checked.
 
-    One claim can be backed: ``confirmed_long_term_goal`` on a track this
-    learner owns and confirmed. The track is itself created from a model
-    flag, so it is not proof the learner spoke — but it *is* an owned,
-    previously stored record rather than a value invented in this call, and it
-    is the supporting record the goal is about. Everything else becomes
-    ``model_proposed`` and ``unconfirmed``.
+    An owned track proves ownership and scope, not what the learner said. The
+    track and its ``confirmed`` flag are themselves created from model input,
+    so resolving a proposal against that row cannot create authority. Until
+    Hermes supplies a trusted host confirmation event, every caller-asserted
+    authoritative origin/state becomes ``model_proposed``/``unconfirmed``.
     """
     from .candidates import (
         AUTHORITATIVE_ORIGINS,
@@ -1572,17 +1564,8 @@ def _recorded_provenance(
 
     origin = candidate.origin
     state = candidate.confirmation_state
-    supported = _has_supporting_track(conn, profile, learner_id, candidate)
-
-    recorded_origin = origin
-    if origin in AUTHORITATIVE_ORIGINS and not (
-        origin is Origin.CONFIRMED_LONG_TERM_GOAL and supported
-    ):
-        recorded_origin = Origin.MODEL_PROPOSED
-
-    recorded_state = state
-    if state in AUTHORITATIVE_STATES and not supported:
-        recorded_state = ConfirmationState.UNCONFIRMED
+    recorded_origin = Origin.MODEL_PROPOSED if origin in AUTHORITATIVE_ORIGINS else origin
+    recorded_state = ConfirmationState.UNCONFIRMED if state in AUTHORITATIVE_STATES else state
 
     if recorded_origin is not origin or recorded_state is not state:
         outcome["memory_candidates"].setdefault("downgraded", []).append(
@@ -1597,19 +1580,6 @@ def _recorded_provenance(
             }
         )
     return recorded_origin, recorded_state
-
-
-def _has_supporting_track(
-    conn: sqlite3.Connection, profile: str, learner_id: str, candidate: Any
-) -> bool:
-    """True when the proposal names a track this learner owns and confirmed."""
-    if not candidate.track_id:
-        return False
-    row = conn.execute(
-        "SELECT status FROM tracks WHERE id = ? AND profile_id = ? AND learner_id = ?",
-        (candidate.track_id, profile, learner_id),
-    ).fetchone()
-    return row is not None and str(row["status"]) == TrackStatus.ACTIVE.value
 
 
 def _check_replacement_target(

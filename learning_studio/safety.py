@@ -114,16 +114,16 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         # RFC 3986 scheme grammar: one letter, then any of letter/digit/+/-/.
         # — so a *one-letter* scheme such as ``x:`` is a scheme too. The
-        # payload must start with something that is neither a space nor a
-        # digit, which is what keeps "12:30", "3:4" and "H:1" out of it.
-        re.compile(r"\b[a-z][a-z0-9+.-]{0,31}:(?=[^\s:\d])", re.IGNORECASE),
+        # payload must start immediately after the colon. A digit is valid in
+        # an RFC 3986 path, so excluding it made ``x:1`` a bypass. Times and
+        # ratios still cannot match because a scheme must begin with a letter.
+        re.compile(r"\b[a-z][a-z0-9+.-]{0,31}:(?=[^\s:])", re.IGNORECASE),
         "must not contain a URI; describe the source instead of linking to it",
     ),
-    # A bare web locator is still a locator. Three shapes, chosen so that
-    # ``Node.js`` and ``3.14`` are not mistaken for hosts: anything under
-    # ``www.``, a domain carrying a path, and a three-or-more-label name.
+    # A bare web locator is still a locator. The branches below distinguish
+    # common host shapes while avoiding obvious file-extension prose.
     (
-        # Four shapes, and no list of top-level domains anywhere: a list has
+        # Shape-based, with no list of top-level domains anywhere: a list has
         # to be maintained, and ``.museum`` is exactly what falls off the end
         # of one. What is matched is the *shape* of a hostname.
         #
@@ -136,7 +136,8 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(
             r"\bwww\.[a-z0-9-]+\.[a-z]{2,}|"
             r"\b[a-z0-9][a-z0-9-]{0,62}\.[a-z]{2,24}/\S|"
-            r"\b[a-z0-9][a-z0-9-]{1,62}\.[a-z]{3,24}\b|"
+            r"\b[a-z0-9][a-z0-9-]*-[a-z0-9-]*\.[a-z]{2,24}\b|"
+            r"\b[a-z0-9][a-z0-9-]{0,62}\.[a-z]{3,24}\b|"
             r"\b[a-z0-9][a-z0-9-]{1,62}(?:\.[a-z0-9][a-z0-9-]{1,62}){2,}\b",
             re.IGNORECASE,
         ),
@@ -193,8 +194,8 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         # wrapped, and the quotes may be the typographic ones a word processor
         # produces.
         re.compile(
-            r"(?:^|[\s\"'(\[{«‹“”‘’])~?/[A-Za-z0-9._-]+|"
-            r"(?:^|[\s\"'(\[{«‹“”‘’])[A-Za-z]:[\\/]|\\\\[A-Za-z0-9]"
+            r"(?:^|[\s\"'(\[{«‹“”‘’「【〖〔（［｛])~?\/[^\s/]+|"
+            r"(?:^|[\s\"'(\[{«‹“”‘’「【〖〔（［｛])[A-Za-z]:[\\/]|\\\\[A-Za-z0-9]"
         ),
         "must not contain a filesystem path",
     ),
@@ -283,14 +284,14 @@ _SENSITIVE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
 #: Opaque identifiers the author supplies (component ids, option ids, asset
 #: references). Lowercase, bounded, and shaped so that nothing path-like,
 #: scheme-like, or traversal-like can be spelled with one.
-IDENTIFIER_PATTERN = r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
+IDENTIFIER_PATTERN = r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?(?![\s\S])"
 
 #: A conservative BCP-47 subset: language, optional script, optional region.
-LOCALE_PATTERN = r"^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?$"
+LOCALE_PATTERN = r"^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?(?![\s\S])"
 
 #: ``2026``, ``2026-07``, or ``2026-07-27``. Enough for provenance, and not a
 #: free-text field pretending to be a date.
-DATE_PATTERN = r"^[0-9]{4}(?:-[0-9]{2}(?:-[0-9]{2})?)?$"
+DATE_PATTERN = r"^[0-9]{4}(?:-[0-9]{2}(?:-[0-9]{2})?)?(?![\s\S])"
 
 _IDENTIFIER_RE = re.compile(IDENTIFIER_PATTERN)
 _LOCALE_RE = re.compile(LOCALE_PATTERN)
@@ -348,10 +349,10 @@ def safe_text(
 ) -> str:
     """Validate one string, returning its normalised form.
 
-    Normalisation is NFC and whitespace trimming only. Nothing is *stripped*
-    to make it pass: a string containing markup is refused, never silently
-    rewritten, because a caller who is told "saved" about content that was
-    quietly altered will ship the altered version to a learner.
+    Storage normalisation is NFC and whitespace trimming only. Safety rules
+    also inspect an NFKC comparison surface so full-width and other
+    compatibility forms cannot disguise markup, locators, paths or
+    credentials. The stored text is never silently compatibility-normalised.
     """
     if not isinstance(raw, str):
         raise UnsafeContent(f"{label} must be a string")
@@ -374,8 +375,9 @@ def safe_text(
         raise UnsafeContent(f"{label} must be a single line")
     if len(text) < min_chars:
         raise UnsafeContent(f"{label} must be at least {min_chars} character(s)")
+    comparison = unicodedata.normalize("NFKC", text)
     for pattern, explanation in _RULES:
-        if pattern.search(text):
+        if pattern.search(comparison):
             raise UnsafeContent(f"{label} {explanation}")
     return text
 
@@ -393,7 +395,7 @@ def safe_identifier(raw: Any, label: str) -> str:
     # Not trimmed. The advertised pattern anchors at both ends, so `" item "`
     # is invalid there; silently accepting it here would mean the schema and
     # the builder disagreeing about the same string.
-    if not _IDENTIFIER_RE.match(raw):
+    if not _IDENTIFIER_RE.fullmatch(raw):
         raise UnsafeContent(
             f"{label} must be 1-64 characters of lowercase letters, digits, '-' or '_', "
             "with no surrounding spaces"
@@ -405,7 +407,7 @@ def safe_locale(raw: Any, label: str) -> str:
     """Validate a language tag: ``en``, ``pt-BR``, ``zh-Hant-TW``."""
     if not isinstance(raw, str):
         raise UnsafeContent(f"{label} must be a string")
-    if not _LOCALE_RE.match(raw):
+    if not _LOCALE_RE.fullmatch(raw):
         raise UnsafeContent(
             f"{label} must be a language tag such as 'en', 'pt-BR', or 'zh-Hant-TW', "
             "with no surrounding spaces"
@@ -417,7 +419,7 @@ def safe_date(raw: Any, label: str) -> str:
     """Validate a publication date as ``YYYY``, ``YYYY-MM``, or ``YYYY-MM-DD``."""
     if not isinstance(raw, str):
         raise UnsafeContent(f"{label} must be a string")
-    if not _DATE_RE.match(raw):
+    if not _DATE_RE.fullmatch(raw):
         raise UnsafeContent(
             f"{label} must be a date as YYYY, YYYY-MM, or YYYY-MM-DD, with no surrounding spaces"
         )
@@ -442,8 +444,9 @@ def reject_learner_description(raw: str, label: str) -> str:
     learner has ADHD" is a health record, and an exercise is not the place to
     keep one — nor is a diagnosis something an agent may infer and write down.
     """
+    comparison = unicodedata.normalize("NFKC", raw)
     for pattern, explanation in _SENSITIVE_RULES:
-        if pattern.search(raw):
+        if pattern.search(comparison):
             raise UnsafeContent(f"{label} {explanation}")
     return raw
 
@@ -454,7 +457,7 @@ def tokens(text: str) -> list[str]:
     Punctuation and case are discarded so that "acetyl-CoA" and "Acetyl CoA"
     are the same sequence, and so that a full stop cannot hide a leak.
     """
-    return re.findall(r"\w+", unicodedata.normalize("NFC", text).casefold(), flags=re.UNICODE)
+    return re.findall(r"\w+", unicodedata.normalize("NFKC", text).casefold(), flags=re.UNICODE)
 
 
 def spelled_out_pattern(answer: str) -> re.Pattern[str] | None:

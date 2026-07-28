@@ -51,8 +51,9 @@ class Origin(StrEnum):
     Four of them describe something the *learner* did — said, corrected,
     withdrew, confirmed — and the plugin cannot see any of it. They stay in
     the vocabulary because they are how an agent describes what it observed,
-    but what gets *stored* is :data:`MODEL_PROPOSED` unless an owned record
-    backs the claim. See :data:`AUTHORITATIVE_ORIGINS`.
+    but what gets *stored* is always :data:`MODEL_PROPOSED`. An owned track
+    proves scope, not that the learner spoke; Hermes currently supplies no
+    host-backed confirmation event. See :data:`AUTHORITATIVE_ORIGINS`.
     """
 
     EXPLICIT_DURABLE_PREFERENCE = "explicit_durable_preference"
