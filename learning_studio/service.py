@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
 import sqlite3
 import uuid
@@ -56,6 +57,8 @@ from .models import (
 NOT_FOUND_MESSAGE = "No such track for this learner."
 
 NOT_FOUND_OBJECTIVE_MESSAGE = "No such objective on that track for this learner."
+
+NOT_FOUND_EXPERIENCE_MESSAGE = "No such prepared exercise for this learner."
 
 #: Track states that accept no new context, objectives, or corrections. A
 #: learner who archived or withdrew a track has said they are done with it;
@@ -202,8 +205,8 @@ class AccessibilityConsent:
             )
         if not config.allow_durable_accessibility_needs:
             raise ConsentError(
-                "This profile is configured never to store accessibility needs durably. "
-                "The need still applies for this session; nothing was stored."
+                "This profile rejects the deprecated accessibility_consent compatibility "
+                "payload. Accessibility needs are always session-only; nothing was stored."
             )
         from .models import clean_text
 
@@ -227,17 +230,32 @@ class AccessibilityConsent:
 
 
 def _consent_allows(field: str, value: Any, consent: AccessibilityConsent | None) -> bool:
-    """True when this exact value may be written to disk."""
-    if field not in SESSION_ONLY_FIELDS:
-        return True
-    return consent is not None and consent.covers(value)
+    """Whether this value may be written to disk. For a need, never.
+
+    The vocabulary restriction that used to sit here stopped a *diagnosis*
+    from being stored — a real gain — but it never answered the question it
+    appeared to. ``accessibility_consent`` is written by the model, in the
+    same call as the need it authorises, and so is ``track.confirmed``. One
+    request could therefore create a row reading ``accessibility_needs =
+    captions, provenance = confirmed_track, confirmed = 1``, and a later
+    manifest could cite that row as proof the learner had agreed. Nothing
+    outside the model was involved at any point.
+
+    Hermes exposes no consent event to check against, so the honest answer is
+    that this plugin cannot record an accessibility need at all. It is
+    honoured for the call that carries it, and nowhere else.
+    """
+    del consent, value
+    return field not in SESSION_ONLY_FIELDS
 
 
 SESSION_ONLY_NOT_STORED = (
-    "Accessibility needs are session-only: this was honoured for the current request but "
-    "NOT stored, and will not be available in a later call. Pass it in current_request "
-    "each session. To store it, the learner must explicitly ask, and you must send "
-    "accessibility_consent naming the specific need and their words."
+    "Accessibility needs are session-only and are never written to storage. This one was "
+    "honoured for the current request and will not be available in a later call: pass it in "
+    "current_request each session. There is no argument that changes this. Consent, a "
+    "confirmed track, and the need itself are all things you write in the same call, so "
+    "none of them can show that the learner agreed to a durable record, and this plugin "
+    "will not create one that says otherwise."
 )
 
 
@@ -669,6 +687,7 @@ def get_context(
     with storage.connect(config) as conn:
         with storage.transaction(conn):
             purge_expired(conn, profile)
+            purge_expired_candidates(conn, profile)
 
         learner_id = _find_learner(conn, principal)
         if learner_id is None:
@@ -856,6 +875,7 @@ def _candidates_json(
             "replaces": row["replaces"],
             "consent_reference": row["consent_reference"],
             "consented_need": row["consented_need"],
+            "expires_at": row["expires_at"],
             "track_id": row["track_id"],
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
@@ -902,6 +922,7 @@ def save_context(
     storage.initialize(config)
     with storage.connect(config) as conn, storage.transaction(conn):
         purge_expired(conn, profile)
+        purge_expired_candidates(conn, profile)
         learner_id = _get_or_create_learner(conn, principal)
 
         track_row = _save_track(conn, profile, learner_id, track, config, outcome, consent)
@@ -1446,6 +1467,18 @@ def _save_candidates(
         if candidate.track_id:
             _owned_track(conn, profile, learner_id, candidate.track_id)
 
+        try:
+            _check_replacement_target(conn, profile, learner_id, candidate)
+        except ValidationError as exc:
+            outcome["memory_candidates"]["rejected"].append(
+                {"statement": _safe_echo(proposal.get("statement")), "reason": str(exc)}
+            )
+            continue
+
+        recorded_origin, recorded_state = _recorded_provenance(candidate, outcome, proposal)
+        expires_at = _candidate_expiry(candidate, config, outcome, proposal)
+        if expires_at is _NOT_STORED:
+            continue
         candidate_id = _new_id()
         timestamp = _now()
         conn.execute(
@@ -1453,8 +1486,8 @@ def _save_candidates(
             " (id, learner_id, profile_id, track_id, category, statement, evidence_summary,"
             "  origin, evidence_count, confidence, durability, confirmation_state,"
             "  recommended_action, replaces, consent_reference, consented_need,"
-            "  created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  expires_at, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 candidate_id,
                 learner_id,
@@ -1463,28 +1496,598 @@ def _save_candidates(
                 candidate.category.value,
                 candidate.statement,
                 candidate.evidence_summary,
-                candidate.origin.value,
+                recorded_origin.value,
                 candidate.evidence_count,
                 candidate.confidence.value,
                 candidate.durability.value,
-                candidate.confirmation_state.value,
+                recorded_state.value,
                 candidate.recommended_action.value,
                 candidate.replaces,
                 candidate.consent_reference,
                 candidate.consented_need,
+                expires_at,
                 timestamp,
                 timestamp,
             ),
         )
         accepted = candidate.to_json()
+        accepted["origin"] = recorded_origin.value
+        accepted["confirmation_state"] = recorded_state.value
         accepted["candidate_id"] = candidate_id
+        accepted["expires_at"] = expires_at
         outcome["memory_candidates"]["accepted"].append(accepted)
+
+
+#: What a stored candidate may claim about how it was confirmed.
+#:
+#: ``learner_confirmed`` is deliberately unreachable. Nothing in a tool call
+#: can establish that a learner confirmed anything: the flag, the origin, the
+#: evidence summary and the consent statement are all written by the model in
+#: the same request, and Hermes supplies no confirmation event to check them
+#: against. A row that claimed otherwise would be a record asserting something
+#: nobody verified, read months later as though somebody had.
+#:
+#: The proposal is still stored — it is useful, and the agent's own reading of
+#: the conversation is real evidence — but labelled for what it is.
+CONFIRMATION_NOT_VERIFIABLE = (
+    "Recorded as a model proposal. This plugin cannot verify that a learner said, confirmed, "
+    "corrected, or withdrew anything: the origin, the confirmation flag and the evidence all "
+    "come from you, in this call, and Hermes supplies no confirmation event to check them "
+    "against. The proposal is kept — labelled truthfully — so that a later reader is not told "
+    "the learner agreed when nobody can show that they did."
+)
+
+
+def _recorded_provenance(
+    candidate: Any, outcome: dict[str, Any], proposal: dict[str, Any]
+) -> tuple[Any, Any]:
+    """The origin and confirmation state actually written down.
+
+    Downgrading only the confirmation state left the row still *claiming*
+    authority: ``origin = confirmed_long_term_goal`` beside
+    ``confirmation_state = unconfirmed`` reads as "the learner confirmed this
+    long-term goal, we just have not ticked the box". Both halves say
+    something about the learner, so both are checked.
+
+    An owned track proves ownership and scope, not what the learner said. The
+    track and its ``confirmed`` flag are themselves created from model input,
+    so resolving a proposal against that row cannot create authority. Until
+    Hermes supplies a trusted host confirmation event, every caller-asserted
+    authoritative origin/state becomes ``model_proposed``/``unconfirmed``.
+    """
+    from .candidates import (
+        AUTHORITATIVE_ORIGINS,
+        AUTHORITATIVE_STATES,
+        ConfirmationState,
+        Origin,
+    )
+
+    origin = candidate.origin
+    state = candidate.confirmation_state
+    recorded_origin = Origin.MODEL_PROPOSED if origin in AUTHORITATIVE_ORIGINS else origin
+    recorded_state = ConfirmationState.UNCONFIRMED if state in AUTHORITATIVE_STATES else state
+
+    if recorded_origin is not origin or recorded_state is not state:
+        outcome["memory_candidates"].setdefault("downgraded", []).append(
+            {
+                "statement": _safe_echo(proposal.get("statement")),
+                "claimed": {"origin": origin.value, "confirmation_state": state.value},
+                "recorded": {
+                    "origin": recorded_origin.value,
+                    "confirmation_state": recorded_state.value,
+                },
+                "reason": CONFIRMATION_NOT_VERIFIABLE,
+            }
+        )
+    return recorded_origin, recorded_state
+
+
+def _check_replacement_target(
+    conn: sqlite3.Connection, profile: str, learner_id: str, candidate: Any
+) -> None:
+    """A replacement or removal must name a record that exists and is theirs.
+
+    Without this, "replace what they said about X" is a free-text assertion
+    about a record nobody looked for — and an agent acting on it would edit
+    or delete something on the strength of a string the model composed.
+    """
+    from .candidates import Action
+
+    if candidate.recommended_action not in (Action.REPLACE, Action.REMOVE):
+        return
+    if not candidate.replaces:
+        raise ValidationError(
+            f"a '{candidate.recommended_action.value}' candidate must name, in 'replaces', "
+            "the existing proposal it changes"
+        )
+
+    target = _comparable(candidate.replaces)
+    rows = conn.execute(
+        "SELECT statement FROM memory_candidates WHERE profile_id = ? AND learner_id = ?",
+        (profile, learner_id),
+    ).fetchall()
+    if not any(_comparable(str(row["statement"])) == target for row in rows):
+        raise ValidationError(
+            "'replaces' does not match any proposal stored for this learner. Name the "
+            "existing statement exactly, or propose this as a new candidate instead of a "
+            "replacement — a change to a record nobody can find is not a change."
+        )
+
+
+#: Sentinel meaning "do not write this row at all".
+_NOT_STORED = object()
+
+#: What ``durability`` actually does, now that it does something.
+#:
+#: ``session`` was the plain lie: a candidate labelled session-scoped was
+#: inserted into SQLite and came back on every later call, forever. There is
+#: no trustworthy per-session store here — a "session" this plugin could key
+#: on would be another model-supplied string — so the honest implementation is
+#: to return the proposal in the response and write nothing.
+#:
+#: ``short_term`` now expires, on the same window as temporary context, and
+#: expired rows are swept before any read. ``durable`` is unchanged.
+DURABILITY_NOT_STORED = (
+    "Returned to you, and deliberately not stored. A 'session' candidate is scoped to this "
+    "conversation, and this plugin has no session-scoped store to put it in — only durable "
+    "SQLite. Keep it in the conversation, or propose it as 'short_term' if it should outlive "
+    "the call."
+)
+
+
+def _candidate_expiry(
+    candidate: Any, config: LearningStudioConfig, outcome: dict[str, Any], proposal: dict[str, Any]
+) -> Any:
+    """When this candidate stops being readable, or the not-stored sentinel."""
+    from .candidates import Durability
+
+    if candidate.durability is Durability.SESSION:
+        entry = candidate.to_json()
+        entry["stored"] = False
+        entry["reason"] = DURABILITY_NOT_STORED
+        outcome["memory_candidates"].setdefault("returned_not_stored", []).append(entry)
+        return _NOT_STORED
+
+    if candidate.durability is Durability.SHORT_TERM:
+        return (datetime.now(UTC) + timedelta(hours=config.temporary_context_ttl_hours)).isoformat()
+
+    return None
+
+
+def purge_expired_candidates(conn: sqlite3.Connection, profile: str, limit: int = 500) -> int:
+    """Delete short-term candidates whose window has closed.
+
+    Profile-wide and bounded, exactly as :func:`purge_expired` is, and for the
+    same reason: the learner whose proposal expired is the one who has not
+    come back, so a per-learner sweep would never reach it.
+    """
+    rows = conn.execute(
+        "SELECT id FROM memory_candidates"
+        " WHERE profile_id = ? AND expires_at IS NOT NULL AND expires_at <= ?"
+        " LIMIT ?",
+        (profile, _now(), limit),
+    ).fetchall()
+    if not rows:
+        return 0
+    ids = [str(row["id"]) for row in rows]
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute(
+        f"DELETE FROM memory_candidates WHERE id IN ({placeholders}) AND profile_id = ?",
+        (*ids, profile),
+    )
+    return len(ids)
 
 
 def _safe_echo(value: Any) -> str:
     """Echo a rejected statement back, truncated, so the agent can identify it."""
     text = str(value or "")
     return text[:80] + ("…" if len(text) > 80 else "")
+
+
+# ── Experiences ───────────────────────────────────────────────────────────
+
+#: Objectives a learner has finished with. Preparing new practice against one
+#: would quietly reopen something they closed.
+CLOSED_OBJECTIVE_STATUSES = (ObjectiveStatus.MET, ObjectiveStatus.RETIRED)
+
+
+def prepare_experience(
+    *,
+    principal: Principal,
+    manifest: Any,
+    track_id: str | None = None,
+    objective_id: str | None = None,
+    config: LearningStudioConfig | None = None,
+) -> dict[str, Any]:
+    """Validate a learning experience and store it, or store nothing at all.
+
+    The order is the point. The manifest is validated *before* the database is
+    opened, so a malformed exercise never creates a row, never creates a
+    learner, and never touches the filesystem. Ownership is then resolved from
+    the trusted principal — never from the manifest, which has no field for it
+    — and the whole write happens in one transaction.
+
+    Nothing here writes context, objectives, or memory candidates. Preparing an
+    exercise is not evidence about the learner, and an exercise that carries
+    accessibility metadata must not thereby become a durable fact about them.
+    """
+    from .manifest import ManifestError, build_manifest
+
+    config = config or load_config()
+
+    try:
+        validated = build_manifest(manifest)
+    except ManifestError as exc:
+        raise ValidationError(str(exc)) from exc
+
+    profile = principal.profile
+    storage.initialize(config)
+    with storage.connect(config) as conn, storage.transaction(conn):
+        learner_id = _get_or_create_learner(conn, principal)
+
+        resolved_track = _resolve_experience_track(conn, profile, learner_id, track_id)
+        resolved_objective = _resolve_experience_objective(
+            conn, profile, learner_id, resolved_track, objective_id, validated
+        )
+        _authorise_accommodations(
+            conn,
+            profile=profile,
+            learner_id=learner_id,
+            track_id=resolved_track,
+            accessibility=validated.accessibility,
+            config=config,
+        )
+
+        experience_id = _insert_experience(
+            conn,
+            profile=profile,
+            learner_id=learner_id,
+            track_id=resolved_track,
+            objective_id=resolved_objective,
+            manifest=validated,
+        )
+
+    return {
+        "ok": True,
+        "learner": principal.describe(),
+        "experience_id": experience_id,
+        "track_id": resolved_track,
+        "objective_id": resolved_objective,
+        "stored": True,
+        "experience": validated.learner_summary(),
+        # Said on every response because the agent's next move depends on it:
+        # something was *stored*, and nothing was started.
+        "delivery": (
+            "Stored only. No exercise has been launched, rendered, or opened, and there is "
+            "no runtime yet. Present it in conversation and say that is what you are doing."
+        ),
+        "answers_withheld": (
+            "Answer keys, rubrics, scoring rules, hints and feedback are stored server-side "
+            "and are deliberately absent from this response."
+        ),
+        "hermes_memory_updated": False,
+    }
+
+
+def _resolve_experience_track(
+    conn: sqlite3.Connection, profile: str, learner_id: str, track_id: Any
+) -> str | None:
+    """Confirm the caller owns the named track and that it still takes work."""
+    if track_id is None:
+        return None
+    row = _writable_track(conn, profile, learner_id, str(track_id))
+    return str(row["id"])
+
+
+def _resolve_experience_objective(
+    conn: sqlite3.Connection,
+    profile: str,
+    learner_id: str,
+    track_id: str | None,
+    objective_id: Any,
+    manifest: Any,
+) -> str | None:
+    """An objective is addressable only through the track that owns it.
+
+    And the experience must be *about* it. Verifying ownership while storing
+    whatever objective text the caller supplied would let an experience claim
+    to assess "add fractions, unaided, 4 of 5" while actually being a French
+    translation drill — a record that reads as evidence of progress against
+    something it never tested. The stored objective is authoritative, so the
+    manifest has to agree with it exactly.
+    """
+    if objective_id is None:
+        return None
+    if track_id is None:
+        raise ValidationError(
+            "An objective belongs to a track, so objective_id needs the track_id it is on."
+        )
+    row = conn.execute(
+        "SELECT * FROM objectives"
+        " WHERE id = ? AND track_id = ? AND profile_id = ? AND learner_id = ?",
+        (str(objective_id), track_id, profile, learner_id),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(NOT_FOUND_OBJECTIVE_MESSAGE)
+    status = ObjectiveStatus(str(row["status"]))
+    if status in CLOSED_OBJECTIVE_STATUSES:
+        raise ValidationError(
+            f"That objective is {status.value}. Ask the learner before practising against an "
+            "objective they have finished with."
+        )
+
+    mismatched = [
+        part
+        for part in ("behavior", "condition", "standard")
+        if _comparable(manifest.objective[part]) != _comparable(str(row[part]))
+    ]
+    if mismatched:
+        raise ValidationError(
+            "The objective in the manifest does not match the stored objective this "
+            f"experience is attached to: {', '.join(mismatched)} differ(s). Send the stored "
+            "objective's wording, or leave objective_id out for a one-off exercise."
+        )
+    return str(row["id"])
+
+
+def _comparable(text: str) -> str:
+    """Case- and whitespace-insensitive form, for objective agreement."""
+    return " ".join(str(text).split()).casefold()
+
+
+# ── Accessibility provenance ──────────────────────────────────────────────
+
+
+def _authorise_accommodations(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    learner_id: str,
+    track_id: str | None,
+    accessibility: dict[str, Any],
+    config: LearningStudioConfig,
+) -> None:
+    """Check the claimed source actually says what the manifest claims it says.
+
+    A ``source`` string written by a model is a claim, not authorisation — the
+    same reasoning that removed ``learner_key``. So each requested
+    accommodation is looked up in the *named* source: a confirmed track's own
+    context, the learner's explicitly stated session context, or the
+    operator's configuration. A source that says nothing authorises nothing.
+
+    Matching is exact on the canonical form of a recorded need, with no fuzzy,
+    substring, or semantic step anywhere. That is the same rule PR 03 applies
+    to accessibility consent, and for the same reason: a comparison loose
+    enough to turn one need into another is a comparison that decides
+    something about somebody's health on its own.
+    """
+    if not accessibility:
+        return
+
+    requested = list(accessibility.get("accommodations", ()))
+    if not requested:
+        return
+
+    source = str(accessibility.get("source", ""))
+    available = _recorded_needs(
+        conn,
+        profile=profile,
+        learner_id=learner_id,
+        track_id=track_id,
+        source=source,
+        config=config,
+    )
+    missing = sorted(set(requested) - available)
+    if missing:
+        raise ConsentError(
+            f"This experience claims {', '.join(missing)} came from {source}, but nothing "
+            f"recorded there says so. Accessibility metadata is only stored when the named "
+            "source already holds that exact need: save it with "
+            "learning_studio_save_context first, or leave accessibility off the manifest and "
+            "honour the need in conversation instead."
+        )
+
+
+def _recorded_needs(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    learner_id: str,
+    track_id: str | None,
+    source: str,
+    config: LearningStudioConfig,
+) -> set[str]:
+    """The accessibility needs one specific source records for this learner."""
+    from .models import normalize_need
+
+    def canonical(values: Any) -> set[str]:
+        items = values if isinstance(values, list) else [values]
+        out: set[str] = set()
+        for item in items:
+            try:
+                out.add(normalize_need(item))
+            except ValueError:  # pragma: no cover - stored values are validated
+                continue
+        return out
+
+    if source == Provenance.PROFILE_CONFIG.value:
+        return canonical(config.profile_context.get("accessibility_needs", []))
+
+    return set()  # pragma: no cover - the enum admits nothing else
+
+
+def _insert_experience(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    learner_id: str,
+    track_id: str | None,
+    objective_id: str | None,
+    manifest: Any,
+) -> str:
+    """Write the experience and every component inside the caller's transaction.
+
+    Each component's learner payload is re-checked immediately before it is
+    written. That is not belt-and-braces about validation — it is the last
+    point at which a hidden field could reach the learner-facing table, and a
+    check *here* fails the whole transaction rather than storing a row that a
+    later renderer would happily show.
+    """
+    from .manifest import dumps
+
+    experience_id = _new_id()
+    now = _now()
+    conn.execute(
+        "INSERT INTO experiences"
+        " (id, learner_id, profile_id, track_id, objective_id, manifest_schema_version,"
+        "  title, objective_behavior, objective_condition, objective_standard, instructions,"
+        "  ui_locale, content_locale, expected_duration_minutes, difficulty, accessibility,"
+        "  source_references, delivery, component_count, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            experience_id,
+            learner_id,
+            profile,
+            track_id,
+            objective_id,
+            manifest.schema_version,
+            manifest.title,
+            manifest.objective["behavior"],
+            manifest.objective["condition"],
+            manifest.objective["standard"],
+            manifest.instructions,
+            manifest.ui_locale,
+            manifest.content_locale,
+            manifest.expected_duration_minutes,
+            manifest.difficulty,
+            dumps(manifest.accessibility),
+            dumps(list(manifest.source_references)),
+            dumps(manifest.delivery),
+            manifest.component_count,
+            now,
+            now,
+        ),
+    )
+
+    for position, component in enumerate(manifest.components, start=1):
+        payload = component.learner_payload()
+        _assert_payload_is_safe(payload, component)
+        component_row_id = _new_id()
+        conn.execute(
+            "INSERT INTO experience_components"
+            " (id, experience_id, learner_id, profile_id, position, component_key,"
+            "  component_type, learner_payload, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                component_row_id,
+                experience_id,
+                learner_id,
+                profile,
+                position,
+                component.id,
+                component.type,
+                dumps(payload),
+                now,
+            ),
+        )
+        hidden = component.hidden()
+        if hidden:
+            conn.execute(
+                "INSERT INTO experience_component_evaluations"
+                " (component_id, experience_id, learner_id, profile_id, evaluation, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (component_row_id, experience_id, learner_id, profile, dumps(hidden), now),
+            )
+    return experience_id
+
+
+def _assert_payload_is_safe(payload: dict[str, Any], component: Any) -> None:
+    """Refuse to write a learner payload carrying anything evaluator-only."""
+    from .components import HIDDEN_KEYS, LEARNER_VISIBLE_KEYS
+
+    # Hidden keys are checked first: they are also "unexpected fields", but a
+    # leaked answer key and a misspelled property are not the same incident,
+    # and the message should say which one happened.
+    for hidden_key in HIDDEN_KEYS:
+        if hidden_key in payload:
+            raise ValidationError(
+                f"component '{component.id}' would store evaluator-only data where the "
+                "learner can read it"
+            )
+    stray = sorted(set(payload) - set(LEARNER_VISIBLE_KEYS))
+    if stray:
+        raise ValidationError(
+            f"component '{component.id}' produced a learner payload with unexpected "
+            f"field(s): {', '.join(stray)}"
+        )
+
+
+def get_experience(
+    *,
+    principal: Principal,
+    experience_id: str,
+    config: LearningStudioConfig | None = None,
+) -> dict[str, Any]:
+    """Read back a stored experience's learner-visible half.
+
+    No tool exposes this yet — the delivery runtime arrives later. It exists
+    now so that the storage guarantees this PR makes (ownership, ordering, and
+    an evaluator-free projection) are testable against the code a runtime will
+    actually call, rather than against a query written in a test.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            raise NotFoundError(NOT_FOUND_EXPERIENCE_MESSAGE)
+
+        row = conn.execute(
+            "SELECT * FROM experiences WHERE id = ? AND profile_id = ? AND learner_id = ?",
+            (str(experience_id), profile, learner_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(NOT_FOUND_EXPERIENCE_MESSAGE)
+
+        components = conn.execute(
+            "SELECT position, component_key, component_type, learner_payload"
+            " FROM experience_components"
+            " WHERE experience_id = ? AND profile_id = ? AND learner_id = ?"
+            " ORDER BY position",
+            (str(experience_id), profile, learner_id),
+        ).fetchall()
+
+    return {
+        "experience_id": str(row["id"]),
+        "track_id": row["track_id"],
+        "objective_id": row["objective_id"],
+        "schema_version": int(row["manifest_schema_version"]),
+        "title": str(row["title"]),
+        "objective": {
+            "behavior": str(row["objective_behavior"]),
+            "condition": str(row["objective_condition"]),
+            "standard": str(row["objective_standard"]),
+        },
+        "instructions": str(row["instructions"]),
+        "ui_locale": str(row["ui_locale"]),
+        "content_locale": row["content_locale"],
+        "expected_duration_minutes": int(row["expected_duration_minutes"]),
+        "difficulty": str(row["difficulty"]),
+        "accessibility": json.loads(str(row["accessibility"])),
+        "source_references": json.loads(str(row["source_references"])),
+        "delivery": json.loads(str(row["delivery"])),
+        "components": [
+            {
+                "position": int(component["position"]),
+                "component_id": str(component["component_key"]),
+                "type": str(component["component_type"]),
+                "payload": json.loads(str(component["learner_payload"])),
+            }
+            for component in components
+        ],
+    }
 
 
 # ── Input validation helpers ──────────────────────────────────────────────

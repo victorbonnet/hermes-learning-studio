@@ -86,12 +86,11 @@ class LearningStudioConfig:
     #: a memory candidate. Below this, evidence stays in temporary context.
     memory_candidate_min_evidence: int = 3
 
-    #: Operator policy, *not* consent. Accessibility needs are session-only
-    #: by default because the per-save learner flag defaults to off; this
-    #: setting only says whether the operator permits durable storage at all
-    #: when a learner does explicitly ask. Set it false on a shared or
-    #: managed profile to refuse even on request. Config is never a
-    #: substitute for the learner asking.
+    #: Deprecated compatibility switch. Accessibility needs are always
+    #: session-only and never stored. ``False`` additionally refuses the old
+    #: model-supplied ``accessibility_consent`` audit payload; ``True`` accepts
+    #: and validates that payload for the response only. Neither value grants
+    #: storage authority. Kept so existing profile configs continue to load.
     allow_durable_accessibility_needs: bool = True
 
     #: Longest single context value accepted, in characters. Bounded above by
@@ -168,8 +167,7 @@ def load_config() -> LearningStudioConfig:
       is the test, build, and bare-import path.
     - **The host is present but the read failed** — a permission error, an
       unreadable file, a YAML syntax error. Defaults here would silently
-      convert ``allow_durable_accessibility_needs: false`` into ``true``,
-      turning an operator's explicit privacy decision into its opposite at
+      convert a strict retention or validation setting into its default at
       exactly the moment nobody is watching. Raise instead.
     """
     try:

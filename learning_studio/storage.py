@@ -300,10 +300,393 @@ _MIGRATION_002 = (
 )
 
 
+# Version 3 adds stored learning experiences.
+#
+# The split across two tables is the schema half of the manifest's
+# visible/hidden boundary. ``experience_components`` holds only what a learner
+# may see; every answer key, rubric, scoring rule, hint, per-option feedback,
+# branch and evaluator note lives in ``experience_component_evaluations``. A
+# projection that forgets to exclude a column therefore cannot leak an answer,
+# because the learner-facing table does not contain one — and a future reader
+# that only ever joins the first table is safe by default.
+#
+# ``component_key`` is the author's own label for a component. It is not a
+# primary key and never an authorisation boundary: rows key on generated
+# opaque ids, so nothing a model writes can address a row.
+_MIGRATION_003 = (
+    # Objectives gained composite uniqueness so an experience can reference one
+    # through a composite foreign key. Additive: an index, not a table change.
+    """
+    CREATE UNIQUE INDEX idx_objectives_identity
+        ON objectives (id, profile_id, learner_id)
+    """,
+    """
+    CREATE TABLE experiences (
+        id                        TEXT PRIMARY KEY,
+        learner_id                TEXT NOT NULL,
+        profile_id                TEXT NOT NULL,
+        track_id                  TEXT,
+        objective_id              TEXT,
+        manifest_schema_version   INTEGER NOT NULL,
+        title                     TEXT    NOT NULL,
+        objective_behavior        TEXT    NOT NULL,
+        objective_condition       TEXT    NOT NULL,
+        objective_standard        TEXT    NOT NULL,
+        instructions              TEXT    NOT NULL,
+        ui_locale                 TEXT    NOT NULL,
+        content_locale            TEXT,
+        expected_duration_minutes INTEGER NOT NULL
+                                  CHECK (expected_duration_minutes BETWEEN 1 AND 240),
+        difficulty                TEXT    NOT NULL
+                                  CHECK (difficulty IN (
+                                      'introductory', 'intermediate', 'advanced', 'expert'
+                                  )),
+        accessibility             TEXT    NOT NULL,
+        source_references         TEXT    NOT NULL,
+        delivery                  TEXT    NOT NULL,
+        component_count           INTEGER NOT NULL CHECK (component_count > 0),
+        created_at                TEXT    NOT NULL,
+        updated_at                TEXT    NOT NULL,
+        UNIQUE (id, profile_id, learner_id),
+        FOREIGN KEY (learner_id, profile_id)
+            REFERENCES learners (id, profile_id) ON DELETE CASCADE,
+        FOREIGN KEY (track_id, profile_id, learner_id)
+            REFERENCES tracks (id, profile_id, learner_id) ON DELETE CASCADE,
+        FOREIGN KEY (objective_id, profile_id, learner_id)
+            REFERENCES objectives (id, profile_id, learner_id) ON DELETE SET NULL
+    )
+    """,
+    "CREATE INDEX idx_experiences_owner ON experiences (profile_id, learner_id, created_at)",
+    """
+    CREATE TABLE experience_components (
+        id             TEXT    PRIMARY KEY,
+        experience_id  TEXT    NOT NULL,
+        learner_id     TEXT    NOT NULL,
+        profile_id     TEXT    NOT NULL,
+        position       INTEGER NOT NULL CHECK (position > 0),
+        component_key  TEXT    NOT NULL,
+        component_type TEXT    NOT NULL,
+        learner_payload TEXT   NOT NULL,
+        created_at     TEXT    NOT NULL,
+        UNIQUE (experience_id, position),
+        UNIQUE (experience_id, component_key),
+        UNIQUE (id, profile_id, learner_id),
+        FOREIGN KEY (experience_id, profile_id, learner_id)
+            REFERENCES experiences (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX idx_experience_components_owner
+        ON experience_components (profile_id, learner_id, experience_id, position)
+    """,
+    """
+    CREATE TABLE experience_component_evaluations (
+        component_id  TEXT PRIMARY KEY,
+        experience_id TEXT NOT NULL,
+        learner_id    TEXT NOT NULL,
+        profile_id    TEXT NOT NULL,
+        evaluation    TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        FOREIGN KEY (component_id, profile_id, learner_id)
+            REFERENCES experience_components (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX idx_experience_evaluations_owner
+        ON experience_component_evaluations (profile_id, learner_id, experience_id)
+    """,
+)
+
+
+# Version 4 rebuilds the experience tables so that three relationships the v3
+# schema only *claimed* are actually enforced by SQLite:
+#
+# 1. **An objective belongs to a track.** The v3 foreign key omitted
+#    ``track_id``, so an experience attached to track B could reference an
+#    objective from track A as long as both belonged to the same learner. The
+#    new key includes the track, which makes that row unstorable.
+# 2. **Deleting an objective works.** The v3 key used ``ON DELETE SET NULL``
+#    over a composite that includes ``profile_id`` and ``learner_id``, both
+#    ``NOT NULL`` — so deleting any objective raised
+#    ``NOT NULL constraint failed``. The action is now ``CASCADE``: an
+#    objective is never deleted by this plugin (it is retired), and the only
+#    thing that deletes one is a track deletion, which already removes the
+#    same experiences by the track key. Cascade therefore agrees with what
+#    happens anyway, and — unlike RESTRICT — cannot deadlock a track deletion
+#    against its own children.
+# 3. **An evaluator row belongs to its component's experience.** The v3 key
+#    constrained only ``component_id``, so an evaluation could name a
+#    different, or nonexistent, experience. The key now spans component,
+#    experience, profile and learner together.
+#
+# The rebuild is expressed as ordinary statements — no ``executescript`` — so
+# it runs inside the caller's transaction and rolls back whole. The new tables
+# are built and populated first, the old ones dropped afterwards (children
+# before parents, so the implicit ``DELETE`` a ``DROP`` performs has nothing
+# left to cascade into), and the renames then fix up the references between
+# them.
+#
+# Two deterministic repairs, because a v3 database may already hold rows the
+# new constraints forbid:
+#
+# - an experience whose objective belongs to another track, or to no surviving
+#   objective at all, keeps the experience and loses the objective link;
+# - an evaluator row whose component is missing, or whose experience does not
+#   match that component's, is dropped. It cannot be attributed to anything,
+#   and guessing an owner for evaluator data is worse than losing it.
+_MIGRATION_004 = (
+    """
+    CREATE UNIQUE INDEX idx_objectives_track_identity
+        ON objectives (id, track_id, profile_id, learner_id)
+    """,
+    """
+    CREATE TABLE experiences_v4 (
+        id                        TEXT PRIMARY KEY,
+        learner_id                TEXT NOT NULL,
+        profile_id                TEXT NOT NULL,
+        track_id                  TEXT,
+        objective_id              TEXT,
+        manifest_schema_version   INTEGER NOT NULL,
+        title                     TEXT    NOT NULL,
+        objective_behavior        TEXT    NOT NULL,
+        objective_condition       TEXT    NOT NULL,
+        objective_standard        TEXT    NOT NULL,
+        instructions              TEXT    NOT NULL,
+        ui_locale                 TEXT    NOT NULL,
+        content_locale            TEXT,
+        expected_duration_minutes INTEGER NOT NULL
+                                  CHECK (expected_duration_minutes BETWEEN 1 AND 240),
+        difficulty                TEXT    NOT NULL
+                                  CHECK (difficulty IN (
+                                      'introductory', 'intermediate', 'advanced', 'expert'
+                                  )),
+        accessibility             TEXT    NOT NULL,
+        source_references         TEXT    NOT NULL,
+        delivery                  TEXT    NOT NULL,
+        component_count           INTEGER NOT NULL CHECK (component_count > 0),
+        created_at                TEXT    NOT NULL,
+        updated_at                TEXT    NOT NULL,
+        -- An objective may only be named together with the track that owns it.
+        CHECK (objective_id IS NULL OR track_id IS NOT NULL),
+        UNIQUE (id, profile_id, learner_id),
+        FOREIGN KEY (learner_id, profile_id)
+            REFERENCES learners (id, profile_id) ON DELETE CASCADE,
+        FOREIGN KEY (track_id, profile_id, learner_id)
+            REFERENCES tracks (id, profile_id, learner_id) ON DELETE CASCADE,
+        FOREIGN KEY (objective_id, track_id, profile_id, learner_id)
+            REFERENCES objectives (id, track_id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE experience_components_v4 (
+        id              TEXT    PRIMARY KEY,
+        experience_id   TEXT    NOT NULL,
+        learner_id      TEXT    NOT NULL,
+        profile_id      TEXT    NOT NULL,
+        position        INTEGER NOT NULL CHECK (position > 0),
+        component_key   TEXT    NOT NULL,
+        component_type  TEXT    NOT NULL,
+        learner_payload TEXT    NOT NULL,
+        created_at      TEXT    NOT NULL,
+        UNIQUE (experience_id, position),
+        UNIQUE (experience_id, component_key),
+        UNIQUE (id, profile_id, learner_id),
+        -- Referenced by the evaluator table's four-column key below.
+        UNIQUE (id, experience_id, profile_id, learner_id),
+        FOREIGN KEY (experience_id, profile_id, learner_id)
+            REFERENCES experiences_v4 (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE experience_component_evaluations_v4 (
+        component_id  TEXT PRIMARY KEY,
+        experience_id TEXT NOT NULL,
+        learner_id    TEXT NOT NULL,
+        profile_id    TEXT NOT NULL,
+        evaluation    TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        FOREIGN KEY (component_id, experience_id, profile_id, learner_id)
+            REFERENCES experience_components_v4 (id, experience_id, profile_id, learner_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    INSERT INTO experiences_v4
+        SELECT
+            e.id, e.learner_id, e.profile_id, e.track_id,
+            CASE
+                WHEN e.objective_id IS NULL THEN NULL
+                WHEN EXISTS (
+                    SELECT 1 FROM objectives o
+                     WHERE o.id = e.objective_id
+                       AND o.track_id = e.track_id
+                       AND o.profile_id = e.profile_id
+                       AND o.learner_id = e.learner_id
+                ) THEN e.objective_id
+                ELSE NULL
+            END,
+            e.manifest_schema_version, e.title, e.objective_behavior, e.objective_condition,
+            e.objective_standard, e.instructions, e.ui_locale, e.content_locale,
+            e.expected_duration_minutes, e.difficulty, e.accessibility, e.source_references,
+            e.delivery, e.component_count, e.created_at, e.updated_at
+        FROM experiences e
+    """,
+    """
+    INSERT INTO experience_components_v4
+        SELECT c.* FROM experience_components c
+         WHERE EXISTS (SELECT 1 FROM experiences_v4 e WHERE e.id = c.experience_id)
+    """,
+    """
+    INSERT INTO experience_component_evaluations_v4
+        SELECT v.* FROM experience_component_evaluations v
+         JOIN experience_components_v4 c
+           ON c.id = v.component_id
+          AND c.experience_id = v.experience_id
+          AND c.profile_id = v.profile_id
+          AND c.learner_id = v.learner_id
+    """,
+    "DROP TABLE experience_component_evaluations",
+    "DROP TABLE experience_components",
+    "DROP TABLE experiences",
+    "ALTER TABLE experiences_v4 RENAME TO experiences",
+    "ALTER TABLE experience_components_v4 RENAME TO experience_components",
+    "ALTER TABLE experience_component_evaluations_v4 RENAME TO experience_component_evaluations",
+    "CREATE INDEX idx_experiences_owner ON experiences (profile_id, learner_id, created_at)",
+    """
+    CREATE INDEX idx_experience_components_owner
+        ON experience_components (profile_id, learner_id, experience_id, position)
+    """,
+    """
+    CREATE INDEX idx_experience_evaluations_owner
+        ON experience_component_evaluations (profile_id, learner_id, experience_id)
+    """,
+)
+
+
+# Version 5 rebuilds ``memory_candidates`` for two reasons.
+#
+# 1. **Track deletion was impossible.** The track foreign key used
+#    ``ON DELETE SET NULL`` over a composite that includes ``profile_id`` and
+#    ``learner_id``, both ``NOT NULL`` — so deleting a track that had a
+#    candidate attached raised ``NOT NULL constraint failed:
+#    memory_candidates.learner_id``. The same defect the experiences table had
+#    at v3, in a table the v4 rebuild did not touch.
+#
+#    The action is now ``CASCADE``. A candidate that names a track is a
+#    proposal *about that track's* work, so removing the track removes it;
+#    candidates with no track are untouched, because the child key is NULL and
+#    a composite foreign key with a NULL column is satisfied trivially.
+#
+# 2. **``short_term`` had no expiry.** A candidate labelled short-term was
+#    stored forever, which made the label a lie. ``expires_at`` is nullable —
+#    ``NULL`` means durable — and the service sets it for short-term rows and
+#    sweeps them on read.
+#
+# Rebuilt rather than altered because a foreign-key action cannot be changed
+# with ``ALTER TABLE``. Same shape as migration 4: build, copy, drop, rename,
+# all as ordinary statements inside the caller's transaction.
+_MIGRATION_005 = (
+    """
+    CREATE TABLE memory_candidates_v5 (
+        id                 TEXT PRIMARY KEY,
+        learner_id         TEXT NOT NULL,
+        profile_id         TEXT NOT NULL,
+        track_id           TEXT,
+        category           TEXT NOT NULL,
+        statement          TEXT NOT NULL,
+        evidence_summary   TEXT NOT NULL,
+        origin             TEXT NOT NULL,
+        evidence_count     INTEGER,
+        confidence         TEXT NOT NULL CHECK (confidence IN ('low', 'medium', 'high')),
+        durability         TEXT NOT NULL
+                           CHECK (durability IN ('session', 'short_term', 'durable')),
+        confirmation_state TEXT NOT NULL
+                           CHECK (confirmation_state IN (
+                               'unconfirmed', 'learner_confirmed', 'learner_declined'
+                           )),
+        recommended_action TEXT NOT NULL
+                           CHECK (recommended_action IN (
+                               'add', 'replace', 'remove', 'no_action'
+                           )),
+        replaces           TEXT,
+        consent_reference  TEXT,
+        consented_need     TEXT,
+        expires_at         TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        FOREIGN KEY (learner_id, profile_id)
+            REFERENCES learners (id, profile_id) ON DELETE CASCADE,
+        FOREIGN KEY (track_id, profile_id, learner_id)
+            REFERENCES tracks (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    INSERT INTO memory_candidates_v5
+        SELECT id, learner_id, profile_id, track_id, category, statement, evidence_summary,
+               origin, evidence_count, confidence, durability, confirmation_state,
+               recommended_action, replaces, consent_reference, consented_need,
+               NULL, created_at, updated_at
+          FROM memory_candidates
+    """,
+    "DROP TABLE memory_candidates",
+    "ALTER TABLE memory_candidates_v5 RENAME TO memory_candidates",
+    "CREATE INDEX idx_candidates_owner ON memory_candidates (profile_id, learner_id)",
+    """
+    CREATE INDEX idx_candidates_expiry
+        ON memory_candidates (profile_id, expires_at) WHERE expires_at IS NOT NULL
+    """,
+)
+
+
+# Migration 6 changes lifecycle and provenance *semantics*, not table shape.
+# Migration 5 may already have run on a database created while this PR was
+# under review, so it remains byte-for-byte unchanged and cleanup is appended:
+#
+# - legacy ``session`` and ``short_term`` rows have no trustworthy session id
+#   or expiry timestamp and are removed rather than made permanent;
+# - legacy learner-authority claims are downgraded because no host-backed
+#   confirmation event existed when they were stored.
+_MIGRATION_006 = (
+    "DELETE FROM memory_candidates WHERE durability IN ('session', 'short_term')",
+    """
+    UPDATE memory_candidates
+       SET origin = 'model_proposed'
+     WHERE origin IN (
+         'explicit_durable_preference',
+         'confirmed_long_term_goal',
+         'explicit_correction',
+         'explicit_withdrawal'
+     )
+    """,
+    """
+    UPDATE memory_candidates
+       SET confirmation_state = 'unconfirmed'
+     WHERE confirmation_state IN ('learner_confirmed', 'learner_declined')
+    """,
+)
+
+
+# Migration 7 enforces the unconditional session-only accessibility policy on
+# databases that may already have reached v6. Older releases could persist the
+# same sensitive fact in current values, revision history, or candidates. None
+# has host-backed consent, so all three representations are purged together;
+# unrelated learning context and candidates remain intact.
+_MIGRATION_007 = (
+    "DELETE FROM context_revisions WHERE field = 'accessibility_needs'",
+    "DELETE FROM context_values WHERE field = 'accessibility_needs'",
+    "DELETE FROM memory_candidates WHERE category = 'accessibility'",
+)
+
+
 #: Ordered, contiguous from 1. The list order is the application order.
 MIGRATIONS: list[Migration] = [
     Migration(version=1, statements=_MIGRATION_001),
     Migration(version=2, statements=_MIGRATION_002),
+    Migration(version=3, statements=_MIGRATION_003),
+    Migration(version=4, statements=_MIGRATION_004),
+    Migration(version=5, statements=_MIGRATION_005),
+    Migration(version=6, statements=_MIGRATION_006),
+    Migration(version=7, statements=_MIGRATION_007),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1].version
@@ -399,13 +782,48 @@ def read_schema_version(conn: sqlite3.Connection) -> int:
     return int(row["version"]) if row else 0
 
 
+def _refuse_newer_database() -> None:
+    """Read the version through a read-only handle, before anything is set up.
+
+    This runs *before* :func:`connect`, and that ordering is the whole point.
+    ``connect`` applies the configured journal mode, which is persistent: a
+    database written by a newer version of the plugin used to be converted to
+    WAL — new files on disk, changed bytes — and only then refused. "The
+    database has been left untouched" has to be true, so the compatibility
+    question is asked by a handle that cannot write.
+
+    A missing file is not an error; it is a first run.
+    """
+    root = storage_root()
+    path = root / DATABASE_FILENAME
+    if not path.exists():
+        return
+
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:  # pragma: no cover - platform or permission dependent
+        # No read-only handle available. Refusing here would make an ordinary
+        # database unusable, so fall through: `initialize` checks the version
+        # again on the normal connection.
+        return
+    try:
+        conn.row_factory = sqlite3.Row
+        _check_version(read_schema_version(conn))
+    except sqlite3.DatabaseError:  # pragma: no cover - unreadable or not a database
+        return
+    finally:
+        conn.close()
+
+
 def initialize(config: LearningStudioConfig | None = None) -> None:
     """Create or migrate the database. Safe to call concurrently and repeatedly.
 
-    The version is read twice on purpose. The first read is an unlocked fast
-    path for the overwhelmingly common case of an up-to-date database. The
-    second happens *after* ``BEGIN IMMEDIATE`` has taken the write lock,
-    because between the two another process may have done the work — and
+    The version is read three times, and each read earns its place. The first
+    is read-only and happens before any connection is configured, so an
+    unsupported newer database is refused without being touched. The second is
+    an unlocked fast path for the overwhelmingly common case of an up-to-date
+    database. The third happens *after* ``BEGIN IMMEDIATE`` has taken the write
+    lock, because between the two another process may have done the work — and
     acting on the stale answer would mean trying to create tables that now
     exist.
 
@@ -414,6 +832,7 @@ def initialize(config: LearningStudioConfig | None = None) -> None:
     case nothing from the upgrade has been applied.
     """
     config = config or LearningStudioConfig()
+    _refuse_newer_database()
     with connect(config) as conn:
         if _check_version(read_schema_version(conn)):
             return

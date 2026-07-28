@@ -17,16 +17,18 @@ it too narrowly.
 
 ## Runtime status: read this first
 
-Two tools exist, and they cover **learning context only**:
+Three tools exist:
 
 | Tool | What it does |
 | --- | --- |
 | `learning_studio_get_context` | Retrieve what is known about a learner before you plan |
 | `learning_studio_save_context` | Record what you learned; propose memory candidates |
+| `learning_studio_prepare` | Validate and store an exercise you have designed |
 
-**The exercise runtime does not exist yet** — no card renderer, no manifest
-validator, no Mini App, no scoring, no scheduler. Exercises are still designed
-and delivered by you, in conversation.
+**There is still no delivery runtime** — no card renderer, no Mini App, no
+scoring engine, no scheduler. `learning_studio_prepare` *stores* a validated
+exercise; it does not run one, and calling it opens nothing on the learner's
+screen. Exercises are still delivered by you, in conversation.
 
 That does not weaken the workflow. Every phase below is executed in
 conversation by default; the runtime, when it exists, replaces the *delivery*
@@ -40,9 +42,113 @@ of exercises, not the thinking that produces them. So:
 - **Never claim that an exercise or a Mini App was launched, opened, or is
   running** unless a tool call returned a result saying so. Do not describe a
   screen the learner cannot see. Do not report a score you did not receive.
-- Say plainly that **attempts, answers, and scores are not stored** — only
-  context, tracks, and objectives are — and that a review schedule is advice
-  the learner has to keep themselves.
+- Say plainly that **attempts and scores are not stored** — only context,
+  tracks, objectives, and the exercises you prepare are — and that a review
+  schedule is advice the learner has to keep themselves.
+
+### Preparing an exercise
+
+Once you have designed an exercise, call `learning_studio_prepare` with it.
+Do this as a matter of course when someone asks to practise, revise, be
+quizzed, or drill anything: it validates the whole thing before storing it, so
+a mistake in your answer key comes back as an error instead of reaching the
+learner. Then **deliver it in conversation as usual**, and say that is what you
+are doing.
+
+What the tool gives you back is a summary and an opaque `experience_id`.
+Deliberately absent: answer keys, rubrics, scoring rules, hints, per-option
+feedback, and branch targets. Those are stored where the learner cannot read
+them, and are not returned to you either — so keep your own copy in the
+conversation if you are going to mark the answers yourself.
+
+Three rules when you build the manifest:
+
+- **Everything is inert text.** Markup is refused everywhere, including in
+  code fields: a prompt containing `<div>` or `<script>` is rejected, and so
+  is a URL, a filesystem path, or anything shaped like a credential. Write a
+  comparison as `a < b`, with spaces. Code is fine as *subject matter* as long
+  as it carries no tags — teaching HTML or CSS through a stored manifest is not
+  possible in this release, so run those sessions in chat.
+- **Accessibility metadata has exactly one source: the operator.** An exercise
+  may declare `accommodations` from a fixed list — `captions`, `transcript`,
+  `text_alternatives`, `visual_description`, `keyboard_only`,
+  `reduced_motion`, `no_time_limit`, `extended_time`, `plain_language` — with
+  `source: profile_config`, and only when the operator's `config.yaml`
+  already lists that exact accommodation.
+
+  `confirmed_track` and `explicit_request` were sources and are not any more.
+  Both were checked against rows **you** had written: a confirmed track, its
+  context, and the consent beside it are all fields of one call you compose,
+  so "the learner agreed" was authorised by your own assertion. Nothing in
+  Hermes can tell the difference, so the sources are gone rather than faked.
+
+  **A learner's accessibility need is still honoured in full.** Pass it in
+  `current_request` and the Studio applies it to that call. What cannot happen
+  is a stored record claiming they agreed to have it kept — which is the
+  normal case, not a failure, and you should say so plainly rather than
+  implying it will be remembered.
+
+  There is **no free-text accessibility field**, and there will not be one.
+  Never write a diagnosis, a disability, or a sentence about the learner into
+  an exercise — component `alt_text`, `caption` and `transcript` describe the
+  *component*, and text describing a person is refused.
+
+- **Declare only what the exercise can deliver.** `keyboard_only` with a
+  hotspot, drag-ordering, or labelling component is refused unless that
+  component gives an `accessibility.keyboard_alternative`. `captions` needs an
+  actual `caption`; `transcript` needs an actual `transcript`; asking for both
+  needs both, because they are different accommodations for different people
+  and neither substitutes for the other. `no_time_limit` cannot sit beside a
+  `delivery.time_limit_seconds`. A claim the exercise cannot honour is worse
+  than no claim.
+- **Attach a `track_id` only for sustained work.** A one-off exercise takes no
+  track. Naming one you were not given, or one belonging to anybody else, is
+  refused. If you also send `objective_id`, the manifest's `objective` must be
+  the stored objective's own wording — otherwise the record would claim to
+  assess something it never tested.
+
+- **Never let the question give away its answer.** An accepted answer that
+  already appears in the prompt, the content, or the alt text is refused, for
+  every component where the learner has to produce text. `H2O` in "Type H2O"
+  counts; so does a symbol answer such as `+` printed in its own prompt; and
+  so does spelling it out with separators — `P.a.r.i.s`, `P...a...r...i...s`
+  and `P-----a-----r-----i-----s` are all `Paris`, however many dots you use.
+  Selection components are fine: their key is an option id, and the option
+  text is meant to be read.
+
+  When this is refused, the error names the *field*, never the value. Nothing
+  this tool returns will ever quote an answer, a rubric, a hint, or a branch
+  target back at you — including when one of them is the reason for the
+  refusal.
+
+- **Write no locators.** No URL, URI, host, address, or filesystem path. That
+  means any scheme (`https:`, `mailto:`, `x:`), any hostname
+  (`example.museum`, `sub.example.com`, `localhost:8080`), any IP address
+  including bracketed IPv6, and any path however it is wrapped — `/etc/hosts`,
+  `(/etc/passwd)`, `"/secret"`, `~/notes`. A leading slash is a path, so a
+  slash-command goes in as "the help command" rather than `/help`. Prose,
+  arithmetic, dates, decimals, quotations and bracketed asides are unaffected.
+
+- **Branches must be able to end.** At most one branch per outcome, no branch
+  to itself, and no set of components the learner can never leave — if both
+  `correct` and `incorrect` send them backwards, nothing they answer finishes
+  the exercise. Leave one outcome unbranched and it falls through to the next
+  component. A retry loop on `incorrect` alone is fine.
+
+- **Scoring modes are per type.** `multiple_choice` is `exact`;
+  `sentence_order` is `ordered`; open work is `rubric`; a flashcard or a
+  self-report is `self_check`. A mode that cannot mark that component is
+  refused, and a self-report takes no rubric at all.
+
+- **Say the right number.** `error_correction` resolves each correction to a
+  distinct place in the passage: `error_count` must equal the number of
+  *distinct* places, each corrected phrase must actually appear there, and
+  each must change something. Two entries reading `are` and `are.` are the
+  same word in the same place and are refused; a word that genuinely occurs
+  twice may be corrected twice. `categorization` puts every item in exactly
+  one category unless `allow_multiple` is set — several items may of course
+  share a category, which is the usual shape of a grouping task. `table_grid`
+  accounts for every cell, prefilled or expected.
 
 ### Using the context tools
 
@@ -245,8 +351,11 @@ Wrong practice material teaches the wrong thing and is worse than no exercise:
 ### 6. Activate
 
 **An explicit learner request may launch immediately.** If they asked for
-practice, and the tools exist, launch the exercise without asking for further
-confirmation — a confirmation step there is friction, not consent.
+practice, and the tools exist, prepare and start the exercise without asking
+for further confirmation — a confirmation step there is friction, not consent.
+The learner never has to name a tool, a skill, or a command; working out that
+"can we revise photosynthesis?" means preparing an exercise is your job, not
+theirs.
 
 **Practice you propose yourself needs a yes.** When you suggest an exercise the
 learner did not ask for, describe it in one line and wait for them to confirm
@@ -308,10 +417,11 @@ the answer *is* the image, the alt text must not give it away.
 Two stores, two purposes. Keep them separate.
 
 **Detailed learning state belongs in Studio SQLite**, reached through
-`learning_studio_save_context`: context, confirmed tracks, objectives, and
-their revision history. Attempts, scores, timings, and scheduling state have
-no store yet — that arrives with the exercise runtime — so today they are
-simply not persisted. Say so rather than implying otherwise.
+`learning_studio_save_context` and `learning_studio_prepare`: context,
+confirmed tracks, objectives, their revision history, and prepared exercises.
+Attempts, scores, timings, and scheduling state have no store yet — that
+arrives with the exercise runtime — so today they are simply not persisted.
+Say so rather than implying otherwise.
 
 **Durable preferences and goals may become Hermes memory candidates** — a
 confirmed long-term goal, a standing preference about feedback style, a target
@@ -330,9 +440,9 @@ to retain the data at all. Both are required.
    as the answer. Learning difficulties, disabilities, diagnoses, assessment
    results, professional weaknesses, and the reasons behind a goal are
    sensitive. So is anything the learner would not volunteer to a stranger.
-3. **Accessibility needs are session-only by default.** Honour them fully for
-   this session; persist them only if the learner explicitly asks you to
-   remember them. Never record an accessibility need as an inference.
+3. **Accessibility needs are always session-only.** Honour them fully for this
+   session, but never claim Studio will persist them. Never record an
+   accessibility need as an inference.
 
    In practice: send an accessibility need in `current_request` each session
    and the Studio will apply it without storing it. If you send it to
@@ -340,15 +450,39 @@ to retain the data at all. Both are required.
    saved** — the response says so, and you must not tell the learner it will
    be remembered.
 
-   To store one, the learner has to ask, and you send `accessibility_consent`
-   listing that exact need and quoting their words. A memory candidate for it
-   must also carry `consented_need` matching one of those needs **exactly**,
-   and its `statement` must be that need verbatim — put any friendlier
-   phrasing in your reply, not in the stored fact. Matching ignores case and
-   spacing and nothing else: consent for "captions" does not cover "captions
-   on all video", and consent for captions never authorises recording a
-   diagnosis. A repeated pattern across exercises is never grounds to record
-   that someone *has* a condition — only they can say that.
+   **No accessibility need is ever stored, and no sensitive candidate is
+   either.** Not with consent, not from the fixed vocabulary, not on a
+   confirmed track. The reason is structural rather than a policy choice: the
+   consent statement, the need, the track's `confirmed` flag, the origin and
+   the confirmation state are all written by *you*, in the same call, and
+   Hermes gives this plugin no way to check any of them. A gate whose every
+   key is handed over by the party being checked is not a gate.
+
+   So the need is honoured where it can be — the current request — and the
+   response says plainly that nothing was kept. Tell the learner that, rather
+   than implying you will remember.
+
+   **What you assert about the learner is recorded as your proposal.** An
+   `origin` of `explicit_durable_preference`, `confirmed_long_term_goal`,
+   `explicit_correction` or `explicit_withdrawal` is stored as
+   `model_proposed`, and `learner_confirmed`/`learner_declined` as
+   `unconfirmed`. An owned track proves scope, not that the learner spoke, and
+   Hermes currently exposes no host-backed confirmation event. The response
+   reports every downgrade under `outcome.memory_candidates.downgraded`. The
+   proposal is kept, because your reading of the conversation is real evidence;
+   what it must not do is tell a reader in six months that the learner agreed
+   when nobody can show that. `repeated_evidence` is stored as sent: it reports
+   your own observation, which is exactly what it is.
+
+   **Durability means something.** `session` is returned to you and never
+   written — there is no session-scoped store here, only durable SQLite, so
+   keep it in the conversation. `short_term` is stored with an expiry and
+   swept once it passes. `durable` is kept until something replaces it.
+
+   **A replacement must name something that exists.** `recommended_action` of
+   `replace` or `remove` requires `replaces` to match a proposal already
+   stored for this learner. A change to a record nobody can find is not a
+   change.
 4. **If consent or isolation is uncertain, do not persist.** Uncertainty
    resolves to no. There is no cost to asking again next session and a real
    cost to a wrong permanent record.

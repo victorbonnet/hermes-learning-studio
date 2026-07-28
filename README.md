@@ -5,14 +5,16 @@ learning: structured study sessions built on active recall and spaced
 repetition.
 
 > **Status: early development.** This is not the feature-complete public
-> release. What exists today is a bundled skill plus two tools that remember a
-> learner's **context** — their goals, level, preferences, and confirmed
-> learning tracks — in profile-scoped SQLite.
+> release. What exists today is a bundled skill plus three tools: two that
+> remember a learner's **context** — their goals, level, preferences, and
+> confirmed learning tracks — and one that validates and stores the
+> **exercises** an agent designs, all in profile-scoped SQLite.
 >
-> There is still **no exercise runtime**: no card renderer, no manifest
-> validator, no Mini App, no scoring, no scheduler, and no network requests.
-> Exercises run as ordinary conversation, and attempts, answers, and scores
-> are not persisted. See [Roadmap](#roadmap) for what is still to come.
+> There is still **no delivery runtime**: no card renderer, no Mini App, no
+> scoring engine, no scheduler, and no network requests. A prepared exercise is
+> stored data, not a running session; exercises are delivered as ordinary
+> conversation, and attempts and scores are not persisted. See
+> [Roadmap](#roadmap) for what is still to come.
 
 ## Install
 
@@ -97,8 +99,11 @@ installable **Python package**, which drives the layout:
 │   ├── storage.py              # SQLite connections and versioned migrations
 │   ├── context.py              # Precedence resolution
 │   ├── candidates.py           # Memory-candidate rules
+│   ├── safety.py               # Content rules — inert text or nothing
+│   ├── components.py           # The trusted component registry (31 types)
+│   ├── manifest.py             # The experience envelope and its validation
 │   ├── service.py              # Reads, writes, ownership, consent gates
-│   ├── schemas.py              # JSON schemas for the two tools
+│   ├── schemas.py              # JSON schemas for the three tools
 │   ├── tools.py                # Tool handlers
 │   └── skills/
 │       └── adaptive-learning/
@@ -202,14 +207,16 @@ never an authorisation check.
 All primary keys are opaque generated tokens, so nothing keys on a label a
 learner can change.
 
-**Migrations are all-or-nothing, and never destructive.** Each migration runs
-in its own transaction and rolls back completely on failure, because a
-half-applied schema is harder to recover from than a failed startup. A
+**Migrations are all-or-nothing.** All pending migrations run in one shared
+transaction and roll back together on failure, because a half-applied schema
+is harder to recover from than a failed startup. Explicit privacy and retention
+migrations may purge rows that the current policy forbids keeping; unrelated
+data is preserved and the cleanup rolls back with the upgrade batch on failure. A
 database written by a newer version of the plugin is refused with an
-explanation and left untouched — deleting or "resetting" it would destroy a
-learner's record to make the code happy.
+explanation and left byte-for-byte untouched — deleting or "resetting" an
+unfamiliar database would destroy a learner's record to make the code happy.
 
-**`register()` opens no database.** It registers a skill and two tools and
+**`register()` opens no database.** It registers a skill and three tools and
 returns. Initialising storage at startup would let a corrupt or
 newer-versioned database take the whole plugin down, instead of failing one
 tool call with a message the agent can act on.
@@ -246,10 +253,9 @@ learning_studio:
   # memory candidate (2–50).
   memory_candidate_min_evidence: 3
 
-  # Operator policy, not consent. Accessibility needs are session-only by
-  # default regardless; this only decides whether they *may* be stored
-  # durably when a learner explicitly asks. Set false on a shared or managed
-  # profile to refuse even on request.
+  # Deprecated compatibility switch. Accessibility is never stored. True
+  # accepts and validates the old accessibility_consent audit payload for the
+  # response only; false rejects that payload. Neither value permits storage.
   allow_durable_accessibility_needs: true
 
   # Longest single context value, in characters (80–20000).
@@ -289,9 +295,9 @@ shared between them.
 
 ## Tools
 
-Two tools, both in the `plugin_learning_studio` toolset. Neither takes a
-learner argument: identity is resolved from the Hermes session, so a call
-always reads and writes the context of whoever sent the current message.
+Three tools, all in the `plugin_learning_studio` toolset. None takes a learner
+argument: identity is resolved from the Hermes session, so a call always reads
+and writes the record of whoever sent the current message.
 
 ### `learning_studio_get_context`
 
@@ -320,6 +326,152 @@ Repetition, agent confidence, and prior sessions are not confirmation, and no
 code path treats them as such.
 
 `outcome.not_stored` lists anything deliberately dropped, with a reason.
+
+### `learning_studio_prepare`
+
+Validates a complete **experience manifest** — an ordered set of exercise
+components with their answer keys — and stores it transactionally. Returns an
+opaque `experience_id` and a learner-safe summary.
+
+The manifest is the UI contract. It is data, never renderer code: no tool here
+generates HTML, and every string is checked to be inert text. See
+[Exercise manifests](#exercise-manifests).
+
+## Exercise manifests
+
+An agent designs an exercise; this plugin decides whether it is storable. The
+contract has three parts.
+
+**A discriminated component registry.** Thirty-one component types across nine
+families — selection, text input, ordering and matching, recall, visual,
+timeline and process, structured, scenarios, and reflection. A component's
+`type` selects exactly one specification; an unknown type is refused, and so is
+any field that specification does not declare, at every level of nesting. The
+registry is subject-neutral by design: `fill_blank` serves a chemistry equation
+and a Spanish conjugation equally, and nothing privileges one discipline.
+
+`code_response` collects and compares code **as text**. Nothing in this plugin
+compiles, imports, or runs it, and a test parses every source file to prove
+there is no `eval`, `exec`, `compile`, or `subprocess` anywhere that could.
+
+**Visible and hidden are different places, not different names.** Each
+component splits in two:
+
+| Half | Fields | Where it goes |
+| --- | --- | --- |
+| Learner-visible | `id`, `type`, `prompt`, `content`, `accessibility` | `experience_components` |
+| Evaluator-only | `answer`, `evaluation` (rubric, scoring, hints, feedback, branching, notes) | `experience_component_evaluations` |
+
+The learner payload is **constructed from an allowlist**, not filtered. A field
+that is not named in `LEARNER_VISIBLE_KEYS` cannot reach a learner, whatever a
+future caller does, and nothing has to remember to delete anything. The split
+runs all the way into the schema: the learner-facing table contains no answer
+column, so a projection that forgets to exclude one still cannot leak a key.
+The tool's own response is built from the visible half, so no answer travels
+back through the model either. Tests put a distinctive canary in every hidden
+field and assert recursively that none appears in the payload, the projection,
+or the tool response.
+
+**Inert text or nothing.** Every string — learner-visible and evaluator-only
+alike — is refused if it contains markup, event-handler attributes, `javascript:`
+or `data:` URLs, HTML entities, stylesheet syntax, any URL, a filesystem path,
+`../` traversal, credential-shaped values, or invisible and bidirectional
+characters. Hidden fields are held to the same rule because hidden today is not
+hidden forever, and a store that already holds markup has to be sanitised on
+the way out forever.
+
+*A known limitation:* this makes it impossible to ship HTML, CSS, or JavaScript
+**as subject matter** through a stored manifest — a lesson on the box model
+cannot put `<div>` in a prompt. That is a deliberate trade while there is no
+renderer, and those subjects are still teachable in conversation. Lifting it
+needs a reviewed, explicitly escaped inert-code channel and the renderer that
+would have to honour it.
+
+**The schema and the runtime agree wherever a schema can say so.** Identifier,
+locale and date patterns are published as strings and compiled from those same
+strings; identifier lists reference the shared definition and advertise
+uniqueness; bounded text advertises a pattern that refuses blank strings,
+markup, and scheme-qualified URLs, generated from the same two declarations the
+validator compiles; each component type advertises exactly the scoring modes it
+accepts.
+
+The rest of the content rules — paths, hosts, credential shapes, stylesheet
+syntax — need alternation the two regex dialects disagree about, so they stay
+runtime-only and the field description says so. Cross-field rules (an answer
+that references an option, an objective that must match a stored one) are the
+runtime's job too. `tests/test_schema_parity.py` runs representative invalid
+values through a real JSON Schema implementation, the plugin's own validator,
+and the manifest builder, so the agreement is *verified* rather than asserted —
+and where the runtime is deliberately stricter, a test says which cases and
+why.
+
+The union of all 31 types is large — about 55 KB, of which the shapes every
+type shares are emitted once under `$defs` rather than 31 times, cutting it
+from over 140 KB. That is the price of a schema that refuses what the runtime
+refuses; a future PR could trade it for a per-type lookup tool if the prompt
+cost proves too high in practice.
+
+**Accessibility metadata has one authoritative source: the operator.** An
+experience declares `accommodations` from a closed vocabulary — captions,
+transcript, text alternatives, visual description, keyboard-only, reduced
+motion, no time limit, extended time, plain language — with
+`source: profile_config`, checked against the profile's `config.yaml`. Matching
+is exact on the canonical form, with no fuzzy, substring, or semantic step.
+
+Two other sources existed and were removed, both for the same reason.
+`explicit_request` was checked against the learner's temporary context — a row
+the model had written in an earlier call. `confirmed_track` was checked against
+a track's context, and one `save_context` call can create the track, set
+`confirmed: true`, write the context, and supply the consent that supposedly
+authorises it. A source a model can populate is not a source, so what remains
+is a file a person edits.
+
+**No accessibility need about a person is stored.** An accessibility need is
+never written to storage, whatever consent accompanies it, and an `accessibility`
+memory candidate is refused however it is presented. The consent statement, the
+need, the track flag, the origin and the confirmation all arrive in one tool
+call, written by one model, and Hermes exposes no confirmation event to check
+them against. A gate whose every key is held by the party being checked is not
+a gate. The need is honoured for the request that carries it, and the response
+says plainly that nothing was kept.
+
+**What the model asserts about the learner is recorded as the model's
+proposal.** An `origin` claiming the learner stated, confirmed, corrected or
+withdrew something is stored as `model_proposed`, and
+`learner_confirmed`/`learner_declined` as `unconfirmed`. Hermes currently exposes
+no host-backed confirmation event that could establish those claims. An owned
+track proves scope, not that the learner spoke. `repeated_evidence` is
+stored as sent, because it reports the agent's own observation. Every downgrade
+is reported in the response. A replacement or removal must name a proposal
+already stored for that learner.
+
+**Candidate durability describes what actually happens.** `session` is returned
+and never written, because this plugin has only durable SQLite and no
+session-scoped store to be honest about. `short_term` is stored with an expiry
+and swept on the next read. `durable` is kept.
+
+There is deliberately **no free-text accessibility field** on the manifest. A
+box to type in is a box a diagnosis eventually gets typed into, and this
+metadata is neither consented to nor an appropriate place for one. Component
+alt text and captions are free text, and are refused if they describe a person
+rather than the component: a diagnosis, a disability label, or a sentence about
+the learner cannot be stored. The same vocabulary stays legal in prompts and
+content, because an exercise about glaucoma is an exercise about glaucoma.
+
+**A declared accommodation must be deliverable.** `keyboard_only` alongside a
+hotspot, labelling, matching, or drag-ordering component is refused unless that
+component supplies a keyboard alternative; `captions` and `visual_description`
+require the corresponding metadata on every asset-bearing component. Telling a
+learner an exercise is usable when it is not is worse than claiming nothing.
+
+Preparing an exercise writes no context, creates no track, and proposes no
+memory candidate; exercise metadata never becomes a durable fact about a
+person.
+
+**Source references are described, not linked.** Title, author, publication
+date, citation label, an approved source identifier, and a note. No URLs, no
+paths, no credentials — this PR fetches nothing, so nothing may look
+fetchable.
 
 ## Identity
 
@@ -407,12 +559,13 @@ score, raw attempts, or session state — and it may never carry raw answers,
 transcripts, session identifiers, tokens, credentials, or an inferred
 disability or diagnosis.
 
-Accessibility needs are **session-only by default**, and session-only means
-absent from the database rather than merely short-lived in it. Send them in
-`current_request` to have them applied without being stored.
+Accessibility needs are **always session-only**, and session-only means absent
+from the database rather than merely short-lived in it. Send them in
+`current_request` to guide context resolution without storing them.
 
-Storing one requires `accessibility_consent`, which names the exact needs the
-learner agreed to and quotes what they said:
+`accessibility_consent` is retained only as a compatibility/audit input. It is
+validated and reported back, but cannot authorise persistence because the
+statement and the need are both model-controlled:
 
 ```json
 {
@@ -431,28 +584,25 @@ learner agreed to and quotes what they said:
 }
 ```
 
-A sensitive candidate must satisfy **five** independent conditions: category
-`accessibility`; an origin that is the learner stating it (never
-`repeated_evidence`); `confirmation_state: learner_confirmed`; consent that
-exists; and `consented_need` matching one of the agreed needs exactly. The
-`statement` must *be* the consented need — presentation wording belongs in
-your reply to the learner, never in the stored fact.
-
-Matching is on the canonical form only: NFKC, trimmed, internal whitespace
-collapsed, case-folded. **No fuzzy matching, no substrings, no model.** So
-`Captions On Audio` matches `captions on audio`, while `captions` does **not**
-cover `captions on all video and audio` — those are different needs, and only
-the learner can say which they agreed to. Consent to remember captions never
-authorises storing a diagnosis.
+The candidate in that example is returned as rejected and no accessibility
+row is written. There is no model argument, consent quotation, confirmation
+flag, or track record that changes this. Manifest accessibility metadata is
+authorised only by operator profile configuration, which a tool call cannot
+create or modify.
 
 ## Roadmap
 
-Deliberately **not** here yet: the exercise runtime and manifest validator,
-card renderers, the FastAPI dashboard and Mini App, Telegram authentication,
-frontend code, Cloudflare tunnels, slash commands, managed asset import,
-image generation, progress dashboards, and any scheduler. Each lands in a
-later PR. The skill describes how the agent will use those capabilities and
-instructs it to fall back to chat until they exist.
+Deliberately **not** here yet: the exercise delivery runtime, card renderers,
+attempt and score storage, the FastAPI dashboard and Mini App, Telegram
+authentication, frontend code, Cloudflare tunnels, slash commands, managed
+asset import, image generation, progress dashboards, and any scheduler. Each
+lands in a later PR. The skill describes how the agent will use those
+capabilities and instructs it to fall back to chat until they exist.
+
+Manifests are validated and stored, but nothing reads them back to a learner
+yet: `learning_studio_prepare` is the data contract a renderer will later
+consume, written down now so that the wire format is settled before there is
+data in it.
 
 ## Development
 

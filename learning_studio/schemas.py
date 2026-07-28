@@ -30,6 +30,7 @@ from .models import (
 
 GET_TOOL_NAME = "learning_studio_get_context"
 SAVE_TOOL_NAME = "learning_studio_save_context"
+PREPARE_TOOL_NAME = "learning_studio_prepare"
 
 _MAX_ITEMS = 25
 
@@ -136,10 +137,11 @@ _TRACK = {
     "type": "object",
     "additionalProperties": False,
     "description": (
-        "Create or update an ongoing learning track. Creating one requires "
-        "confirmed=true — an explicit yes from the learner that they want sustained "
-        "work on this. Repetition, your own confidence, and prior sessions are not "
-        "confirmation."
+        "Create or update an ongoing learning track. Creating one requires confirmed=true, "
+        "which is your assertion that the learner said yes in so many words - repetition, "
+        "your own confidence, and prior sessions are not that. The flag is a deliberate "
+        "speed bump, not proof: this plugin cannot verify it, so a track authorises nothing "
+        "sensitive and never stands in for consent."
     ),
     "properties": {
         "track_id": _TRACK_ID,
@@ -152,8 +154,9 @@ _TRACK = {
         "confirmed": {
             "type": "boolean",
             "description": (
-                "True only when the learner has explicitly agreed to an ongoing track. "
-                "Without it no durable track is created and the context stays temporary."
+                "Set only when the learner has explicitly agreed to ongoing work. Without "
+                "it no durable track is created and the context stays temporary. You are "
+                "asserting this; nothing here can check it."
             ),
         },
         "status": {
@@ -165,8 +168,9 @@ _TRACK = {
             ),
         },
         "context": context_object(
-            "Durable context for this track. Accessibility needs are dropped unless the "
-            "same call carries accessibility_consent naming that specific need."
+            "Durable context for this track. Accessibility needs are session-only and are "
+            "always returned without being stored; accessibility_consent cannot authorise "
+            "durable storage because it is model-controlled too."
         ),
     },
 }
@@ -232,19 +236,36 @@ _MEMORY_CANDIDATE = {
         },
         "origin": {
             "type": "string",
-            "enum": [o.value for o in Origin],
+            "enum": [o.value for o in Origin if o is not Origin.MODEL_PROPOSED],
             "description": (
                 "What produced this proposal. Only these origins may. One error, one slow "
-                "reply, a single inference, momentary frustration, a raw score, or "
-                "session state must never become a candidate."
+                "reply, a single inference, momentary frustration, a raw score, or session "
+                "state must never become a candidate. Note that an origin asserting the "
+                "learner said, confirmed, corrected or withdrew something is always stored "
+                "as 'model_proposed' - an owned track proves scope, not what the learner "
+                "said. The response reports the downgrade."
             ),
         },
         "recommended_action": {"type": "string", "enum": [a.value for a in Action]},
         "confidence": {"type": "string", "enum": [c.value for c in Confidence]},
-        "durability": {"type": "string", "enum": [d.value for d in Durability]},
+        "durability": {
+            "type": "string",
+            "enum": [d.value for d in Durability],
+            "description": (
+                "What happens to the proposal. 'session' is returned to you and never "
+                "stored, because this plugin has only durable SQLite and no session-scoped "
+                "store. 'short_term' is stored with an expiry and swept once it passes. "
+                "'durable' is kept until something replaces it."
+            ),
+        },
         "confirmation_state": {
             "type": "string",
             "enum": [s.value for s in ConfirmationState],
+            "description": (
+                "'learner_confirmed' and 'learner_declined' are always stored as "
+                "'unconfirmed': neither an owned track nor anything else in a tool call "
+                "can show that a learner reached a decision."
+            ),
         },
         "replaces": {
             "type": "string",
@@ -260,10 +281,10 @@ _MEMORY_CANDIDATE = {
             "minLength": 1,
             "maxLength": MAX_VALUE_CHARS,
             "description": (
-                "Required for an 'accessibility' candidate, and only for one. Must be "
-                "exactly one of the needs listed in accessibility_consent.needs, and the "
-                "statement must be that same need. Consent to remember one need is never "
-                "consent to record another fact about someone's health."
+                "Accepted for compatibility and always refused. An 'accessibility' "
+                "candidate cannot be stored at all: the consent, the need, the origin and "
+                "the confirmation would all be written by you in this one call, so none of "
+                "them shows that the learner agreed. Honour the need in conversation."
             ),
         },
         "evidence_count": {
@@ -284,25 +305,29 @@ _ACCESSIBILITY_CONSENT = {
     "additionalProperties": False,
     "required": ["consent_statement", "needs"],
     "description": (
-        "Send this ONLY when the learner has explicitly asked you to remember a specific "
-        "accessibility need. Without it, accessibility needs are honoured for the current "
-        "request and never written to storage. Never infer it, and never reuse consent "
-        "given for one need to store a different one."
+        "Records what the learner said when agreeing, for your own reasoning and the "
+        "response's audit trail. It does NOT authorise storage: accessibility needs are "
+        "never written to storage under any circumstances, because this statement and the "
+        "need beside it are both written by you in the same call. Honour the need in the "
+        "current request and pass it again next session."
     ),
     "properties": {
         "consent_statement": {
             "type": "string",
             "minLength": 1,
             "maxLength": MAX_VALUE_CHARS,
-            "description": "What the learner actually said when agreeing, in their words.",
+            "description": (
+                "Your record of what the learner said when agreeing, in their words. "
+                "Reported back to you; never treated as proof."
+            ),
         },
         "needs": {
             "type": "array",
             "maxItems": MAX_LIST_ITEMS,
             "items": {"type": "string", "minLength": 1, "maxLength": MAX_VALUE_CHARS},
             "description": (
-                "The exact needs they agreed to have remembered. Only values listed here "
-                "may be stored; anything else is dropped."
+                "The exact needs they agreed to have remembered. None of them is stored: "
+                "the response says so for each one."
             ),
         },
     },
@@ -353,7 +378,68 @@ SAVE_CONTEXT_SCHEMA: dict[str, Any] = {
     },
 }
 
+
+def _prepare_parameters() -> dict[str, Any]:
+    """Build the prepare schema from the component registry itself.
+
+    Generated rather than written out, so the schema the model is shown and
+    the rules the handler enforces are the same declarations. A component type
+    added to the registry appears here automatically; one described here that
+    the registry does not implement cannot exist.
+    """
+    from .components import components_schema, shared_definitions
+    from .manifest import manifest_schema
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["manifest"],
+        # Shapes every component type shares, stated once. The union of 31
+        # fully inlined types is over 140 KB of schema on every request; these
+        # references are the same declarations, written down a single time.
+        "$defs": shared_definitions(),
+        "properties": {
+            "track_id": {
+                **_TRACK_ID,
+                "description": (
+                    "Attach this experience to a confirmed learning track. Omit it for a "
+                    "one-off exercise; a track is never created here."
+                ),
+            },
+            "objective_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "description": (
+                    "An existing objective on that track that this experience assesses. "
+                    "Requires track_id."
+                ),
+            },
+            "manifest": manifest_schema(components_schema()),
+        },
+    }
+
+
+PREPARE_SCHEMA: dict[str, Any] = {
+    "name": PREPARE_TOOL_NAME,
+    "description": (
+        "Prepare a bespoke exercise for the person you are talking to and store it as "
+        "validated data. Use it whenever someone asks to practise, revise, be quizzed, "
+        "drill, or test themselves on anything at all - any subject, any level. You "
+        "design the exercise: choose the components, write the prompts, and supply the "
+        "answer key. The answer key, rubrics, scoring rules, hints and feedback are kept "
+        "server-side and are never returned to you, so nothing you get back can give the "
+        "answers away. Returns an opaque experience id and a learner-safe summary. This "
+        "tool stores an exercise; it does not run one, render one, or open anything - "
+        "deliver it in conversation and say so. The learner is identified from the Hermes "
+        "session, never from an argument."
+    ),
+    "parameters": _prepare_parameters(),
+}
+
+
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     GET_TOOL_NAME: GET_CONTEXT_SCHEMA,
     SAVE_TOOL_NAME: SAVE_CONTEXT_SCHEMA,
+    PREPARE_TOOL_NAME: PREPARE_SCHEMA,
 }
