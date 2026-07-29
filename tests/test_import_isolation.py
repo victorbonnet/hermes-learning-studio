@@ -161,6 +161,57 @@ def test_import_tool_fails_safely_when_pillow_is_absent(
     assert not (home / "workspace" / "learning-studio" / "assets").exists()
 
 
+def test_registration_does_not_reach_the_web_package(without_optional_deps):
+    """The Mini App API must not be imported by enabling the plugin.
+
+    It lives behind the ``web`` extra, so an install that never opted in has
+    no FastAPI — and would crash at startup if registration touched it.
+    """
+    module = importlib.import_module("learning_studio")
+    from tests.fake_hermes import FakePluginContext
+
+    module.register(FakePluginContext(plugin_name="learning-studio"))
+
+    assert "learning_studio.web.app" not in sys.modules
+
+
+def test_the_web_package_itself_imports_without_fastapi(without_optional_deps):
+    """Asking *whether* the extra is installed must not require it."""
+    web = importlib.import_module("learning_studio.web")
+
+    assert web.extra_is_installed() is False
+    assert "fastapi" not in sys.modules
+
+
+def test_the_api_module_needs_the_extra_and_says_so(without_optional_deps):
+    with pytest.raises(ImportError):
+        importlib.import_module("learning_studio.web.app")
+
+
+def test_telegram_verification_needs_no_optional_dependency(without_optional_deps):
+    """Authentication is standard library, so it is testable and auditable."""
+    telegram_auth = importlib.import_module("learning_studio.telegram_auth")
+
+    with pytest.raises(telegram_auth.InitDataError):
+        telegram_auth.verify_init_data(
+            "auth_date=1&hash=" + "a" * 64, bot_token="x", now=1, max_age_seconds=60
+        )
+
+
+def test_the_web_extra_is_declared_separately_from_the_base_package():
+    import tomllib
+    from pathlib import Path
+
+    pyproject = tomllib.loads(
+        (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    assert pyproject["project"]["dependencies"] == []
+    extras = pyproject["project"]["optional-dependencies"]
+    assert any(spec.startswith("fastapi") for spec in extras["web"])
+    assert not any(spec.startswith("fastapi") for spec in extras["media"])
+
+
 def test_sqlite3_is_the_only_storage_dependency():
     """The standard library, so a bare install still persists."""
     import learning_studio.storage as storage

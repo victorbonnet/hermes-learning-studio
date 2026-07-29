@@ -11,11 +11,15 @@ repetition.
 > **exercises** an agent designs, plus a secure managed-image importer, all in
 > profile-scoped storage.
 >
-> There is still **no delivery runtime**: no card renderer, no Mini App, no
-> scoring engine, no scheduler, and no network requests. A prepared exercise is
-> stored data, not a running session; exercises are delivered as ordinary
-> conversation, and attempts and scores are not persisted. See
-> [Roadmap](#roadmap) for what is still to come.
+> There is now a **secure API** behind the optional `web` extra: a
+> Telegram-authenticated FastAPI service that serves a stored exercise to its
+> owner and collects their responses. See
+> [Telegram Mini App API](#telegram-mini-app-api).
+>
+> There is still **no delivery runtime**: no card renderer, no Mini App
+> frontend, no scoring engine, no scheduler, and nothing that starts a server
+> or opens a tunnel. Responses collected by the API live in the session and are
+> not marked or persisted. See [Roadmap](#roadmap) for what is still to come.
 
 ## Install
 
@@ -135,6 +139,13 @@ installable **Python package**, which drives the layout:
 │   ├── service.py              # Reads, writes, ownership, consent gates
 │   ├── schemas.py              # JSON schemas for the four tools
 │   ├── tools.py                # Tool handlers
+│   ├── telegram_auth.py        # Mini App initData verification (stdlib only)
+│   ├── authorization.py        # Allowlist intersection — narrows, never widens
+│   ├── sessions.py             # Expiring, opaque, in-memory Mini App sessions
+│   ├── web/                    # Optional `web` extra — nothing else imports it
+│   │   ├── dependencies.py     # The single injection point
+│   │   ├── security.py         # Headers, body limits, rate limits, redaction
+│   │   └── app.py              # The protected API
 │   └── skills/
 │       └── adaptive-learning/
 │           ├── SKILL.md        # The orchestration workflow
@@ -172,9 +183,10 @@ path honest.
 **Registration cannot fail.** `register(ctx)` is called at every Hermes startup
 for every enabled plugin. It registers one skill, imports nothing optional, and
 declares no `requires_env` — so enabling the plugin cannot break a session.
-Pillow, and the FastAPI dependency a later PR introduces, must stay behind lazy
-imports inside the code paths that need them; a test blocks those modules at
-import time and asserts registration still succeeds.
+Pillow stays behind a lazy import inside the code path that needs it, and
+FastAPI lives entirely inside `learning_studio/web/`, which nothing on the
+plugin surface imports; a test blocks both modules at import time and asserts
+registration still succeeds.
 
 **One skill, many references.** The skill is a single orchestration workflow —
 discovery, objectives, pedagogy, format selection, verification, activation,
@@ -296,6 +308,29 @@ learning_studio:
   max_asset_width: 8192
   max_asset_height: 8192
   max_asset_pixels: 40000000
+
+  # ── Telegram Mini App API (optional `web` extra) ─────────────────────
+  # Behaviour only. The bot token stays in .env; there is no setting for it.
+
+  # How long a Mini App session stays usable, in seconds (60–86400).
+  mini_app_session_ttl_seconds: 1800
+
+  # How old signed initData may be when a session is opened (30–3600).
+  mini_app_init_data_max_age_seconds: 300
+
+  # Largest accepted request body, in bytes (512–1048576).
+  mini_app_max_request_bytes: 16384
+
+  # Sliding-window rate limit, per Telegram user and per session.
+  mini_app_rate_limit_requests: 60
+  mini_app_rate_limit_window_seconds: 60
+
+  # Upper bound on concurrently held sessions (1–100000).
+  mini_app_max_sessions: 500
+
+  # Optional NARROWING of the profile's Telegram allowlist. Empty means no
+  # additional restriction. It can never add a user the profile excludes.
+  mini_app_allowed_telegram_users: []
 
   # Context values that apply to everyone on this profile.
   profile_context:
@@ -647,6 +682,141 @@ flag, or track record that changes this. Manifest accessibility metadata is
 authorised only by operator profile configuration, which a tool call cannot
 create or modify.
 
+## Telegram Mini App API
+
+An optional FastAPI service that serves a stored exercise to the person who
+owns it, over a Telegram-authenticated, same-origin API. It is **not started by
+the plugin**: nothing in this release launches a server, opens a tunnel, or
+sends a Telegram button. This PR builds the boundary; process lifecycle and the
+frontend land later.
+
+```bash
+uv pip install "hermes-learning-studio[web]"
+```
+
+Nothing outside `learning_studio/web/` imports FastAPI, and `register(ctx)`
+never reaches that package — an install without the extra keeps a fully working
+plugin, which tests assert by blocking the module at import time.
+
+### Authentication
+
+Every request carries the raw Telegram `initData` string in an
+`X-Telegram-Init-Data` header, verified per Telegram's specification:
+
+- the data-check string is every field except `hash` **and** `signature`,
+  sorted, `key=value`, joined with `\n`;
+- the key is `HMAC-SHA256(key="WebAppData", data=<bot token>)`;
+- the comparison is `hmac.compare_digest`, never `==`;
+- `auth_date` must be recent (300 s to open a session) and not in the future;
+- the `user` object must name a real, non-bot numeric ID — and **only that ID
+  is kept**. Names, usernames, language, and photo are discarded.
+
+A launch from a group, supergroup, or channel is refused: a Mini App session
+reads one person's learning record, which is not a room's business.
+
+The bot token is read from `TELEGRAM_BOT_TOKEN` in `.env`, where Hermes already
+keeps it. It is never copied into `config.yaml`, a database row, a response, a
+log line, or a process argument, and the raw `initData` payload is never stored
+anywhere.
+
+### Authorisation is an intersection
+
+```
+effective access = profile Telegram allowlist  ∩  plugin restriction
+```
+
+The profile allowlist is Hermes' own: `TELEGRAM_ALLOWED_USERS` in `.env` plus
+`platforms.telegram.extra.allow_from` / `allow_admin_from` in `config.yaml`.
+`mini_app_allowed_telegram_users` can only **narrow** it — there is no setting
+that adds a user, because a plugin able to widen the host's allowlist would be
+a privilege-escalation feature with a configuration file for an interface.
+
+Group-only authorisations (`TELEGRAM_GROUP_ALLOWED_USERS`,
+`group_allowed_chats`) grant nothing here. An empty allowlist authorises
+nobody, and a host configuration that cannot be read authorises nobody.
+
+### Sessions
+
+Opening a session exchanges fresh `initData` and an `experience_id` for an
+opaque random token, scoped to `(profile, Telegram user, learner, track,
+experience)` and expiring after `mini_app_session_ttl_seconds`. Sessions live
+in memory only — a bearer token is never written to the database or to disk,
+and a restart ends every session. The store keeps the SHA-256 digest of the
+token, so the token itself exists only in the response that minted it.
+
+Both credentials are checked on **every** request: the Telegram payload and the
+session token, and the token is refused if the Telegram account presenting it
+is not the one it was minted for.
+
+### Routes
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Authenticated liveness |
+| `POST` | `/api/session` | Bootstrap a session for one experience |
+| `GET` | `/api/session/component` | The component currently in view |
+| `POST` | `/api/session/answer` | Record a response and advance |
+| `GET` | `/api/session/result` | Progress summary for the session |
+| `GET` | `/api/assets/{id}` | One managed image, verified on the way out |
+
+There is no public route, and no interactive docs or OpenAPI schema is
+published. Answers are recorded **in the session** and nothing is marked:
+grading and durable attempt storage arrive with the evaluation runtime, and
+every completion response says so rather than implying a score exists.
+
+An asset is served only when the caller owns it *and* the session's own
+experience references it, and its bytes are re-hashed against the recorded
+digest on every delivery — an image swapped on disk after import is not served.
+
+### What the API cannot leak
+
+Responses are built from the stored **learner payloads**, which were
+constructed from an allowlist when the experience was prepared and never
+contained an answer key, rubric, hint, feedback string, or branch. The
+evaluator-only tables are not queried anywhere in the web package. A test drives
+the whole flow and asserts that no canary from any hidden field appears in any
+response body.
+
+Errors say as little as possible: an experience that does not exist, one owned
+by another learner, and one in another profile are the same 404, and an
+invalid, expired, or someone-else's session token are the same 401.
+
+### Limits and headers
+
+Per-user and per-session sliding-window rate limits, a request body ceiling, a
+bounded answer shape (size, breadth, nesting), and on every response:
+
+```
+Content-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none';
+  frame-ancestors https://web.telegram.org https://telegram.org;
+  img-src 'self' data:; connect-src 'self'; script-src 'none'; style-src 'none';
+  object-src 'none'
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Cache-Control: no-store, no-cache, must-revalidate, private
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Resource-Policy: same-origin
+Permissions-Policy: accelerometer=(), camera=(), geolocation=(), …
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+```
+
+No CORS headers are ever sent, so a cross-origin page cannot read a response;
+the required custom header means such a request needs a preflight this server
+does not answer. `X-Frame-Options` is deliberately absent — it cannot express
+"only Telegram", so `frame-ancestors` does that job alone.
+
+Logs are structured JSON restricted to an allowlist of fields. A user appears
+as a per-process pseudonym, a session as a digest prefix; the `initData`
+payload, the bot token, and the session token never reach a log line.
+
+### Testing without a bypass
+
+There is no `DEV_MODE`, no `SKIP_AUTH`, and no flag that disables verification.
+Tests inject a `Dependencies` object — a fake bot token, allowlist, and clock —
+and then sign real payloads with that token, so the same HMAC path runs in tests
+as in production. A test parses the API sources and fails if an identifier that
+looks like a bypass switch ever appears.
+
 ## Roadmap
 
 Secure managed image import **is** here: `learning_studio_import_asset`
@@ -654,17 +824,22 @@ validates and stores PNG, JPEG, and WebP images in profile-scoped managed
 storage, and `learning_studio_prepare` authorises every referenced asset. See
 [Managed assets](#learning_studio_import_asset).
 
-Deliberately **not** here yet: image-generation providers, asset delivery and
-the FastAPI layer, the exercise delivery runtime, card renderers, the Mini App
-and frontend code, Telegram authentication, Cloudflare tunnels, slash commands,
-attempt and score storage, progress dashboards, and any scheduler. Each lands
-in a later PR. The skill describes how the agent will use those capabilities
-and instructs it to fall back to chat until they exist.
+Telegram authentication, session scoping, and the protected API **are** here,
+behind the `web` extra — including managed asset delivery. See
+[Telegram Mini App API](#telegram-mini-app-api).
 
-Manifests are validated and stored, but nothing reads them back to a learner
-yet: `learning_studio_prepare` is the data contract a renderer will later
-consume, written down now so that the wire format is settled before there is
-data in it.
+Deliberately **not** here yet: image-generation providers, the card renderers
+and frontend code, anything that starts or supervises the server process,
+Cloudflare tunnels, slash commands, sending a Telegram launch button,
+launch/status/stop tools, scoring, attempt and score storage, progress
+dashboards, and any scheduler. Each lands in a later PR. The skill describes how
+the agent will use those capabilities and instructs it to fall back to chat
+until they exist.
+
+An exercise can now be *served* over the API, but it is still not *rendered*:
+there is no client, so the agent continues to deliver exercises in conversation.
+Responses collected by the API are held in the session and are never marked or
+stored.
 
 ## Development
 

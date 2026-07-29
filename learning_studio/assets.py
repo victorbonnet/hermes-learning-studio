@@ -534,6 +534,20 @@ def release_managed_asset(published: PublishedAsset) -> None:
 
 def verify_managed_asset(row: Any) -> None:
     """Fail closed unless a row's managed bytes remain private and authentic."""
+    read_managed_asset(row)
+
+
+def read_managed_asset(row: Any) -> bytes:
+    """Verify a row's managed bytes and return them.
+
+    Verification and reading are the same operation on purpose. The integrity
+    check already opens the file, pins its inode, and hashes every byte, so a
+    delivery path that read the file *again* afterwards would be checking one
+    file and serving another — precisely the swap the pinning exists to
+    prevent. Callers that only want the check use
+    :func:`verify_managed_asset`, which is this function with the bytes
+    dropped.
+    """
     name = str(row["storage_name"])
     if not name or Path(name).name != name or "/" in name or "\\" in name:
         raise AssetError("Managed asset integrity validation failed")
@@ -562,6 +576,7 @@ def verify_managed_asset(row: Any) -> None:
             linked_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if (linked_after.st_dev, linked_after.st_ino) != opened_identity:
                 raise AssetError("Managed asset integrity validation failed")
+            return data
         except AssetError:
             raise
         except OSError as exc:

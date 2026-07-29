@@ -53,10 +53,20 @@ dev = [
     "ruff>=0.6",
     "jsonschema>=4.20",
     "Pillow>=10.0",
+    "fastapi>=0.110",
+    "httpx>=0.27",
 ]
 # Pillow is needed only when the import tool validates an image. It is lazy:
 # base plugin import, registration, and the other tools do not import it.
 media = ["Pillow>=10.0"]
+# The Telegram Mini App API. Separated from `media` and from the base package
+# because it is a *runtime* opt-in: an operator who only uses the tools in
+# conversation installs neither, and `register(ctx)` never imports either.
+# Nothing outside `learning_studio/web/` may import these.
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["learning_studio"]

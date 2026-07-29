@@ -253,19 +253,55 @@ NETWORK_MODULES = ("httpx", "requests", "urllib", "http", "socket", "aiohttp", "
 OPTIONAL_MODULES = ("fastapi", "starlette", "uvicorn", "PIL", "telegram", "telethon", "cloudflare")
 
 
-def imported_names(path: Path) -> set[str]:
-    """Top-level packages this file imports. Relative imports are this one."""
+#: The two exemptions this policy grants, each narrow and each paired with a
+#: test below that keeps it from widening.
+#:
+#: - ``urllib.parse`` is string handling: it splits a percent-encoded query
+#:   string and decodes it. It opens no socket. ``urllib.request`` — the half
+#:   that *is* network — remains banned everywhere, including here.
+#: - The ``web`` package is the FastAPI Mini App API. It genuinely needs
+#:   FastAPI, which is why FastAPI is an optional extra and why nothing
+#:   outside ``web/`` may import it. Registration never reaches this package;
+#:   ``tests/test_import_isolation.py`` proves that at runtime rather than
+#:   trusting this list.
+_URLLIB_PARSE_ONLY = ("telegram_auth.py",)
+_WEB_PACKAGE = "web"
+
+
+def imported_names(path: Path, *, dotted: bool = False) -> set[str]:
+    """Packages this file imports. Relative imports are this one.
+
+    With ``dotted=True`` the full module path is kept (``urllib.parse``),
+    which is what distinguishes a submodule that reaches the network from one
+    that parses a string.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    def name_of(raw: str) -> str:
+        return raw if dotted else raw.split(".")[0]
+
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names.update(alias.name.split(".")[0] for alias in node.names)
+            names.update(name_of(alias.name) for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 names.add("learning_studio")
             elif node.module:
-                names.add(node.module.split(".")[0])
+                names.add(name_of(node.module))
     return names
+
+
+def _exempt(forbidden: str, path: Path) -> bool:
+    """The exemptions above, applied to one file."""
+    relative = path.relative_to(PACKAGE)
+    if forbidden == "PIL" and path.name == "assets.py":
+        # PR 05: a function-local Pillow import in one narrow module.
+        return True
+    if forbidden == "urllib" and path.name in _URLLIB_PARSE_ONLY:
+        networked = {"urllib", "urllib.request", "urllib.error"}
+        return not (imported_names(path, dotted=True) & networked)
+    return forbidden in ("fastapi", "starlette") and relative.parts[0] == _WEB_PACKAGE
 
 
 def called_names(path: Path) -> set[str]:
@@ -308,16 +344,46 @@ def test_no_source_in_the_package_executes_code():
 @pytest.mark.parametrize("forbidden", [*EXECUTION_MODULES, *NETWORK_MODULES, *OPTIONAL_MODULES])
 def test_the_package_imports_no_execution_network_or_optional_module(forbidden: str):
     offenders = [
-        path.name
+        str(path.relative_to(PACKAGE))
         for path in sources()
-        if forbidden in imported_names(path)
-        # PR 05 deliberately gives one narrow module a function-local Pillow
-        # import.  Runtime import-isolation tests prove that importing and
-        # registering the plugin never executes it.
-        and not (forbidden == "PIL" and path.name == "assets.py")
+        if forbidden in imported_names(path) and not _exempt(forbidden, path)
     ]
 
     assert offenders == [], f"{forbidden} is imported by {offenders}"
+
+
+def test_the_urllib_exemption_covers_string_parsing_only():
+    """``urllib.parse`` is allowed in one module; ``urllib.request`` nowhere."""
+    for path in sources():
+        dotted = imported_names(path, dotted=True)
+        assert "urllib.request" not in dotted, f"{path.name} imports urllib.request"
+        assert "urllib.error" not in dotted, f"{path.name} imports urllib.error"
+        assert "urllib" not in dotted, f"{path.name} imports urllib as a whole"
+
+
+def test_only_the_web_package_may_import_fastapi():
+    """The Mini App API is the one place an optional web dependency belongs."""
+    offenders = [
+        str(path.relative_to(PACKAGE))
+        for path in sources()
+        if imported_names(path) & {"fastapi", "starlette"}
+        and path.relative_to(PACKAGE).parts[0] != _WEB_PACKAGE
+    ]
+
+    assert offenders == []
+
+
+def test_the_web_package_is_never_imported_by_the_plugin_surface():
+    """Registration must not reach a module that needs an optional extra.
+
+    Checked structurally here and at runtime in
+    ``tests/test_import_isolation.py``; both matter, because this one catches
+    an import that a test environment happens to satisfy.
+    """
+    for name in ("plugin.py", "tools.py", "schemas.py", "service.py", "__init__.py"):
+        text = (PACKAGE / name).read_text(encoding="utf-8")
+        assert "from .web" not in text, f"{name} imports the web package"
+        assert "learning_studio.web" not in text, f"{name} imports the web package"
 
 
 def test_pillow_is_imported_only_inside_the_asset_inspection_function():
