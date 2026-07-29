@@ -79,6 +79,15 @@ fail closed for `learning_studio_import_asset`; plugin registration, learning
 context, and exercise preparation remain available. No pathname-only fallback
 is used because it would weaken the managed-storage security boundary.
 
+Numeric DPI/resolution metadata is accepted because it is structural and does
+not carry an opaque payload. ICC profiles, EXIF/XMP, comments, text chunks, and
+unrecognised application segments remain rejected because accepted source bytes
+are preserved exactly and those containers can carry private arbitrary data.
+If a database transaction fails after publication, retained live file and
+managed-directory descriptors bind cleanup to the exact published inode: it is
+truncated and locked to mode `000`; a zero-byte tombstone is safer than unlinking
+a basename that a concurrent writer may have replaced.
+
 ## Usage
 
 Ask the agent to load the skill:

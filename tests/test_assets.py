@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import inspect
 import json
 import sqlite3
 import stat
+import sys
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -284,6 +286,146 @@ def test_atomic_copy_has_private_modes_and_no_temporary_files(hermes_home, princ
     assert result["asset_id"] in files[0].name
 
 
+def test_successful_import_releases_the_publication_descriptor(hermes_home, principal, monkeypatch):
+    source = _source_root(hermes_home) / "released-handle.png"
+    _image(source)
+    real_copy = assets.copy_atomic
+    captured = None
+
+    def capture_publication(image, asset_id, *, ownership_sink=None):
+        nonlocal captured
+        captured = real_copy(image, asset_id, ownership_sink=ownership_sink)
+        return captured
+
+    monkeypatch.setattr(assets, "copy_atomic", capture_publication)
+
+    _import(principal, source)
+
+    assert captured is not None
+    assert captured.file_descriptor is None
+    assert captured.directory_handle is None
+
+
+def test_released_publication_cannot_close_a_reused_descriptor(hermes_home):
+    image = assets.InspectedImage(b"published", "1" * 64, "image/png", "png", 1, 1)
+    published = assets.copy_atomic(image, "released-descriptor-reuse")
+    released_fd = published.file_descriptor
+    assert released_fd is not None
+    assets.release_managed_asset(published)
+
+    unrelated = storage.storage_root() / "unrelated-descriptor.txt"
+    unrelated.write_bytes(b"unrelated")
+    source_fd = assets.os.open(unrelated, assets.os.O_RDONLY)
+    try:
+        if source_fd != released_fd:
+            assets.os.dup2(source_fd, released_fd)
+
+        assets.retire_managed_asset(published)
+
+        assert assets.os.fstat(released_fd).st_size == len(b"unrelated")
+    finally:
+        with contextlib.suppress(OSError):
+            assets.os.close(released_fd)
+        if source_fd != released_fd:
+            assets.os.close(source_fd)
+
+
+def test_publication_context_interruption_retires_and_closes_the_exact_inode(
+    hermes_home, monkeypatch
+):
+    image = assets.InspectedImage(b"published", "1" * 64, "image/png", "png", 1, 1)
+    real_context = assets._open_managed_assets_directory
+    real_retire = assets._retire_file_handle
+    retired_fd = None
+
+    @contextlib.contextmanager
+    def interrupt_during_context_teardown():
+        with real_context() as pinned:
+            yield pinned
+        raise KeyboardInterrupt
+
+    def capture_retired_descriptor(handle):
+        nonlocal retired_fd
+        retired_fd = handle.fileno()
+        real_retire(handle)
+
+    monkeypatch.setattr(assets, "_open_managed_assets_directory", interrupt_during_context_teardown)
+    monkeypatch.setattr(assets, "_retire_file_handle", capture_retired_descriptor)
+
+    with pytest.raises(KeyboardInterrupt):
+        assets.copy_atomic(image, "post-publish-interrupt")
+
+    assert retired_fd is not None
+    with pytest.raises(OSError):
+        assets.os.fstat(retired_fd)
+    retired = storage.storage_root() / "assets" / "post-publish-interrupt.png"
+    assert retired.stat().st_size == 0
+    assert stat.S_IMODE(retired.stat().st_mode) == 0
+
+
+def test_interruption_inside_directory_close_leaks_no_descriptors(hermes_home):
+    image = assets.InspectedImage(b"published", "1" * 64, "image/png", "png", 1, 1)
+    source_lines, first_line = inspect.getsourcelines(assets._close_exact_descriptor)
+    target_line = first_line + next(
+        index for index, line in enumerate(source_lines) if line.strip() == "os.close(fd)"
+    )
+    interrupted = False
+    fd_count_before = len(assets.os.listdir("/proc/self/fd"))
+
+    def interrupt_before_close(frame, event, _arg):
+        nonlocal interrupted
+        if (
+            not interrupted
+            and event == "line"
+            and frame.f_code is assets._close_exact_descriptor.__code__
+            and frame.f_lineno == target_line
+        ):
+            interrupted = True
+            raise KeyboardInterrupt
+        return interrupt_before_close
+
+    sys.settrace(interrupt_before_close)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            assets.copy_atomic(image, "directory-close-interrupt")
+    finally:
+        sys.settrace(None)
+
+    assert interrupted
+    assert len(assets.os.listdir("/proc/self/fd")) == fd_count_before
+    retired = storage.storage_root() / "assets" / "directory-close-interrupt.png"
+    assert retired.stat().st_size == 0
+    assert stat.S_IMODE(retired.stat().st_mode) == 0
+
+
+def test_interruption_between_copy_return_and_assignment_recovers_ownership(
+    hermes_home, principal, monkeypatch
+):
+    source = _source_root(hermes_home) / "return-assignment-interrupt.png"
+    _image(source)
+    real_copy = assets.copy_atomic
+    captured = None
+
+    def interrupt_after_copy(image, asset_id, *, ownership_sink=None):
+        nonlocal captured
+        captured = real_copy(image, asset_id, ownership_sink=ownership_sink)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(assets, "copy_atomic", interrupt_after_copy)
+
+    with pytest.raises(KeyboardInterrupt):
+        _import(principal, source)
+
+    assert captured is not None
+    assert captured.file_descriptor is None
+    assert captured.directory_handle is None
+    retired = assets.managed_assets_root() / captured.storage_name
+    assert retired.stat().st_size == 0
+    assert stat.S_IMODE(retired.stat().st_mode) == 0
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM managed_assets").fetchone()["n"] == 0
+
+
 def test_managed_import_fails_closed_without_secure_directory_operations(
     hermes_home, principal, monkeypatch
 ):
@@ -297,6 +439,16 @@ def test_managed_import_fails_closed_without_secure_directory_operations(
     assert not (hermes_home / "workspace" / "learning-studio" / "assets").exists()
 
 
+def test_managed_root_resolution_failure_is_safe(hermes_home, monkeypatch):
+    missing = hermes_home / "private-path-canary" / "missing"
+    monkeypatch.setattr(assets, "ensure_storage_root", lambda: missing)
+
+    with pytest.raises(assets.AssetError, match="unavailable") as refusal:
+        assets.managed_assets_root()
+
+    assert str(missing) not in str(refusal.value)
+
+
 def test_atomic_copy_never_overwrites_an_existing_asset_name(hermes_home):
     first = assets.InspectedImage(b"first", "1" * 64, "image/png", "png", 1, 1)
     second = assets.InspectedImage(b"second", "2" * 64, "image/png", "png", 1, 1)
@@ -307,6 +459,7 @@ def test_atomic_copy_never_overwrites_an_existing_asset_name(hermes_home):
         assets.copy_atomic(second, "fixed-id")
 
     assert destination.read_bytes() == b"first"
+    assets.release_managed_asset(published)
 
 
 def test_atomic_copy_is_pinned_against_managed_directory_swap(hermes_home, monkeypatch):
@@ -329,9 +482,10 @@ def test_atomic_copy_is_pinned_against_managed_directory_swap(hermes_home, monke
 
     assert list(outside.iterdir()) == []
     assert (pinned / published.storage_name).read_bytes() == b"pinned"
+    assets.release_managed_asset(published)
 
 
-def test_cleanup_refuses_a_replacement_managed_directory(hermes_home):
+def test_cleanup_retires_the_original_inode_after_directory_replacement(hermes_home):
     image = assets.InspectedImage(b"published", "1" * 64, "image/png", "png", 1, 1)
     published = assets.copy_atomic(image, "cleanup-id")
     root = assets.managed_assets_root()
@@ -341,11 +495,30 @@ def test_cleanup_refuses_a_replacement_managed_directory(hermes_home):
     unrelated = root / published.storage_name
     unrelated.write_bytes(b"unrelated")
 
-    with pytest.raises(assets.AssetError, match="changed storage directory"):
-        assets.remove_managed_asset(published)
+    assets.retire_managed_asset(published)
 
     assert unrelated.read_bytes() == b"unrelated"
-    assert (pinned / published.storage_name).read_bytes() == b"published"
+    retired = pinned / published.storage_name
+    assert retired.stat().st_size == 0
+    assert stat.S_IMODE(retired.stat().st_mode) == 0
+
+
+def test_cleanup_never_unlinks_a_same_name_replacement(hermes_home):
+    image = assets.InspectedImage(b"published", "1" * 64, "image/png", "png", 1, 1)
+    published = assets.copy_atomic(image, "cleanup-entry-race")
+    root = assets.managed_assets_root()
+    preserved_name = "preserved-original.png"
+    (root / published.storage_name).rename(root / preserved_name)
+    replacement = root / published.storage_name
+    replacement.write_bytes(b"unrelated")
+    replacement.chmod(0o600)
+
+    assets.retire_managed_asset(published)
+
+    assert replacement.read_bytes() == b"unrelated"
+    preserved = root / preserved_name
+    assert preserved.stat().st_size == 0
+    assert stat.S_IMODE(preserved.stat().st_mode) == 0
 
 
 def test_integrity_check_is_pinned_against_managed_directory_swap(
@@ -376,6 +549,38 @@ def test_integrity_check_is_pinned_against_managed_directory_swap(
 
     assets.verify_managed_asset(row)
     assert (outside / row["storage_name"]).read_bytes() == b"attacker-controlled"
+
+
+def test_integrity_refuses_a_path_replaced_after_open(hermes_home, principal, monkeypatch):
+    source = _source_root(hermes_home) / "integrity-entry-race.png"
+    _image(source)
+    imported = _import(principal, source)
+    root = assets.managed_assets_root()
+    managed = next(root.iterdir())
+    preserved = root / "preserved-integrity-original.png"
+    with storage.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM managed_assets WHERE id = ?", (imported["asset_id"],)
+        ).fetchone()
+    real_sha256 = assets.hashlib.sha256
+    swapped = False
+
+    def swap_while_hashing(data=b""):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            managed.rename(preserved)
+            managed.write_bytes(b"X" * len(data))
+            managed.chmod(0o600)
+        return real_sha256(data)
+
+    monkeypatch.setattr(assets.hashlib, "sha256", swap_while_hashing)
+
+    with pytest.raises(assets.AssetError, match="integrity"):
+        assets.verify_managed_asset(row)
+
+    assert swapped is True
+    assert preserved.exists()
 
 
 def test_rejects_an_escaping_managed_assets_directory(hermes_home, principal):
@@ -414,6 +619,26 @@ def test_rejects_images_with_private_embedded_metadata(hermes_home, principal):
     exif = Image.Exif()
     exif[0x010E] = "private-exif-canary"
     image.save(source, format="JPEG", exif=exif)
+
+    with pytest.raises(service.ValidationError, match="metadata|clean copy"):
+        _import(principal, source)
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG"])
+def test_accepts_non_sensitive_dpi_metadata(hermes_home, principal, fmt):
+    source = _source_root(hermes_home) / f"print-resolution.{fmt.lower()}"
+    Image.new("RGB", (2, 2), "blue").save(source, format=fmt, dpi=(300, 300))
+
+    result = _import(principal, source)
+
+    assert result["ok"] is True
+
+
+def test_rejects_opaque_icc_profile_payloads(hermes_home, principal):
+    source = _source_root(hermes_home) / "private-colour-profile.jpg"
+    Image.new("RGB", (2, 2), "blue").save(
+        source, format="JPEG", icc_profile=b"PRIVATE-ICC-PROFILE-CANARY"
+    )
 
     with pytest.raises(service.ValidationError, match="metadata|clean copy"):
         _import(principal, source)
@@ -462,7 +687,9 @@ def test_dedup_never_reports_success_for_broken_managed_bytes(hermes_home, princ
     assert imported["asset_id"]
 
 
-def test_database_insert_failure_removes_final_and_temporary_files(hermes_home, principal):
+def test_database_insert_failure_retires_final_bytes_and_removes_temporary_files(
+    hermes_home, principal
+):
     source = _source_root(hermes_home) / "rollback.png"
     _image(source)
     storage.initialize()
@@ -476,9 +703,204 @@ def test_database_insert_failure_removes_final_and_temporary_files(hermes_home, 
         _import(principal, source)
 
     root = hermes_home / "workspace" / "learning-studio" / "assets"
-    assert list(root.iterdir()) == []
+    files = list(root.iterdir())
+    assert len(files) == 1
+    assert files[0].stat().st_size == 0
+    assert stat.S_IMODE(files[0].stat().st_mode) == 0
+    assert not any(path.name.startswith(".tmp-") for path in files)
     with storage.connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS n FROM managed_assets").fetchone()["n"] == 0
+
+
+def test_database_commit_failure_retires_and_closes_the_exact_publication(
+    hermes_home, principal, monkeypatch
+):
+    source = _source_root(hermes_home) / "commit-rollback.png"
+    _image(source)
+    real_copy = assets.copy_atomic
+    captured = None
+
+    def capture_publication(image, asset_id, *, ownership_sink=None):
+        nonlocal captured
+        captured = real_copy(image, asset_id, ownership_sink=ownership_sink)
+        return captured
+
+    @contextlib.contextmanager
+    def fail_at_commit(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.rollback()
+            raise sqlite3.OperationalError("forced commit failure")
+
+    monkeypatch.setattr(assets, "copy_atomic", capture_publication)
+    monkeypatch.setattr(storage, "transaction", fail_at_commit)
+
+    with pytest.raises(sqlite3.OperationalError, match="commit failure"):
+        _import(principal, source)
+
+    assert captured is not None
+    assert captured.file_descriptor is None
+    assert captured.directory_handle is None
+    retired = assets.managed_assets_root() / captured.storage_name
+    assert retired.stat().st_size == 0
+    assert stat.S_IMODE(retired.stat().st_mode) == 0
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM managed_assets").fetchone()["n"] == 0
+
+
+def test_post_commit_interruption_preserves_the_committed_asset(
+    hermes_home, principal, monkeypatch
+):
+    source = _source_root(hermes_home) / "committed-interruption.png"
+    expected = _image(source)
+    real_copy = assets.copy_atomic
+    captured = None
+
+    def capture_publication(image, asset_id, *, ownership_sink=None):
+        nonlocal captured
+        captured = real_copy(image, asset_id, ownership_sink=ownership_sink)
+        return captured
+
+    @contextlib.contextmanager
+    def interrupt_after_commit(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(assets, "copy_atomic", capture_publication)
+    monkeypatch.setattr(storage, "transaction", interrupt_after_commit)
+
+    with pytest.raises(KeyboardInterrupt):
+        _import(principal, source)
+
+    assert captured is not None
+    assert captured.file_descriptor is None
+    assert captured.directory_handle is None
+    managed = assets.managed_assets_root() / captured.storage_name
+    assert managed.read_bytes() == expected
+    assert stat.S_IMODE(managed.stat().st_mode) == 0o600
+    with storage.connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM managed_assets WHERE id = ?",
+                (captured.storage_name.split(".")[0],),
+            ).fetchone()["n"]
+            == 1
+        )
+
+
+def test_normal_success_interruption_still_releases_publication(
+    hermes_home, principal, monkeypatch
+):
+    source = _source_root(hermes_home) / "normal-success-interruption.png"
+    expected = _image(source)
+    real_copy = assets.copy_atomic
+    captured = None
+
+    def capture_publication(image, asset_id, *, ownership_sink=None):
+        nonlocal captured
+        captured = real_copy(image, asset_id, ownership_sink=ownership_sink)
+        return captured
+
+    source_lines, first_line = inspect.getsourcelines(service.import_asset)
+    target_line = first_line + next(
+        index for index, line in enumerate(source_lines) if line == "        if result is None:\n"
+    )
+    interrupted = False
+
+    def interrupt_before_normal_release(frame, event, _arg):
+        nonlocal interrupted
+        if (
+            not interrupted
+            and event == "line"
+            and frame.f_code is service.import_asset.__code__
+            and frame.f_lineno == target_line
+        ):
+            interrupted = True
+            raise KeyboardInterrupt
+        return interrupt_before_normal_release
+
+    monkeypatch.setattr(assets, "copy_atomic", capture_publication)
+    sys.settrace(interrupt_before_normal_release)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _import(principal, source)
+    finally:
+        sys.settrace(None)
+
+    assert interrupted
+    assert captured is not None
+    assert captured.file_descriptor is None
+    assert captured.directory_handle is None
+    managed = assets.managed_assets_root() / captured.storage_name
+    assert managed.read_bytes() == expected
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM managed_assets").fetchone()["n"] == 1
+
+
+def test_interruption_inside_release_leaves_no_unreachable_descriptors(
+    hermes_home, principal, monkeypatch
+):
+    source = _source_root(hermes_home) / "release-interruption.png"
+    _image(source)
+    real_copy = assets.copy_atomic
+    captured = None
+    captured_fd = None
+
+    def capture_publication(image, asset_id, *, ownership_sink=None):
+        nonlocal captured, captured_fd
+        captured = real_copy(image, asset_id, ownership_sink=ownership_sink)
+        captured_fd = captured.file_descriptor
+        return captured
+
+    source_lines, first_line = inspect.getsourcelines(assets.release_managed_asset)
+    target_line = first_line + next(
+        index for index, line in enumerate(source_lines) if line.strip() == "file_handle.close()"
+    )
+    interrupted = False
+    fd_count_before = len(assets.os.listdir("/proc/self/fd"))
+
+    def interrupt_during_release(frame, event, _arg):
+        nonlocal interrupted
+        if (
+            not interrupted
+            and event == "line"
+            and frame.f_code is assets.release_managed_asset.__code__
+            and frame.f_lineno == target_line
+        ):
+            interrupted = True
+            raise KeyboardInterrupt
+        return interrupt_during_release
+
+    monkeypatch.setattr(assets, "copy_atomic", capture_publication)
+    sys.settrace(interrupt_during_release)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _import(principal, source)
+    finally:
+        sys.settrace(None)
+
+    assert interrupted
+    assert captured is not None
+    assert captured.file_handle is None
+    assert captured.directory_handle is None
+    assert captured_fd is not None
+    with pytest.raises(OSError):
+        assets.os.fstat(captured_fd)
+    assert len(assets.os.listdir("/proc/self/fd")) == fd_count_before
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM managed_assets").fetchone()["n"] == 1
 
 
 @pytest.mark.parametrize(

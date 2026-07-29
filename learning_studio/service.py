@@ -22,6 +22,7 @@ turn a track ID into an oracle for whether another learner exists.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -1733,6 +1734,9 @@ def import_asset(
 
     profile = principal.profile
     published_asset = None
+    publication_ownership = []
+    asset_id = None
+    result = None
     storage.initialize(config)
     try:
         with storage.connect(config) as conn, storage.transaction(conn):
@@ -1767,7 +1771,9 @@ def import_asset(
 
             asset_id = _new_id()
             try:
-                published_asset = assets.copy_atomic(inspected, asset_id)
+                published_asset = assets.copy_atomic(
+                    inspected, asset_id, ownership_sink=publication_ownership
+                )
                 storage_name = published_asset.storage_name
             except assets.AssetError as exc:
                 raise ValidationError(str(exc)) from exc
@@ -1800,14 +1806,51 @@ def import_asset(
                 ),
             )
             row = conn.execute("SELECT * FROM managed_assets WHERE id = ?", (asset_id,)).fetchone()
-            return assets.safe_metadata(row, deduplicated=False)
+            result = assets.safe_metadata(row, deduplicated=False)
     except BaseException:
+        if published_asset is None and publication_ownership:
+            published_asset = publication_ownership[-1]
         if published_asset is not None:
-            import contextlib
-
-            with contextlib.suppress(OSError, assets.AssetError):
-                assets.remove_managed_asset(published_asset)
+            # A connection/transaction context can be interrupted after SQLite
+            # has durably committed. Re-check the row before destructive
+            # rollback; unknown state must preserve bytes rather than corrupt a
+            # potentially committed asset.
+            committed = None
+            try:
+                with storage.connect(config) as check_conn:
+                    durable = check_conn.execute(
+                        "SELECT storage_name, sha256, byte_size FROM managed_assets WHERE id = ?",
+                        (asset_id,),
+                    ).fetchone()
+                if durable is None:
+                    committed = False
+                elif (
+                    durable["storage_name"] == published_asset.storage_name
+                    and durable["sha256"] == inspected.sha256
+                    and int(durable["byte_size"]) == inspected.byte_size
+                ):
+                    committed = True
+            except BaseException:
+                committed = None
+            if committed is False:
+                with contextlib.suppress(OSError, assets.AssetError):
+                    assets.retire_managed_asset(published_asset)
+            else:
+                assets.release_managed_asset(published_asset)
         raise
+    else:
+        if result is None:
+            raise RuntimeError("asset import completed without a result")
+        return result
+    finally:
+        # This guard also runs if an asynchronous exception lands after the
+        # transaction commits but before the normal return path can release
+        # ownership. Consumed mutable handles make repeated finalization safe.
+        final_publication = published_asset
+        if final_publication is None and publication_ownership:
+            final_publication = publication_ownership[-1]
+        if final_publication is not None:
+            assets.release_managed_asset(final_publication)
 
 
 # ── Experiences ────────────────────────────────────────────────────────────
