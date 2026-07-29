@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import inspect
 import json
+import os
 import sqlite3
 import stat
 import sys
@@ -25,6 +26,21 @@ from learning_studio.config import LearningStudioConfig
 from learning_studio.schemas import IMPORT_ASSET_SCHEMA
 from learning_studio.validation import SchemaViolation, validate
 from tests.component_examples import example, manifest
+
+#: ``/dev/fd`` is the portable spelling of the caller's open-descriptor table:
+#: a symlink to ``/proc/self/fd`` on Linux, a real directory on macOS. Reading
+#: ``/proc`` directly made the descriptor-accounting tests below fail anywhere
+#: but Linux, which hid them from the platform most of this repo is edited on.
+_FD_DIRECTORY = "/dev/fd"
+requires_descriptor_listing = pytest.mark.skipif(
+    not os.path.isdir(_FD_DIRECTORY),
+    reason="descriptor accounting needs an open-descriptor directory",
+)
+
+
+def _open_descriptor_count() -> int:
+    """Count this process's open descriptors."""
+    return len(os.listdir(_FD_DIRECTORY))
 
 
 def _source_root(hermes_home: Path) -> Path:
@@ -363,6 +379,7 @@ def test_publication_context_interruption_retires_and_closes_the_exact_inode(
     assert stat.S_IMODE(retired.stat().st_mode) == 0
 
 
+@requires_descriptor_listing
 def test_interruption_inside_directory_close_leaks_no_descriptors(hermes_home):
     image = assets.InspectedImage(b"published", "1" * 64, "image/png", "png", 1, 1)
     source_lines, first_line = inspect.getsourcelines(assets._close_exact_descriptor)
@@ -370,7 +387,7 @@ def test_interruption_inside_directory_close_leaks_no_descriptors(hermes_home):
         index for index, line in enumerate(source_lines) if line.strip() == "os.close(fd)"
     )
     interrupted = False
-    fd_count_before = len(assets.os.listdir("/proc/self/fd"))
+    fd_count_before = _open_descriptor_count()
 
     def interrupt_before_close(frame, event, _arg):
         nonlocal interrupted
@@ -392,7 +409,7 @@ def test_interruption_inside_directory_close_leaks_no_descriptors(hermes_home):
         sys.settrace(None)
 
     assert interrupted
-    assert len(assets.os.listdir("/proc/self/fd")) == fd_count_before
+    assert _open_descriptor_count() == fd_count_before
     retired = storage.storage_root() / "assets" / "directory-close-interrupt.png"
     assert retired.stat().st_size == 0
     assert stat.S_IMODE(retired.stat().st_mode) == 0
@@ -849,6 +866,7 @@ def test_normal_success_interruption_still_releases_publication(
         assert conn.execute("SELECT COUNT(*) AS n FROM managed_assets").fetchone()["n"] == 1
 
 
+@requires_descriptor_listing
 def test_interruption_inside_release_leaves_no_unreachable_descriptors(
     hermes_home, principal, monkeypatch
 ):
@@ -869,7 +887,7 @@ def test_interruption_inside_release_leaves_no_unreachable_descriptors(
         index for index, line in enumerate(source_lines) if line.strip() == "file_handle.close()"
     )
     interrupted = False
-    fd_count_before = len(assets.os.listdir("/proc/self/fd"))
+    fd_count_before = _open_descriptor_count()
 
     def interrupt_during_release(frame, event, _arg):
         nonlocal interrupted
@@ -898,7 +916,7 @@ def test_interruption_inside_release_leaves_no_unreachable_descriptors(
     assert captured_fd is not None
     with pytest.raises(OSError):
         assets.os.fstat(captured_fd)
-    assert len(assets.os.listdir("/proc/self/fd")) == fd_count_before
+    assert _open_descriptor_count() == fd_count_before
     with storage.connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS n FROM managed_assets").fetchone()["n"] == 1
 
