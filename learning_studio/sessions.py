@@ -78,6 +78,11 @@ class MiniAppSession:
     created_at: float
     expires_at: float
     component_count: int
+    #: ``auth_date`` of the verified payload that opened this session. Later
+    #: requests must present a payload at least this fresh, so a session cannot
+    #: be continued with an *older* captured launch than the one that created
+    #: it. Zero when unset (test construction only).
+    auth_date: int = 0
     #: Zero-based cursor into the experience's ordered components.
     position: int = 0
     #: ``component_id -> submitted response``. Held in memory for the life of
@@ -105,7 +110,9 @@ class SessionStore:
     def __len__(self) -> int:
         return len(self._sessions)
 
-    def create(self, scope: SessionScope, *, component_count: int) -> tuple[str, MiniAppSession]:
+    def create(
+        self, scope: SessionScope, *, component_count: int, auth_date: int = 0
+    ) -> tuple[str, MiniAppSession]:
         """Mint a session and return ``(token, session)``.
 
         The token is returned exactly once, to the response that created it.
@@ -124,6 +131,7 @@ class SessionStore:
             created_at=now,
             expires_at=now + self._ttl,
             component_count=int(component_count),
+            auth_date=int(auth_date),
         )
         self._sessions[digest] = session
         return token, session

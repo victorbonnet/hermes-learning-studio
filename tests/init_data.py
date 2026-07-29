@@ -28,8 +28,24 @@ OTHER_USER_ID = "2002"
 
 
 def data_check_string(fields: dict[str, str]) -> str:
-    """The canonical check string: sorted ``key=value`` pairs, LF-joined."""
-    payload = {k: v for k, v in fields.items() if k not in ("hash", "signature")}
+    """The canonical check string for the **bot-token HMAC** algorithm.
+
+    Only ``hash`` is removed. ``signature`` stays in, because Telegram's two
+    validation algorithms exclude different fields and this is the bot-token
+    one:
+
+    - ``@telegram-apps/init-data-node`` — ``validate3rd`` (Ed25519) skips both
+      ``hash`` and ``signature``; ``validate`` (HMAC) skips only ``hash`` and
+      pushes everything else, ``signature`` included, into the signed pairs.
+    - aiogram's ``check_webapp_signature`` pops only ``hash``.
+
+    This fixture was originally written from a summary that conflated the two
+    and therefore agreed with a verifier that had the same defect. It is now
+    derived from those two independent implementations, so it can disagree
+    with the code under test — which is the only reason a fixture is worth
+    having.
+    """
+    payload = {k: v for k, v in fields.items() if k != "hash"}
     return "\n".join(f"{key}={payload[key]}" for key in sorted(payload))
 
 
@@ -53,6 +69,13 @@ def user_field(user_id: str = USER_ID, **overrides: Any) -> str:
     return json.dumps(user, separators=(",", ":"))
 
 
+#: A syntactically plausible stand-in for the Ed25519 proof current Telegram
+#: clients attach. It is not a real signature and is never verified here — its
+#: job is to be *present*, because a payload carrying it is the shape a real
+#: launch has, and it must participate in the bot-token HMAC.
+SIGNATURE = "K1xY2z_QVZ3d4e5F6g7H8i9J0kLmNoPqRsTuVwXyZ01aBcDeFgHiJkLmNoPqRsTuVw"
+
+
 def build_init_data(
     *,
     user_id: str = USER_ID,
@@ -62,8 +85,16 @@ def build_init_data(
     user: str | None = None,
     extra: dict[str, str] | None = None,
     omit: tuple[str, ...] = (),
+    signature: str | None = SIGNATURE,
 ) -> str:
     """Build a percent-encoded ``initData`` query string.
+
+    ``signature`` is present by **default**, so the ordinary fixture is the
+    payload a current Telegram client actually sends. Verification that
+    wrongly excluded the field from the HMAC would then fail every test that
+    uses this helper, rather than passing against a payload shape that has not
+    existed since Telegram added third-party validation. Pass
+    ``signature=None`` for the older shape.
 
     ``signed=False`` produces a well-formed payload carrying a wrong hash,
     which is the interesting negative case: structurally valid, cryptographically
@@ -74,6 +105,8 @@ def build_init_data(
         "query_id": "AAF_test_query_id",
         "user": user if user is not None else user_field(user_id),
     }
+    if signature is not None:
+        fields["signature"] = signature
     fields.update(extra or {})
     for name in omit:
         fields.pop(name, None)

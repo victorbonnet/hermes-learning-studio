@@ -19,7 +19,13 @@ from learning_studio.telegram_auth import (
     InitDataError,
     verify_init_data,
 )
-from tests.init_data import BOT_TOKEN, USER_ID, build_init_data, sign
+from tests.init_data import (
+    BOT_TOKEN,
+    USER_ID,
+    build_init_data,
+    data_check_string,
+    sign,
+)
 
 NOW = 1_800_000_000
 MAX_AGE = 300
@@ -208,13 +214,64 @@ def test_the_hash_comparison_is_constant_time(monkeypatch):
     assert calls, "verification must compare hashes with hmac.compare_digest"
 
 
-def test_the_signature_field_is_excluded_from_the_check_string():
-    """Telegram signs everything except ``hash`` *and* ``signature``."""
-    fields = {"auth_date": str(NOW), "user": _user('{"id":1001}')}
-    fields["hash"] = sign(fields)
-    fields["signature"] = "AAAA_third_party_ed25519_signature"
+def test_a_signature_bearing_payload_verifies():
+    """The shape every current Telegram client sends.
 
-    assert verify("&".join(f"{k}={_q(v)}" for k, v in fields.items())).user_id == USER_ID
+    Regression for a real defect: the first version of this module applied the
+    third-party Ed25519 exclusion rule (``hash`` *and* ``signature``) to the
+    bot-token HMAC, so genuine modern launches were rejected with
+    ``init_data_hash_mismatch`` and no session could ever be opened.
+    """
+    raw = build_init_data(auth_date=NOW, signature="AbCdEf_modern_ed25519_signature")
+
+    assert verify(raw).user_id == USER_ID
+
+
+def test_the_signature_field_participates_in_the_hmac():
+    """Tampering with ``signature`` alone must invalidate the payload.
+
+    This is what distinguishes "included in the signed data" from "ignored".
+    If the field were excluded, swapping it would change nothing and this
+    payload would still verify.
+    """
+    raw = build_init_data(auth_date=NOW, signature="AbCdEf_original_signature")
+    tampered = raw.replace("AbCdEf_original_signature", "AbCdEf_swapped_signature0")
+
+    with pytest.raises(InitDataError):
+        verify(tampered)
+
+
+def test_a_payload_without_a_signature_still_verifies():
+    """Older clients omit the field entirely; they must keep working."""
+    assert verify(build_init_data(auth_date=NOW, signature=None)).user_id == USER_ID
+
+
+def test_the_check_string_is_built_the_way_the_reference_implementations_build_it():
+    """Pin the canonicalisation itself, independently of the HMAC.
+
+    Derived from ``@telegram-apps/init-data-node`` (``validate`` pushes every
+    pair but ``hash``) and aiogram (``parsed_data.pop("hash")``): sorted
+    ``key=value`` pairs joined with a line feed, ``signature`` among them.
+    """
+    from learning_studio.telegram_auth import _UNSIGNED_FIELDS
+
+    assert {"hash"} == _UNSIGNED_FIELDS
+
+    fields = {
+        "user": '{"id":1001}',
+        "auth_date": str(NOW),
+        "signature": "sig-value",
+        "query_id": "q-value",
+    }
+
+    assert data_check_string(fields) == "\n".join(
+        [
+            f"auth_date={NOW}",
+            "query_id=q-value",
+            "signature=sig-value",
+            'user={"id":1001}',
+        ]
+    )
 
 
 # ── Failures never quote the payload ──────────────────────────────────────

@@ -703,13 +703,31 @@ plugin, which tests assert by blocking the module at import time.
 Every request carries the raw Telegram `initData` string in an
 `X-Telegram-Init-Data` header, verified per Telegram's specification:
 
-- the data-check string is every field except `hash` **and** `signature`,
-  sorted, `key=value`, joined with `\n`;
+- the data-check string is every field except `hash` — sorted, `key=value`,
+  joined with `\n`;
 - the key is `HMAC-SHA256(key="WebAppData", data=<bot token>)`;
 - the comparison is `hmac.compare_digest`, never `==`;
-- `auth_date` must be recent (300 s to open a session) and not in the future;
+- `auth_date` must be recent (300 s to open a session) and no more than 60 s in
+  the future, a stated tolerance for clients whose clocks run fast;
 - the `user` object must name a real, non-bot numeric ID — and **only that ID
   is kept**. Names, usernames, language, and photo are discarded.
+
+**`signature` is part of the signed data.** Telegram documents two validation
+algorithms that exclude different fields, and mixing them up breaks
+authentication outright:
+
+| Algorithm | Used when | Excluded from the check string |
+| --- | --- | --- |
+| HMAC-SHA-256 with the bot token (**used here**) | the verifier holds the token | `hash` only |
+| Ed25519 third-party signature | the verifier has no token | `hash` and `signature` |
+
+Applying the Ed25519 exclusion to the HMAC path rejects every launch from a
+client that sends `signature`, which current clients do. Both reference
+implementations agree: `@telegram-apps/init-data-node` skips the field in
+`validate3rd` and signs it in `validate`, and aiogram's
+`check_webapp_signature` pops only `hash`. The test fixtures are built from
+those implementations rather than from prose, and the default fixture carries a
+`signature` field so the modern payload shape is what the suite exercises.
 
 A launch from a group, supergroup, or channel is refused: a Mini App session
 reads one person's learning record, which is not a room's business.
@@ -722,18 +740,53 @@ anywhere.
 ### Authorisation is an intersection
 
 ```
-effective access = profile Telegram allowlist  ∩  plugin restriction
+effective access = profile Telegram DM allowlist  ∩  plugin restriction
 ```
 
-The profile allowlist is Hermes' own: `TELEGRAM_ALLOWED_USERS` in `.env` plus
-`platforms.telegram.extra.allow_from` / `allow_admin_from` in `config.yaml`.
-`mini_app_allowed_telegram_users` can only **narrow** it — there is no setting
-that adds a user, because a plugin able to widen the host's allowlist would be
-a privilege-escalation feature with a configuration file for an interface.
+`mini_app_allowed_telegram_users` can only **narrow** the profile side. There
+is no setting that adds a user, because a plugin able to widen the host's
+allowlist would be a privilege-escalation feature with a configuration file for
+an interface.
 
-Group-only authorisations (`TELEGRAM_GROUP_ALLOWED_USERS`,
-`group_allowed_chats`) grant nothing here. An empty allowlist authorises
-nobody, and a host configuration that cannot be read authorises nobody.
+The profile side is Hermes' decision, and this plugin reproduces the shape of
+`gateway/authz_mixin.py::_is_user_authorized` for a direct message rather than
+inventing a reading of the raw fields:
+
+1. If **any** Telegram or gateway environment allowlist is configured —
+   `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_GROUP_ALLOWED_USERS`,
+   `TELEGRAM_GROUP_ALLOWED_CHATS`, `GATEWAY_ALLOWED_USERS` — Hermes decides a DM
+   from the environment alone and never consults the adapter's `allow_from`. The
+   allowlist is then `TELEGRAM_ALLOWED_USERS ∪ GATEWAY_ALLOWED_USERS`.
+2. Only when **no** environment allowlist exists at all does the configured
+   `allow_from` apply — read from every shape Hermes accepts:
+   `platforms.telegram` and `gateway.platforms.telegram`, with the key written
+   directly or inside `extra` (`gateway/config.py` bridges the former into the
+   latter).
+
+Unioning the two unconditionally would authorise somebody the host denies: an
+operator who sets `TELEGRAM_ALLOWED_USERS` and leaves a stale `allow_from` in
+configuration has, in Hermes' view, one allowlist.
+
+**`allow_admin_from` is not an authorisation source.** Hermes reads it only in
+`gateway/slash_access.py`, to decide which *already authorised* users may run
+privileged slash commands. Treating it as an access grant would let a user
+excluded from Telegram entirely reach the Mini App.
+
+### Deliberately not honoured
+
+Each of these can only ever *deny* somebody Hermes would allow — never admit
+somebody Hermes would deny — which is the safe direction for a plugin that has
+promised never to broaden access:
+
+| Not honoured | Why |
+| --- | --- |
+| `allow_from: ["*"]` and other wildcards | A wildcard opens a chat bot to everyone; it does not open one person's learning record to everyone. Name the IDs. |
+| `GATEWAY_ALLOW_ALL_USERS`, `TELEGRAM_ALLOW_ALL_USERS` | Same reason. |
+| `TELEGRAM_GROUP_ALLOWED_USERS`, `TELEGRAM_GROUP_ALLOWED_CHATS`, `group_allow_from`, `group_allowed_chats` | Authorise participation in a room, not access to a personal record. Counted only when deciding whether *any* environment allowlist exists. |
+| DM pairing approvals | A first-class grant in Hermes, stored outside configuration; reading it would mean reaching into host internals. Hermes writes approvals into the allowlist whenever one is configured, so the gap is narrow — the remedy is naming the user in `TELEGRAM_ALLOWED_USERS`. |
+
+An empty allowlist authorises nobody, and a host configuration that cannot be
+read raises rather than resolving to "empty".
 
 ### Sessions
 
@@ -747,6 +800,16 @@ token, so the token itself exists only in the response that minted it.
 Both credentials are checked on **every** request: the Telegram payload and the
 session token, and the token is refused if the Telegram account presenting it
 is not the one it was minted for.
+
+Telegram signs `initData` once, at launch, so the freshness bound for requests
+*inside* a session is `session TTL + bootstrap window` — enough for a payload
+that was already near the bootstrap limit to see the session out. Taking the
+maximum of the two instead would quietly shorten every session opened with
+slightly stale `initData`, returning 401 while the session store still
+considered it live. The session's own hard expiry is what bounds its life, and
+the advertised `expires_in_seconds` is the figure a caller actually gets. A
+session may be continued with the launch that opened it or a newer one, never
+with an older captured payload.
 
 ### Routes
 
@@ -783,8 +846,16 @@ invalid, expired, or someone-else's session token are the same 401.
 
 ### Limits and headers
 
-Per-user and per-session sliding-window rate limits, a request body ceiling, a
-bounded answer shape (size, breadth, nesting), and on every response:
+Per-user and per-session sliding-window rate limits, a bounded answer shape
+(size, breadth, nesting), and a request body ceiling enforced **before**
+buffering: an oversized or malformed `Content-Length` is refused having read
+nothing at all, and a chunked body that declares no length is read chunk by
+chunk and abandoned the moment the cumulative size crosses the limit. The peak
+cost of an oversized request is one chunk, not the payload. Reading the body
+and measuring afterwards would make the ceiling a formality — the memory is
+already spent by the time the 413 is written.
+
+On every response:
 
 ```
 Content-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none';
@@ -808,6 +879,23 @@ does not answer. `X-Frame-Options` is deliberately absent — it cannot express
 Logs are structured JSON restricted to an allowlist of fields. A user appears
 as a per-process pseudonym, a session as a digest prefix; the `initData`
 payload, the bot token, and the session token never reach a log line.
+
+That holds on the 500 path too, which is where it is easiest to lose. An
+unexpected failure is recorded as `{"event": "unhandled_error", route, method,
+status, reason}` where `reason` is the exception's *class name* — chosen by a
+programmer — and **no exception message or traceback is logged at all**. A
+failing query or service call can be holding a filesystem path, a SQL fragment,
+a bot token, or an answer key, and `logger.exception` would write all of it past
+every other redaction.
+
+This trade costs something and is worth stating: diagnosing a 500 here means
+reproducing it. A middle option — a second logger, silenced by default, that an
+operator could opt into — was implemented and removed, because a `LogRecord`
+carrying `exc_info` is a live object holding those values and anything that
+captures records broadly renders it regardless of that logger's configuration.
+pytest's own log capture does exactly that. A record never constructed is the
+only one that cannot be captured, and an "off by default" switch is a switch
+that gets flipped by accident.
 
 ### Testing without a bypass
 

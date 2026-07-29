@@ -5,11 +5,23 @@ downstream — sessions, experiences, managed image bytes — trusts exactly one
 value that comes out of here: the Telegram user ID. So the verification is the
 documented algorithm, in full, with nothing softened:
 
-1. **Canonical data-check string.** Every received field except ``hash`` and
-   ``signature``, sorted by key, rendered ``key=value``, joined with ``\\n``.
-   ``signature`` is excluded because Telegram excludes it — it carries the
-   Ed25519 third-party proof, which is a *different* verification path this
-   plugin does not use (it holds the bot token, so it verifies the HMAC).
+1. **Canonical data-check string.** Every received field except ``hash``,
+   sorted by key, rendered ``key=value``, joined with ``\\n``.
+
+   ``signature`` **is included**, and that is the whole subtlety. Telegram
+   documents two validation algorithms and they exclude different fields:
+
+   - the *third-party* Ed25519 algorithm, for verifiers that do not hold the
+     bot token, excludes ``hash`` **and** ``signature`` and prepends
+     ``<bot_id>:WebAppData``;
+   - the *bot-token* HMAC algorithm used here excludes only ``hash``.
+
+   Excluding ``signature`` here — applying the Ed25519 rule to the HMAC path —
+   rejects every genuine launch from a Telegram client that sends the field,
+   which current clients do. Both reference implementations confirm the split:
+   ``@telegram-apps/init-data-node`` skips ``signature`` in ``validate3rd`` but
+   pushes it into the signed pairs in ``validate``, and aiogram's
+   ``check_webapp_signature`` pops only ``hash``.
 2. **Secret key derivation.** ``HMAC-SHA256(key="WebAppData", data=bot_token)``.
    The key and the message are the other way round from the usual reading of
    the docs' notation, and getting them backwards produces a verifier that
@@ -18,8 +30,13 @@ documented algorithm, in full, with nothing softened:
 3. **Constant-time comparison.** :func:`hmac.compare_digest`, never ``==``: a
    short-circuiting comparison against an attacker-supplied hash leaks the
    expected digest one byte at a time.
-4. **Freshness.** ``auth_date`` must be recent and must not be in the future,
-   which is what stops a captured payload from being replayed forever.
+4. **Freshness.** ``auth_date`` must be recent, which is what stops a captured
+   payload from being replayed forever, and must not be in the future by more
+   than :data:`FUTURE_SKEW_SECONDS`. The tolerance is deliberate and stated
+   rather than implied: a client whose clock runs a few seconds fast is
+   ordinary, and refusing it would deny a legitimate learner for a reason
+   nobody could diagnose. Sixty seconds does not meaningfully widen the replay
+   window, which the max-age bound governs.
 5. **A usable user.** A validated numeric ID, not a bot, and *only* the ID is
    kept — the display name, username, language and photo Telegram also sends
    are personal data with no role here.
@@ -47,8 +64,11 @@ from urllib.parse import parse_qsl
 #: percent-decoding a megabyte someone posted at the endpoint.
 MAX_INIT_DATA_CHARS = 4096
 
-#: Fields excluded from the data-check string, per the Telegram specification.
-_UNSIGNED_FIELDS = frozenset({"hash", "signature"})
+#: Excluded from the data-check string for the bot-token HMAC algorithm: the
+#: hash cannot sign itself. ``signature`` is deliberately *not* here — it is
+#: excluded only by the third-party Ed25519 algorithm, which this module does
+#: not implement. See the module docstring.
+_UNSIGNED_FIELDS = frozenset({"hash"})
 
 #: ``chat_type`` values that mean "a private conversation with the bot". A
 #: Mini App launched anywhere else is a group surface, and this plugin's data

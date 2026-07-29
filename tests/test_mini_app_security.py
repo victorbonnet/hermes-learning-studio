@@ -18,7 +18,8 @@ from learning_studio.web.security import (
     RateLimited,
     RateLimiter,
     RequestTooLarge,
-    enforce_body_limit,
+    enforce_declared_length,
+    enforce_measured_length,
     log_request,
     redacted,
     validate_response_value,
@@ -41,23 +42,39 @@ class Clock:
 
 
 def test_a_body_within_the_limit_is_accepted():
-    enforce_body_limit("4", b"abcd", 16)
+    enforce_declared_length("4", 16)
+    enforce_measured_length(4, 16)
+
+
+def test_a_declared_oversize_body_is_refused():
+    """The declaration is what lets a huge upload be refused before reading."""
+    with pytest.raises(RequestTooLarge):
+        enforce_declared_length("1000000", 16)
+
+
+def test_an_absent_declaration_is_not_itself_a_refusal():
+    """A chunked request declares nothing; the measured check bounds it."""
+    enforce_declared_length(None, 16)
+    enforce_declared_length("", 16)
+
+
+@pytest.mark.parametrize("declared", ["not-a-number", "-1", "1e6"])
+def test_a_malformed_content_length_is_refused(declared: str):
+    """Not "treated as absent" — that would hand over the unmeasured path."""
+    with pytest.raises(RequestTooLarge):
+        enforce_declared_length(declared, 16)
 
 
 def test_a_measured_oversize_body_is_refused():
     with pytest.raises(RequestTooLarge):
-        enforce_body_limit(None, b"x" * 17, 16)
+        enforce_measured_length(17, 16)
 
 
-def test_a_declared_oversize_body_is_refused_before_it_is_read():
-    """The declaration is what lets a huge upload be refused early."""
+def test_the_measured_check_is_cumulative_not_per_chunk():
+    """Nine bytes twice is eighteen bytes, and the limit is sixteen."""
+    enforce_measured_length(9, 16)
     with pytest.raises(RequestTooLarge):
-        enforce_body_limit("1000000", b"", 16)
-
-
-def test_a_malformed_content_length_is_refused():
-    with pytest.raises(RequestTooLarge):
-        enforce_body_limit("not-a-number", b"{}", 16)
+        enforce_measured_length(18, 16)
 
 
 # ── Rate limiting ─────────────────────────────────────────────────────────

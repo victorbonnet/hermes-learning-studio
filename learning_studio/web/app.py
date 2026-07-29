@@ -51,8 +51,10 @@ from .security import (
     RateLimited,
     RateLimiter,
     RequestTooLarge,
-    enforce_body_limit,
+    enforce_declared_length,
+    enforce_measured_length,
     log_request,
+    log_unhandled,
     validate_response_value,
 )
 
@@ -139,8 +141,8 @@ def create_app(dependencies: Dependencies | None = None):
     async def secure_every_response(request: Request, call_next):
         try:
             response = await call_next(request)
-        except Exception:  # pragma: no cover - defensive; handlers convert theirs
-            logger.exception("unhandled error serving %s", request.url.path)
+        except Exception as exc:
+            log_unhandled(exc, route=request.url.path, method=request.method)
             response = JSONResponse({"error": INTERNAL}, status_code=500)
         for header, value in SECURITY_HEADERS.items():
             response.headers[header] = value
@@ -165,20 +167,26 @@ def create_app(dependencies: Dependencies | None = None):
     def authenticate(request: Request, *, bootstrap: bool):
         """Verify Telegram auth, authorise the account, and rate-limit it.
 
-        Run on *every* route. ``bootstrap`` only chooses the freshness window:
-        opening a session demands recently signed ``initData``, while later
-        calls in that session accept a payload as old as a session may live,
+        Run on *every* route. ``bootstrap`` only chooses the freshness window.
+        Opening a session demands recently signed ``initData``. Later calls in
+        that session accept a payload old enough to have opened the session and
+        then lived out its whole term — ``session TTL + bootstrap window`` —
         because Telegram signs once at launch and the session's own expiry is
         what bounds the rest.
+
+        That sum is not padding. Taking ``max()`` of the two, as this did
+        first, silently shortened every session opened with slightly stale
+        ``initData``: a payload 299 seconds old at bootstrap hit the 1800-second
+        freshness bound after only ~1501 seconds of a session that had
+        advertised 1800, so the API returned 401 while the session store still
+        considered it live. The advertised TTL has to be the one a caller
+        actually gets.
         """
         raw = request.headers.get(INIT_DATA_HEADER, "")
         max_age = (
             config.mini_app_init_data_max_age_seconds
             if bootstrap
-            else max(
-                config.mini_app_init_data_max_age_seconds,
-                config.mini_app_session_ttl_seconds,
-            )
+            else config.mini_app_session_ttl_seconds + config.mini_app_init_data_max_age_seconds
         )
         try:
             verified = verify_init_data(
@@ -217,6 +225,12 @@ def create_app(dependencies: Dependencies | None = None):
         except SessionError as exc:
             raise ApiError(401, SESSION_REQUIRED, reason=exc.reason) from exc
 
+        if verified.auth_date < session.auth_date:
+            # The wider freshness window above is what makes this check worth
+            # having: a session may be continued with the launch that opened it
+            # or a newer one, never with an older captured payload.
+            raise ApiError(401, SESSION_REQUIRED, reason="init_data_older_than_session")
+
         try:
             limiter.check(f"session:{session.ref}")
         except RateLimited as exc:
@@ -238,14 +252,41 @@ def create_app(dependencies: Dependencies | None = None):
         return verified, session
 
     async def json_body(request: Request) -> dict[str, Any]:
-        """Read a bounded JSON object body, or refuse."""
-        body = await request.body()
+        """Read a bounded JSON object body, or refuse — without buffering it all.
+
+        The order is the point, and getting it wrong was a real defect here.
+        ``await request.body()`` buffers the entire request *before* anything
+        can be measured, so a declared-oversize request was fully resident in
+        memory by the time it earned its 413. Now:
+
+        1. an oversized or malformed ``Content-Length`` is refused having read
+           nothing at all;
+        2. otherwise the body is consumed chunk by chunk and abandoned the
+           moment the cumulative size crosses the limit, which is what bounds a
+           chunked request that declared no length.
+
+        The peak cost of an oversized request is therefore one chunk, not the
+        whole payload.
+        """
+        limit = config.mini_app_max_request_bytes
         try:
-            enforce_body_limit(
-                request.headers.get("content-length"), body, config.mini_app_max_request_bytes
-            )
+            enforce_declared_length(request.headers.get("content-length"), limit)
         except RequestTooLarge as exc:
-            raise ApiError(413, TOO_LARGE, reason="body_too_large") from exc
+            raise ApiError(413, TOO_LARGE, reason="declared_body_too_large") from exc
+
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            try:
+                enforce_measured_length(received, limit)
+            except RequestTooLarge as exc:
+                # Raising from inside the iteration abandons the rest of the
+                # stream rather than draining it politely, which is the point:
+                # the bytes still in flight are never pulled.
+                raise ApiError(413, TOO_LARGE, reason="body_too_large") from exc
+            chunks.append(chunk)
+        body = b"".join(chunks)
 
         if not body:
             return {}
@@ -296,6 +337,7 @@ def create_app(dependencies: Dependencies | None = None):
                 track_id=experience.get("track_id"),
             ),
             component_count=len(experience["components"]),
+            auth_date=verified.auth_date,
         )
         log_request(
             event="session_opened",

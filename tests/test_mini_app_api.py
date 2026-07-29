@@ -12,6 +12,7 @@ No Telegram call is made, and no test in this file opens a socket.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -302,6 +303,60 @@ def test_a_session_expires(client, experience_id, clock, config):
     assert response.status_code == 401
 
 
+def test_a_session_opened_with_stale_init_data_still_lasts_its_advertised_life(
+    client, experience_id, clock, config
+):
+    """The advertised TTL has to be the TTL a caller actually gets.
+
+    Regression: the freshness bound for later calls was ``max(bootstrap window,
+    session TTL)`` rather than their sum, so a session opened with ``initData``
+    that was already 299 seconds old died after ~1501 seconds of the 1800 it
+    had advertised — a 401 while the session store still considered it live.
+    """
+    almost_stale = config.mini_app_init_data_max_age_seconds - 1
+    headers = auth(age=almost_stale)
+    opened = client.post("/api/session", json={"experience_id": experience_id}, headers=headers)
+    assert opened.status_code == 201
+    token = opened.json()["session_token"]
+    advertised = opened.json()["expires_in_seconds"]
+
+    assert advertised == config.mini_app_session_ttl_seconds
+
+    # One second before the advertised expiry, with the same launch payload.
+    clock.advance(advertised - 1)
+    still_live = client.get("/api/session/component", headers={**headers, SESSION_HEADER: token})
+
+    assert still_live.status_code == 200
+
+    # And it does expire on time — the window widened, the session did not.
+    clock.advance(2)
+    assert (
+        client.get("/api/session/component", headers={**headers, SESSION_HEADER: token}).status_code
+        == 401
+    )
+
+
+def test_a_session_cannot_be_continued_with_an_older_launch(client, experience_id, clock):
+    """A newer payload may continue a session; an older captured one may not."""
+    token, _ = open_session(client, experience_id)
+
+    older = auth(age=200)  # signed before the payload that opened the session
+    response = client.get("/api/session/component", headers={**older, SESSION_HEADER: token})
+
+    assert response.status_code == 401
+
+
+def test_a_newer_launch_continues_the_same_session(client, experience_id, clock):
+    """Reopening the Mini App mid-exercise must not invalidate the session."""
+    token, _ = open_session(client, experience_id)
+
+    clock.advance(30)
+    newer = auth(age=0)
+    response = client.get("/api/session/component", headers={**newer, SESSION_HEADER: token})
+
+    assert response.status_code == 200
+
+
 # ── Cross-user, cross-session, cross-experience ───────────────────────────
 
 
@@ -507,6 +562,236 @@ def test_a_non_json_body_is_refused(client):
     )
 
     assert response.status_code == 400
+
+
+def drive_asgi(app, *, method: str, path: str, headers: dict[str, str], chunks: list[bytes]):
+    """Call the ASGI app directly, counting the body bytes it actually pulls.
+
+    Instrumenting the ``receive`` channel is the only way to measure this
+    honestly. Spying on ``Request.stream`` does not work: Starlette's
+    ``BaseHTTPMiddleware`` *constructs* the stream generator for every request
+    without consuming it, so a spy there fires even when the route reads
+    nothing. And going through ``TestClient`` measures the transport's
+    buffering rather than the application's.
+
+    Returns ``(status, pulled)`` where ``pulled`` counts the messages and bytes
+    the app asked for.
+    """
+    import asyncio
+
+    remaining = list(chunks)
+    pulled = {"messages": 0, "bytes": 0}
+    messages: list[dict] = []
+
+    async def receive():
+        if not remaining:
+            return {"type": "http.disconnect"}
+        chunk = remaining.pop(0)
+        pulled["messages"] += 1
+        pulled["bytes"] += len(chunk)
+        return {"type": "http.request", "body": chunk, "more_body": bool(remaining)}
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": method,
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "scheme": "http",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "client": ("127.0.0.1", 45678),
+        "server": ("testserver", 80),
+    }
+    asyncio.run(app(scope, receive, send))
+    status = next(m["status"] for m in messages if m["type"] == "http.response.start")
+    return status, pulled
+
+
+def test_a_declared_oversize_body_is_never_pulled_from_the_channel(deps, config):
+    """The declaration must be refused before a single byte is read.
+
+    Regression: the first version awaited ``request.body()`` and measured
+    afterwards, so a caller declaring a gigabyte got a gigabyte buffered and
+    *then* a 413.
+    """
+    limit = config.mini_app_max_request_bytes
+
+    status, pulled = drive_asgi(
+        create_app(deps),
+        method="POST",
+        path="/api/session",
+        headers={
+            **auth(),
+            "content-type": "application/json",
+            "content-length": str(limit * 64),
+        },
+        chunks=[b"x" * 1024] * 64,
+    )
+
+    assert status == 413
+    assert pulled == {"messages": 0, "bytes": 0}
+
+
+def test_an_undeclared_oversize_body_stops_being_pulled_at_the_limit(deps, config):
+    """A chunked request declares nothing, so reading must abort mid-stream."""
+    limit = config.mini_app_max_request_bytes
+    chunk = b"x" * 1024
+    offered = (limit // len(chunk)) * 8
+
+    status, pulled = drive_asgi(
+        create_app(deps),
+        method="POST",
+        path="/api/session",
+        headers={**auth(), "content-type": "application/json"},
+        chunks=[chunk] * offered,
+    )
+
+    assert status == 413
+    # At most one chunk may cross the line — that is what "stop as soon as the
+    # cumulative size is exceeded" means.
+    assert pulled["bytes"] <= limit + len(chunk)
+    assert pulled["messages"] < offered, "the whole oversized stream was read before refusing"
+
+
+def test_a_body_within_the_limit_is_still_read_completely(deps, experience_id):
+    """The guard must not truncate an ordinary request."""
+    payload = json.dumps({"experience_id": experience_id}).encode()
+
+    status, pulled = drive_asgi(
+        create_app(deps),
+        method="POST",
+        path="/api/session",
+        headers={
+            **auth(),
+            "content-type": "application/json",
+            "content-length": str(len(payload)),
+        },
+        chunks=[payload[:5], payload[5:]],
+    )
+
+    assert status == 201
+    assert pulled["bytes"] == len(payload)
+
+
+def test_an_unexpected_failure_leaks_nothing_to_the_logs(deps, experience_id, caplog):
+    """The 500 path must be as redacted as every other log line.
+
+    Regression: the middleware called ``logger.exception``, which wrote the
+    message and traceback — and therefore any path, SQL fragment, token, or
+    answer key the failing code was holding — straight into the ordinary log.
+    """
+
+    from fastapi.testclient import TestClient
+
+    def exploding(_principal, _experience_id):
+        raise RuntimeError(
+            "connect /Users/someone/.hermes/db: SELECT * FROM learners; "
+            f"answer={CANARY}-leaked bot_token={BOT_TOKEN}"
+        )
+
+    broken = Dependencies(
+        config=deps.config,
+        sessions=deps.sessions,
+        bot_token=deps.bot_token,
+        allowed_users=deps.allowed_users,
+        profile=deps.profile,
+        clock=deps.clock,
+        load_experience=exploding,
+        load_asset=deps.load_asset,
+    )
+    with (
+        caplog.at_level(logging.DEBUG),
+        TestClient(create_app(broken), raise_server_exceptions=False) as broken_client,
+    ):
+        response = broken_client.post(
+            "/api/session", json={"experience_id": experience_id}, headers=auth()
+        )
+
+    assert response.status_code == 500
+    logs = caplog.text
+    assert "/Users/someone/.hermes" not in logs
+    assert "SELECT" not in logs
+    assert CANARY not in logs
+    assert BOT_TOKEN not in logs
+    assert "Traceback" not in logs
+    # The failure is still recorded — just as a class name, which a programmer
+    # chose, rather than a message built from runtime values.
+    assert '"event": "unhandled_error"' in logs
+    assert "RuntimeError" in logs
+
+
+def test_the_failure_is_still_recorded_usefully(deps, experience_id, caplog):
+    """Redaction must not mean silence: what broke and where is still logged.
+
+    An operator needs enough to know a 500 happened, on which route, and of
+    what kind. Everything built from runtime values — the message, the
+    traceback — is what stays out.
+    """
+
+    from fastapi.testclient import TestClient
+
+    def exploding(_principal, _experience_id):
+        raise KeyError("runtime detail that must not be logged")
+
+    broken = Dependencies(
+        config=deps.config,
+        sessions=deps.sessions,
+        bot_token=deps.bot_token,
+        allowed_users=deps.allowed_users,
+        profile=deps.profile,
+        clock=deps.clock,
+        load_experience=exploding,
+        load_asset=deps.load_asset,
+    )
+    with (
+        caplog.at_level(logging.DEBUG),
+        TestClient(create_app(broken), raise_server_exceptions=False) as broken_client,
+    ):
+        broken_client.post("/api/session", json={"experience_id": experience_id}, headers=auth())
+
+    logs = caplog.text
+    assert '"event": "unhandled_error"' in logs
+    assert '"route": "/api/session"' in logs
+    assert '"reason": "KeyError"' in logs
+    assert "runtime detail that must not be logged" not in logs
+
+
+def test_no_second_logger_can_be_switched_on_to_leak_the_traceback():
+    """There is no opt-in detail logger, because a switch gets flipped.
+
+    A silenced-by-default logger was tried here and removed: pytest's log
+    capture attaches handlers to loggers it did not create and reads records
+    through ``propagate = False``, so "off by default" was not off. The
+    property under test is that no such escape hatch exists.
+    """
+    import ast
+
+    import learning_studio.web.security as security_module
+
+    assert not hasattr(security_module, "diagnostics")
+
+    # Parsed, not grepped: the module's docstring *describes* the design that
+    # was removed, and a text search would read that description as a
+    # violation. Only actual calls count.
+    package = Path(security_module.__file__).parent
+    offenders: list[str] = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "exception":
+                offenders.append(f"{path.name}: .exception() call")
+            if any(keyword.arg == "exc_info" for keyword in node.keywords):
+                offenders.append(f"{path.name}: exc_info= argument")
+
+    assert offenders == []
 
 
 def test_requests_are_rate_limited_per_user(hermes_home, clock, allowlist):

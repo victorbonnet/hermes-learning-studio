@@ -1,53 +1,110 @@
-"""Mini App authorisation: an intersection that can only ever narrow."""
+"""Mini App authorisation: an intersection that can only ever narrow.
+
+The rules under test are not this plugin's invention — they mirror
+``gateway/authz_mixin.py::_is_user_authorized`` for a direct message. The two
+regressions at the top of this file are the reason the mirroring is explicit:
+both were real defects that authorised somebody Hermes denies.
+"""
 
 from __future__ import annotations
 
 import pytest
 
 from learning_studio.authorization import (
+    ENV_ALLOWLISTS,
     GROUP_ONLY_SOURCES,
+    NON_AUTHORISING_CONFIG_KEYS,
+    any_env_allowlist_configured,
     effective_allowed_users,
     is_authorized,
     profile_allowed_users,
 )
 
 
-def config(**extra) -> dict:
+def extra_config(**extra) -> dict:
+    """``platforms.telegram.extra`` — the bridged shape."""
     return {"platforms": {"telegram": {"extra": extra}}}
 
 
-# ── Reading the profile's own allowlist ───────────────────────────────────
+def top_level_config(**keys) -> dict:
+    """``platforms.telegram`` — the shape operators actually write."""
+    return {"platforms": {"telegram": keys}}
 
 
-def test_the_environment_allowlist_is_honoured():
-    allowed = profile_allowed_users(env={"TELEGRAM_ALLOWED_USERS": "1001,2002"})
+def gateway_config(**keys) -> dict:
+    """``gateway.platforms.telegram`` — the currently documented shape."""
+    return {"gateway": {"platforms": {"telegram": keys}}}
 
-    assert allowed == {"1001", "2002"}
+
+# ── Regressions: two ways this module used to broaden host access ──────────
 
 
-def test_the_config_allowlist_is_honoured():
-    allowed = profile_allowed_users(env={}, host_config=config(allow_from=["1001"]))
+def test_allow_admin_from_is_not_an_authorisation_source():
+    """Regression. It gates slash-command privilege, not access.
+
+    Hermes reads ``allow_admin_from`` only in ``gateway/slash_access.py``. An
+    earlier version of this module unioned it into the allowlist, so a user the
+    host excluded from Telegram entirely could reach the Mini App by appearing
+    there.
+    """
+    allowed = profile_allowed_users(
+        env={},
+        host_config=top_level_config(allow_from=["1001"], allow_admin_from=["9999"]),
+    )
+
+    assert allowed == {"1001"}
+    assert "9999" not in allowed
+
+
+@pytest.mark.parametrize("key", NON_AUTHORISING_CONFIG_KEYS)
+def test_no_admin_key_grants_access_in_any_shape(key: str):
+    for build in (extra_config, top_level_config, gateway_config):
+        assert profile_allowed_users(env={}, host_config=build(**{key: ["9999"]})) == frozenset()
+
+
+def test_an_environment_allowlist_wins_over_stale_configuration():
+    """Regression. Hermes stops consulting ``allow_from`` once env is set.
+
+    An operator with ``TELEGRAM_ALLOWED_USERS=1001`` and a leftover
+    ``allow_from: [9999]`` has, in Hermes' view, exactly one allowlist. The
+    earlier unconditional union honoured two and authorised 9999.
+    """
+    allowed = profile_allowed_users(
+        env={"TELEGRAM_ALLOWED_USERS": "1001"},
+        host_config=top_level_config(allow_from=["9999"]),
+    )
 
     assert allowed == {"1001"}
 
 
-def test_admins_are_allowed_users_too():
-    allowed = profile_allowed_users(env={}, host_config=config(allow_admin_from=["7"]))
-
-    assert allowed == {"7"}
-
-
-def test_both_sources_are_unioned_as_hermes_unions_them():
+@pytest.mark.parametrize("present", ENV_ALLOWLISTS)
+def test_any_environment_allowlist_suppresses_configuration_fallback(present: str):
+    """Even a group-scoped env allowlist means Hermes decides from env."""
     allowed = profile_allowed_users(
-        env={"TELEGRAM_ALLOWED_USERS": "1001"}, host_config=config(allow_from=["2002"])
+        env={present: "5005"}, host_config=top_level_config(allow_from=["9999"])
+    )
+
+    assert "9999" not in allowed
+
+
+# ── Reading the environment allowlists ────────────────────────────────────
+
+
+def test_the_platform_environment_allowlist_authorises():
+    assert profile_allowed_users(env={"TELEGRAM_ALLOWED_USERS": "1001,2002"}) == {"1001", "2002"}
+
+
+def test_the_global_gateway_allowlist_authorises():
+    """``GATEWAY_ALLOWED_USERS`` authorises in Hermes, so it authorises here."""
+    assert profile_allowed_users(env={"GATEWAY_ALLOWED_USERS": "1001"}) == {"1001"}
+
+
+def test_the_platform_and_global_environment_allowlists_are_unioned():
+    allowed = profile_allowed_users(
+        env={"TELEGRAM_ALLOWED_USERS": "1001", "GATEWAY_ALLOWED_USERS": "2002"}
     )
 
     assert allowed == {"1001", "2002"}
-
-
-@pytest.mark.parametrize("raw", ["", "   ", ",,", "abc", "-5", "0", "1001abc"])
-def test_unusable_entries_do_not_become_allowlist_members(raw: str):
-    assert profile_allowed_users(env={"TELEGRAM_ALLOWED_USERS": raw}) == frozenset()
 
 
 def test_whitespace_around_ids_is_tolerated():
@@ -57,18 +114,72 @@ def test_whitespace_around_ids_is_tolerated():
     }
 
 
-# ── Groups authorise nothing here ─────────────────────────────────────────
+@pytest.mark.parametrize("raw", ["", "   ", ",,", "abc", "-5", "0", "1001abc"])
+def test_unusable_entries_do_not_become_allowlist_members(raw: str):
+    assert profile_allowed_users(env={"TELEGRAM_ALLOWED_USERS": raw}) == frozenset()
+
+
+# ── Reading the configured allowlist, in every shape Hermes accepts ────────
+
+
+@pytest.mark.parametrize("build", [extra_config, top_level_config, gateway_config])
+def test_the_configured_allowlist_is_honoured_in_every_shape(build):
+    """``gateway/config.py`` bridges the top-level key into ``extra``."""
+    assert profile_allowed_users(env={}, host_config=build(allow_from=["1001"])) == {"1001"}
+
+
+def test_a_configured_allowlist_applies_only_without_an_environment_allowlist():
+    config = top_level_config(allow_from=["1001"])
+
+    assert profile_allowed_users(env={}, host_config=config) == {"1001"}
+    assert profile_allowed_users(env={"TELEGRAM_ALLOWED_USERS": "2002"}, host_config=config) == {
+        "2002"
+    }
+
+
+def test_a_comma_separated_scalar_allow_from_is_read():
+    """Hermes' ``_coerce_allow_set`` accepts a scalar string; so does this."""
+    assert profile_allowed_users(env={}, host_config=top_level_config(allow_from="1001,2002")) == {
+        "1001",
+        "2002",
+    }
+
+
+@pytest.mark.parametrize("host_config", [None, {}, {"platforms": None}, {"platforms": {}}, "text"])
+def test_an_absent_or_unusable_configuration_authorises_nobody(host_config):
+    assert profile_allowed_users(env={}, host_config=host_config) == frozenset()
+
+
+# ── Grants this module deliberately does not honour ───────────────────────
 
 
 @pytest.mark.parametrize("source", GROUP_ONLY_SOURCES)
 def test_group_only_authorisations_grant_no_mini_app_access(source: str):
     """Being allowed to speak in a room is not being allowed into a record."""
     allowed = profile_allowed_users(
-        env={source: "1001"},
-        host_config=config(**{source: ["1001"]}),
+        env={source: "1001"}, host_config=top_level_config(**{source: ["1001"]})
     )
 
     assert allowed == frozenset()
+
+
+@pytest.mark.parametrize("wildcard", ["*", "1001,*"])
+def test_a_wildcard_never_opens_the_mini_app(wildcard: str):
+    """A wildcard opens a chat bot, not one person's learning record."""
+    allowed = profile_allowed_users(env={"TELEGRAM_ALLOWED_USERS": wildcard})
+
+    assert "*" not in allowed
+    assert not is_authorized("7777", allowed)
+
+
+@pytest.mark.parametrize("flag", ["GATEWAY_ALLOW_ALL_USERS", "TELEGRAM_ALLOW_ALL_USERS"])
+def test_an_allow_all_flag_authorises_nobody_here(flag: str):
+    assert profile_allowed_users(env={flag: "true"}) == frozenset()
+
+
+def test_no_environment_and_no_configuration_authorises_nobody():
+    assert profile_allowed_users(env={}) == frozenset()
+    assert any_env_allowlist_configured({}) is False
 
 
 # ── The intersection ──────────────────────────────────────────────────────
@@ -76,8 +187,7 @@ def test_group_only_authorisations_grant_no_mini_app_access(source: str):
 
 def test_the_plugin_restriction_narrows_the_profile_allowlist():
     allowed = effective_allowed_users(
-        plugin_restriction=("1001",),
-        env={"TELEGRAM_ALLOWED_USERS": "1001,2002,3003"},
+        plugin_restriction=("1001",), env={"TELEGRAM_ALLOWED_USERS": "1001,2002,3003"}
     )
 
     assert allowed == {"1001"}
@@ -101,6 +211,17 @@ def test_the_plugin_can_never_broaden_profile_access():
     assert allowed == {"2002"}
     assert "3003" not in allowed
     assert "4004" not in allowed
+
+
+def test_the_restriction_cannot_resurrect_a_configured_user_the_environment_excludes():
+    """The two fixes compose: precedence first, then narrowing."""
+    allowed = effective_allowed_users(
+        plugin_restriction=("9999",),
+        env={"TELEGRAM_ALLOWED_USERS": "1001"},
+        host_config=top_level_config(allow_from=["9999"], allow_admin_from=["9999"]),
+    )
+
+    assert allowed == frozenset()
 
 
 def test_a_restriction_disjoint_from_the_profile_allows_nobody():

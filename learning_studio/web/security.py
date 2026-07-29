@@ -68,21 +68,41 @@ class RateLimited(Exception):
         self.retry_after = max(1, int(retry_after))
 
 
-def enforce_body_limit(declared_length: str | None, body: bytes, limit: int) -> None:
-    """Refuse an oversized body, by declaration and by measurement.
+def enforce_declared_length(declared_length: str | None, limit: int) -> None:
+    """Refuse an oversized body *before* a single byte is read.
 
-    Both checks are needed: ``Content-Length`` lets an oversized request be
-    rejected before it is read, and the measured length is what catches a
-    chunked body that declared nothing at all.
+    This is the half that matters for resource safety. Reading the body and
+    then measuring it — which this module did first — means the ceiling is
+    enforced only after the whole request is already in memory, so a caller who
+    declares a gigabyte gets a gigabyte buffered and *then* a 413. Checking the
+    declaration first turns that into a refusal that costs nothing.
+
+    A malformed declaration is refused rather than ignored: a
+    ``Content-Length`` that is not a number is not a request this API needs to
+    understand, and treating it as "absent" would hand the caller the
+    unmeasured path for free.
     """
-    if declared_length:
-        try:
-            declared = int(declared_length)
-        except ValueError as exc:
-            raise RequestTooLarge("malformed content-length") from exc
-        if declared > limit:
-            raise RequestTooLarge("declared body too large")
-    if len(body) > limit:
+    if not declared_length:
+        return
+    try:
+        declared = int(declared_length)
+    except ValueError as exc:
+        raise RequestTooLarge("malformed content-length") from exc
+    if declared < 0:
+        raise RequestTooLarge("negative content-length")
+    if declared > limit:
+        raise RequestTooLarge("declared body too large")
+
+
+def enforce_measured_length(size: int, limit: int) -> None:
+    """Refuse a body that turned out larger than it declared, or declared nothing.
+
+    Kept as a separate check because a chunked request carries no
+    ``Content-Length`` at all, and a dishonest one carries the wrong value. The
+    caller applies this *as it reads*, so the cumulative size can never exceed
+    the limit by more than one chunk.
+    """
+    if size > limit:
         raise RequestTooLarge("body too large")
 
 
@@ -166,6 +186,43 @@ def redacted(**fields: Any) -> LogEvent:
 
 def log_request(level: int = logging.INFO, **fields: Any) -> None:
     logger.log(level, "%s", redacted(**fields).render())
+
+
+def log_unhandled(exc: BaseException, *, route: str, method: str) -> None:
+    """Record an unexpected failure without quoting it.
+
+    An unexpected failure in this API can be holding anything the failing code
+    was holding: a filesystem path, a SQL fragment, a bot token read from the
+    environment, a component's answer key. ``logger.exception`` — which this
+    module used first — writes the message and the traceback into the ordinary
+    log, defeating the redaction every other line goes through.
+
+    So no exception text and no traceback are logged. What is recorded is the
+    route, the method, the status, and the exception's *class name* — a name a
+    programmer chose, not a string built from runtime values.
+
+    **This is a deliberate trade, and it costs something.** Diagnosing a 500
+    here means reproducing it, because the traceback is not written anywhere.
+    An intermediate design — a second, silenced logger that an operator could
+    opt into — was tried and removed: a ``LogRecord`` carrying ``exc_info`` is
+    a live object holding the sensitive values, and any component that captures
+    records broadly renders it regardless of how that logger is configured.
+    pytest's own log capture does exactly that, reaching records through
+    ``propagate = False`` and attaching handlers to loggers it did not create.
+    A record that is never constructed is the only one that cannot be captured,
+    and "the traceback is off unless somebody flips this switch" is a switch
+    that gets flipped by accident.
+    """
+    logger.error(
+        "%s",
+        redacted(
+            event="unhandled_error",
+            route=route,
+            method=method,
+            status=500,
+            reason=type(exc).__name__,
+        ).render(),
+    )
 
 
 #: Bounds on a submitted answer, applied after the body-size limit. A response
