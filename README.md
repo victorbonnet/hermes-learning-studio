@@ -72,6 +72,13 @@ For a directory-plugin install, install Pillow into the same Python environment
 that runs Hermes. Without it, the plugin and its other three tools continue to
 work; `learning_studio_import_asset` returns a safe, actionable error.
 
+Managed publication also requires descriptor-relative filesystem operations
+(`dir_fd`, `O_DIRECTORY`, and `O_NOFOLLOW`) so validation cannot be bypassed by
+a directory-swap race. Platforms without those primitives, including Windows,
+fail closed for `learning_studio_import_asset`; plugin registration, learning
+context, and exercise preparation remain available. No pathname-only fallback
+is used because it would weaken the managed-storage security boundary.
+
 ## Usage
 
 Ask the agent to load the skill:

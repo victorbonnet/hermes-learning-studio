@@ -47,6 +47,18 @@ _SAFE_IMAGE_INFO_KEYS = {
 }
 
 
+def _supports_secure_directory_operations() -> bool:
+    """Whether this runtime can pin every managed-storage operation to a dirfd."""
+    required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink, os.link)
+    return (
+        hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and all(function in os.supports_dir_fd for function in required_dir_fd)
+        and os.stat in os.supports_follow_symlinks
+        and os.link in os.supports_follow_symlinks
+    )
+
+
 class AssetError(ValueError):
     """An asset was unsafe or invalid. Messages contain no source paths."""
 
@@ -250,6 +262,11 @@ def _open_managed_assets_directory():
     a checked pathname would leave a window in which another process could
     replace ``assets/`` with a symlink before a later create or open.
     """
+    if not _supports_secure_directory_operations():
+        raise AssetError(
+            "Managed image import requires secure descriptor-relative filesystem operations "
+            "that are unavailable on this platform"
+        )
     base = ensure_storage_root().resolve(strict=True)
     root = base / ASSET_DIRECTORY
     directory_flags = (

@@ -284,6 +284,19 @@ def test_atomic_copy_has_private_modes_and_no_temporary_files(hermes_home, princ
     assert result["asset_id"] in files[0].name
 
 
+def test_managed_import_fails_closed_without_secure_directory_operations(
+    hermes_home, principal, monkeypatch
+):
+    source = _source_root(hermes_home) / "unsupported-platform.png"
+    _image(source)
+    monkeypatch.setattr(assets, "_supports_secure_directory_operations", lambda: False)
+
+    with pytest.raises(service.ValidationError, match="descriptor-relative|platform"):
+        _import(principal, source)
+
+    assert not (hermes_home / "workspace" / "learning-studio" / "assets").exists()
+
+
 def test_atomic_copy_never_overwrites_an_existing_asset_name(hermes_home):
     first = assets.InspectedImage(b"first", "1" * 64, "image/png", "png", 1, 1)
     second = assets.InspectedImage(b"second", "2" * 64, "image/png", "png", 1, 1)
