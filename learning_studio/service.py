@@ -29,6 +29,7 @@ import json
 import secrets
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -2243,10 +2244,44 @@ def get_experience(
 ) -> dict[str, Any]:
     """Read back a stored experience's learner-visible half.
 
-    No tool exposes this yet — the delivery runtime arrives later. It exists
-    now so that the storage guarantees this PR makes (ownership, ordering, and
-    an evaluator-free projection) are testable against the code a runtime will
-    actually call, rather than against a query written in a test.
+    No tool exposes this — the agent-facing surface never reads an experience
+    back. It is the projection the Mini App API serves, kept here so ownership,
+    ordering, and the evaluator-free projection are decided in one place.
+    """
+    return delivery_bundle(
+        principal=principal, experience_id=experience_id, config=config
+    ).experience
+
+
+@dataclass(frozen=True)
+class DeliveryBundle:
+    """An ownership-checked experience, plus the learner row that owns it.
+
+    The API needs both: the payload to serve, and the internal learner ID to
+    bind a session to. Returning them together means the ownership check
+    happens exactly once, in the same connection that produced the payload.
+    """
+
+    learner_id: str
+    experience: dict[str, Any]
+
+    @property
+    def asset_ids(self) -> frozenset[str]:
+        """Every managed asset this experience's components legitimately use."""
+        return experience_asset_ids(self.experience)
+
+
+def delivery_bundle(
+    *,
+    principal: Principal,
+    experience_id: str,
+    config: LearningStudioConfig | None = None,
+) -> DeliveryBundle:
+    """Load one experience for delivery, or refuse.
+
+    Refusal is :data:`NOT_FOUND_EXPERIENCE_MESSAGE` whether the experience does
+    not exist, belongs to another learner, or belongs to another profile — the
+    Mini App must not become an oracle for what other people are studying.
     """
     config = config or load_config()
     profile = principal.profile
@@ -2272,6 +2307,15 @@ def get_experience(
             (str(experience_id), profile, learner_id),
         ).fetchall()
 
+    return DeliveryBundle(learner_id=learner_id, experience=_experience_payload(row, components))
+
+
+def _experience_payload(row: sqlite3.Row, components: list[sqlite3.Row]) -> dict[str, Any]:
+    """The learner-visible projection of a stored experience.
+
+    Built by naming every field, so the evaluator-only tables — which are not
+    even queried above — cannot arrive here by a future ``SELECT *``.
+    """
     return {
         "experience_id": str(row["id"]),
         "track_id": row["track_id"],
@@ -2301,6 +2345,97 @@ def get_experience(
             for component in components
         ],
     }
+
+
+# ── Managed asset delivery ────────────────────────────────────────────────
+
+
+def experience_asset_ids(experience: dict[str, Any]) -> frozenset[str]:
+    """Collect the managed asset IDs an experience's components reference.
+
+    Walking the stored learner payloads — rather than trusting a list supplied
+    with the request — is what makes "this session may fetch this image" a
+    consequence of the exercise's own content. An asset the experience does not
+    mention is not fetchable through that experience's session, even by its
+    rightful owner, and even though ownership alone would allow it.
+    """
+    found: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            reference = node.get(_ASSET_REFERENCE_KEY)
+            if isinstance(reference, str) and reference:
+                found.add(reference)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for component in experience.get("components", []):
+        walk(component.get("payload"))
+    return frozenset(found)
+
+
+#: The one key a managed asset reference is ever spelled with; see
+#: ``components._ASSET``.
+_ASSET_REFERENCE_KEY = "asset_ref"
+
+
+@dataclass(frozen=True)
+class ManagedAssetBytes:
+    """Verified bytes plus the metadata needed to serve them safely."""
+
+    asset_id: str
+    mime_type: str
+    sha256: str
+    byte_size: int
+    data: bytes
+
+
+def read_managed_asset(
+    *,
+    principal: Principal,
+    asset_id: str,
+    config: LearningStudioConfig | None = None,
+) -> ManagedAssetBytes:
+    """Return one managed asset's bytes, for its owner only.
+
+    Ownership is re-checked here against ``(profile, learner)`` rather than
+    inherited from whatever the caller already looked up, and the bytes are
+    re-verified against the recorded hash on every read: an image that was
+    swapped on disk after import must not be served, however legitimate the
+    request that asked for it.
+    """
+    from . import assets
+
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            raise NotFoundError(NOT_FOUND_ASSET_MESSAGE)
+        row = conn.execute(
+            "SELECT * FROM managed_assets WHERE id = ? AND profile_id = ? AND learner_id = ?",
+            (str(asset_id), profile, learner_id),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(NOT_FOUND_ASSET_MESSAGE)
+
+    try:
+        data = assets.read_managed_asset(row)
+    except assets.AssetError as exc:
+        raise ValidationError(str(exc)) from exc
+
+    return ManagedAssetBytes(
+        asset_id=str(row["id"]),
+        mime_type=str(row["mime_type"]),
+        sha256=str(row["sha256"]),
+        byte_size=int(row["byte_size"]),
+        data=data,
+    )
 
 
 # ── Input validation helpers ──────────────────────────────────────────────

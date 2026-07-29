@@ -54,7 +54,26 @@ image-provider requests, and nothing that reads a real credential.
   scope, touch the network, or raise — a failing `register()` disables the
   plugin.
 - **Put optional dependencies behind lazy imports** inside the function that
-  needs them, and declare them as extras in `pyproject.toml`.
+  needs them, and declare them as extras in `pyproject.toml`. FastAPI is the
+  exception that proves the rule: it is imported at module scope, but only
+  inside `learning_studio/web/`, which nothing on the plugin surface imports.
+  Adding a `from .web import ...` anywhere else breaks every install without
+  the `web` extra, and a test fails if you do.
+- **Never add a way to skip authentication.** No `DEV_MODE`, no `SKIP_AUTH`,
+  no "only in tests" branch. The Mini App API takes its bot token, allowlist,
+  and clock through `Dependencies`; a test injects a fake token and signs real
+  payloads with it, so the verification under test is the verification that
+  ships. `tests/test_mini_app_security.py` parses the sources and fails on an
+  identifier that looks like a bypass.
+- **Authorisation may narrow, never widen.** Mini App access is bounded by
+  *both* of Hermes' Telegram gates — adapter intake (`allow_from`, the sole
+  authority when present, even when empty) and runner authorisation (the
+  environment allowlists) — intersected with this plugin's optional restriction.
+  Nothing in `config.yaml` may grant access to somebody Hermes excludes. When
+  you touch `learning_studio/authorization.py`, read the current
+  `plugins/platforms/telegram/adapter.py` and `gateway/authz_mixin.py` rather
+  than the documentation: this resolver has been wrong twice, in both
+  directions, and each time the tests agreed with it.
 - **Resolve paths with the profile-safe helper.** Hermes supports multiple
   profiles via `HERMES_HOME`, so never hardcode `~/.hermes` and never use the
   process CWD. Go through `learning_studio.paths`, which delegates to the

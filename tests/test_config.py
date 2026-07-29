@@ -177,6 +177,61 @@ def test_an_oversized_default_value_is_refused():
         _config(defaults={"goal": "x" * 5000})
 
 
+# ── Mini App settings ─────────────────────────────────────────────────────
+
+
+def test_the_mini_app_defaults_are_conservative():
+    config = LearningStudioConfig.from_mapping({})
+
+    assert config.mini_app_session_ttl_seconds == 1800
+    assert config.mini_app_init_data_max_age_seconds == 300
+    assert config.mini_app_max_request_bytes == 16 * 1024
+    assert config.mini_app_rate_limit_requests == 60
+    assert config.mini_app_rate_limit_window_seconds == 60
+    assert config.mini_app_allowed_telegram_users == ()
+
+
+def test_no_secret_belongs_in_the_mini_app_settings():
+    """A bot token in config.yaml would be a credential in a tracked file."""
+    with pytest.raises(ConfigError, match="unknown"):
+        _config(mini_app_bot_token="1234567890:secret")
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("mini_app_session_ttl_seconds", 5),
+        ("mini_app_session_ttl_seconds", 200_000),
+        ("mini_app_init_data_max_age_seconds", 1),
+        ("mini_app_init_data_max_age_seconds", 99_999),
+        ("mini_app_max_request_bytes", 1),
+        ("mini_app_max_request_bytes", 100_000_000),
+        ("mini_app_rate_limit_requests", 0),
+        ("mini_app_rate_limit_window_seconds", 0),
+        ("mini_app_max_sessions", 0),
+    ],
+)
+def test_an_out_of_range_mini_app_setting_is_refused(key: str, value: int):
+    with pytest.raises(ConfigError):
+        _config(**{key: value})
+
+
+def test_the_allowlist_restriction_takes_numeric_ids():
+    config = _config(mini_app_allowed_telegram_users=[1001, "2002", "2002"])
+
+    assert config.mini_app_allowed_telegram_users == ("1001", "2002")
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["1001", ["@someone"], ["-5"], [0], [True], [None], {"1001": True}, [1001.5]],
+)
+def test_an_unusable_allowlist_entry_is_refused(value):
+    """Silently dropping an entry would look identical to it working."""
+    with pytest.raises(ConfigError):
+        _config(mini_app_allowed_telegram_users=value)
+
+
 # ── The plugin does not mutate host configuration ─────────────────────────
 
 
