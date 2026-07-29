@@ -407,20 +407,26 @@ the objectives from step 2, in their terms.
 
 When an exercise needs a picture — a labelled cell, a circuit, a map:
 
-1. Generate it with the host agent's existing image tool (`image_generate`).
-   This skill does not ship an image generator, and you must not shell out to
-   one.
-2. Import the real output into the exercise through the Studio's managed-asset
-   import step, once that tool exists. Until then, show the image in chat.
-3. **Never invent an asset ID, filename, or path.** Use only identifiers a tool
-   actually returned to you.
-4. Never state that an image was generated or imported without a real tool
-   result to back it. If generation failed, say so and fall back to a text
-   description — a described diagram is a working exercise; a fabricated
-   reference is a broken one.
+1. Generate or select it with the host agent's existing image tooling
+   (`image_generate`). This skill does not ship an image generator, and you
+   must not shell out to one.
+2. Pass the **actual local path that tool returned** to
+   `learning_studio_import_asset`, together with a title, a provenance, and
+   alt text. Do not retype, guess, or construct the path.
+3. Use only the opaque `asset_id` from that **successful** import when you
+   reference the image in a Learning Studio manifest, as
+   `{"asset_ref": "<asset_id>", "alt_text": "..."}`. The local path never
+   belongs in a manifest.
+4. **Never invent an asset ID, filename, path, import result, or generation
+   result.** Use only identifiers and outcomes a tool actually returned to you.
+5. If generation or managed import fails, say so and either build an honest
+   text-only exercise or show the picture as an ordinary image in the
+   conversation — without referencing it as a managed asset. A described
+   diagram is a working exercise; a fabricated reference is a broken one.
 
-Every image needs alternative text that conveys what the image contributes. If
-the answer *is* the image, the alt text must not give it away.
+Every image needs alternative text that conveys what the image contributes,
+and the alt text you pass to the import must match the one you use in the
+manifest. If the answer *is* the image, the alt text must not give it away.
 
 ## Memory
 

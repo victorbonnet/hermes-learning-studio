@@ -574,11 +574,13 @@ _ASSET = shared(
 def _asset(name: str, *, required: bool = False) -> Field:
     """A reference to a managed asset, under whatever name the type uses.
 
-    Only the *shape* is checked. Nothing is fetched, imported, or opened:
-    asset import belongs to a later PR, and this PR must be able to model the
-    reference without acquiring the ability to resolve it. ``alt_text`` is
-    required because an image whose alternative text is optional is an image
-    that ships without one.
+    Component validation checks only the *shape* of the reference: nothing is
+    fetched, imported, or opened here. Managed assets are created by
+    ``learning_studio_import_asset``, and ``prepare_experience()`` resolves
+    each reference and authorises it against the current profile, learner, and
+    exact track scope before an experience is stored. ``alt_text`` is required
+    because an image whose alternative text is optional is an image that ships
+    without one.
     """
     return replace(_ASSET, name=name, required=required)
 

@@ -171,8 +171,8 @@ path honest.
 
 **Registration cannot fail.** `register(ctx)` is called at every Hermes startup
 for every enabled plugin. It registers one skill, imports nothing optional, and
-declares no `requires_env` — so enabling the plugin cannot break a session. The
-FastAPI and Pillow dependencies that later PRs introduce must stay behind lazy
+declares no `requires_env` — so enabling the plugin cannot break a session.
+Pillow, and the FastAPI dependency a later PR introduces, must stay behind lazy
 imports inside the code paths that need them; a test blocks those modules at
 import time and asserts registration still succeeds.
 
@@ -649,12 +649,17 @@ create or modify.
 
 ## Roadmap
 
-Deliberately **not** here yet: the exercise delivery runtime, card renderers,
-attempt and score storage, the FastAPI dashboard and Mini App, Telegram
-authentication, frontend code, Cloudflare tunnels, slash commands, managed
-asset import, image generation, progress dashboards, and any scheduler. Each
-lands in a later PR. The skill describes how the agent will use those
-capabilities and instructs it to fall back to chat until they exist.
+Secure managed image import **is** here: `learning_studio_import_asset`
+validates and stores PNG, JPEG, and WebP images in profile-scoped managed
+storage, and `learning_studio_prepare` authorises every referenced asset. See
+[Managed assets](#learning_studio_import_asset).
+
+Deliberately **not** here yet: image-generation providers, asset delivery and
+the FastAPI layer, the exercise delivery runtime, card renderers, the Mini App
+and frontend code, Telegram authentication, Cloudflare tunnels, slash commands,
+attempt and score storage, progress dashboards, and any scheduler. Each lands
+in a later PR. The skill describes how the agent will use those capabilities
+and instructs it to fall back to chat until they exist.
 
 Manifests are validated and stored, but nothing reads them back to a learner
 yet: `learning_studio_prepare` is the data contract a renderer will later
