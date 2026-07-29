@@ -17,18 +17,28 @@ it too narrowly.
 
 ## Runtime status: read this first
 
-Three tools exist:
+Four tools exist:
 
 | Tool | What it does |
 | --- | --- |
 | `learning_studio_get_context` | Retrieve what is known about a learner before you plan |
 | `learning_studio_save_context` | Record what you learned; propose memory candidates |
 | `learning_studio_prepare` | Validate and store an exercise you have designed |
+| `learning_studio_import_asset` | Validate a real host image and return an opaque managed asset id |
 
 **There is still no delivery runtime** — no card renderer, no Mini App, no
 scoring engine, no scheduler. `learning_studio_prepare` *stores* a validated
 exercise; it does not run one, and calling it opens nothing on the learner's
 screen. Exercises are still delivered by you, in conversation.
+
+When a visual component genuinely improves the exercise, first use Hermes'
+existing image-generation or image-selection capability. Pass the **real local
+path it returned** to `learning_studio_import_asset`, then use the returned
+`asset_id` as the manifest's `asset_ref` together with the exact returned
+`alt_text`. Never invent an asset id, put a local path or URL in a manifest, or
+claim an image was imported after an error. The import tool does not generate
+images. If its optional media dependency is unavailable, choose a non-visual
+component and continue in chat.
 
 That does not weaken the workflow. Every phase below is executed in
 conversation by default; the runtime, when it exists, replaces the *delivery*

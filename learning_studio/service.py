@@ -60,6 +60,8 @@ NOT_FOUND_OBJECTIVE_MESSAGE = "No such objective on that track for this learner.
 
 NOT_FOUND_EXPERIENCE_MESSAGE = "No such prepared exercise for this learner."
 
+NOT_FOUND_ASSET_MESSAGE = "No such managed asset for this learner and track."
+
 #: Track states that accept no new context, objectives, or corrections. A
 #: learner who archived or withdrew a track has said they are done with it;
 #: quietly writing to it anyway would undo that.
@@ -1684,7 +1686,131 @@ def _safe_echo(value: Any) -> str:
     return text[:80] + ("…" if len(text) > 80 else "")
 
 
-# ── Experiences ───────────────────────────────────────────────────────────
+# ── Managed assets ─────────────────────────────────────────────────────────
+
+
+def import_asset(
+    *,
+    principal: Principal,
+    source_path: str,
+    title: Any,
+    provenance: Any,
+    alt_text: Any = None,
+    decorative: bool = False,
+    generation_prompt: Any = None,
+    track_id: Any = None,
+    config: LearningStudioConfig | None = None,
+) -> dict[str, Any]:
+    """Validate and atomically adopt a trusted local image result."""
+    from . import assets
+    from .models import clean_text
+    from .safety import safe_text
+
+    config = config or load_config()
+    try:
+        clean_title = safe_text(title, "title", max_chars=200)
+        if not isinstance(decorative, bool):
+            raise ValueError("decorative must be true or false")
+        if decorative:
+            if alt_text is not None:
+                raise ValueError("a decorative image must omit alt text")
+            clean_alt = None
+        else:
+            try:
+                clean_alt = safe_text(alt_text, "alt text", max_chars=1000)
+            except ValueError as exc:
+                raise ValueError("a meaningful image requires useful alt text") from exc
+        if provenance not in assets.PROVENANCES:
+            raise ValueError("provenance must be one of: " + ", ".join(assets.PROVENANCES))
+        clean_prompt = (
+            clean_text(generation_prompt, "generation_prompt", 4000)
+            if generation_prompt is not None
+            else None
+        )
+        inspected = assets.inspect_image(source_path, config)
+    except (ValueError, assets.AssetError) as exc:
+        raise ValidationError(str(exc)) from exc
+
+    profile = principal.profile
+    published_asset = None
+    storage.initialize(config)
+    try:
+        with storage.connect(config) as conn, storage.transaction(conn):
+            learner_id = _get_or_create_learner(conn, principal)
+            resolved_track = (
+                str(_writable_track(conn, profile, learner_id, str(track_id))["id"])
+                if track_id is not None
+                else None
+            )
+            scope_key = resolved_track or ""
+            existing = conn.execute(
+                "SELECT * FROM managed_assets"
+                " WHERE profile_id = ? AND learner_id = ? AND scope_key = ? AND sha256 = ?",
+                (profile, learner_id, scope_key, inspected.sha256),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    assets.verify_managed_asset(existing)
+                except assets.AssetError as exc:
+                    raise ValidationError(str(exc)) from exc
+                submitted = {
+                    "title": clean_title,
+                    "alt_text": clean_alt,
+                    "decorative": int(decorative),
+                    "provenance": provenance,
+                    "generation_prompt": clean_prompt,
+                }
+                conflicts = [key for key, value in submitted.items() if existing[key] != value]
+                return assets.safe_metadata(
+                    existing, deduplicated=True, metadata_conflicts=conflicts
+                )
+
+            asset_id = _new_id()
+            try:
+                published_asset = assets.copy_atomic(inspected, asset_id)
+                storage_name = published_asset.storage_name
+            except assets.AssetError as exc:
+                raise ValidationError(str(exc)) from exc
+            now = _now()
+            conn.execute(
+                "INSERT INTO managed_assets"
+                " (id, learner_id, profile_id, track_id, scope_key, title, alt_text, decorative,"
+                "  provenance, generation_prompt, sha256, mime_type, byte_size, width, height,"
+                "  storage_name, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    asset_id,
+                    learner_id,
+                    profile,
+                    resolved_track,
+                    scope_key,
+                    clean_title,
+                    clean_alt,
+                    int(decorative),
+                    provenance,
+                    clean_prompt,
+                    inspected.sha256,
+                    inspected.mime_type,
+                    inspected.byte_size,
+                    inspected.width,
+                    inspected.height,
+                    storage_name,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM managed_assets WHERE id = ?", (asset_id,)).fetchone()
+            return assets.safe_metadata(row, deduplicated=False)
+    except BaseException:
+        if published_asset is not None:
+            import contextlib
+
+            with contextlib.suppress(OSError, assets.AssetError):
+                assets.remove_managed_asset(published_asset)
+        raise
+
+
+# ── Experiences ────────────────────────────────────────────────────────────
 
 #: Objectives a learner has finished with. Preparing new practice against one
 #: would quietly reopen something they closed.
@@ -1728,6 +1854,13 @@ def prepare_experience(
         resolved_track = _resolve_experience_track(conn, profile, learner_id, track_id)
         resolved_objective = _resolve_experience_objective(
             conn, profile, learner_id, resolved_track, objective_id, validated
+        )
+        _authorise_manifest_assets(
+            conn,
+            profile=profile,
+            learner_id=learner_id,
+            track_id=resolved_track,
+            components=validated.components,
         )
         _authorise_accommodations(
             conn,
@@ -1833,6 +1966,43 @@ def _resolve_experience_objective(
 def _comparable(text: str) -> str:
     """Case- and whitespace-insensitive form, for objective agreement."""
     return " ".join(str(text).split()).casefold()
+
+
+def _authorise_manifest_assets(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    learner_id: str,
+    track_id: str | None,
+    components: Any,
+) -> None:
+    """Require every manifest asset to exist in this exact ownership scope."""
+    from . import assets
+    from .manifest import _component_assets
+
+    scope_key = track_id or ""
+    for component in components:
+        for reference in _component_assets(component):
+            row = conn.execute(
+                "SELECT * FROM managed_assets"
+                " WHERE id = ? AND profile_id = ? AND learner_id = ? AND scope_key = ?",
+                (str(reference["asset_ref"]), profile, learner_id, scope_key),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(NOT_FOUND_ASSET_MESSAGE)
+            try:
+                assets.verify_managed_asset(row)
+            except assets.AssetError as exc:
+                raise ValidationError(str(exc)) from exc
+            if bool(row["decorative"]):
+                raise ValidationError(
+                    "A decorative managed asset cannot be used as meaningful exercise imagery."
+                )
+            if str(reference.get("alt_text", "")) != str(row["alt_text"]):
+                raise ValidationError(
+                    "The manifest alt text does not match the managed asset metadata. "
+                    "Use the alt_text returned by learning_studio_import_asset."
+                )
 
 
 # ── Accessibility provenance ──────────────────────────────────────────────

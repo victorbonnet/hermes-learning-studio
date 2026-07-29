@@ -169,7 +169,64 @@ def test_migrations_are_contiguous_and_the_version_is_the_last_one():
     versions = [m.version for m in storage.MIGRATIONS]
 
     assert versions == list(range(1, len(versions) + 1))
-    assert storage.SCHEMA_VERSION == versions[-1] == 7
+    assert storage.SCHEMA_VERSION == versions[-1] == 8
+
+
+def test_a_v7_database_upgrades_to_managed_assets_without_rewriting_prior_state(
+    hermes_home: Path,
+):
+    _build_database_at(7)
+    now = "2026-01-01T00:00:00+00:00"
+    with storage.connect() as conn:
+        conn.execute(
+            "INSERT INTO learners"
+            " (id, profile_id, principal_digest, platform, created_at, updated_at)"
+            " VALUES ('L-before-assets', 'default', 'digest-before-assets', 'telegram', ?, ?)",
+            (now, now),
+        )
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 8
+        assert (
+            conn.execute("SELECT id FROM learners WHERE id = 'L-before-assets'").fetchone()["id"]
+            == "L-before-assets"
+        )
+        columns = _columns(conn, "managed_assets")
+        assert {
+            "id",
+            "learner_id",
+            "profile_id",
+            "track_id",
+            "sha256",
+            "mime_type",
+            "storage_name",
+            "generation_prompt",
+        } <= columns
+        assert "source_path" not in columns
+
+
+def test_a_failing_migration_eight_rolls_back_the_asset_schema(hermes_home: Path, monkeypatch):
+    _build_database_at(7)
+    real = list(storage.MIGRATIONS)
+    broken_eight = storage.Migration(
+        version=8,
+        statements=(*real[7].statements, "THIS IS NOT SQL"),
+    )
+    monkeypatch.setattr(storage, "MIGRATIONS", [*real[:7], broken_eight])
+
+    with pytest.raises(storage.MigrationError):
+        storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 7
+        assert (
+            conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'managed_assets'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_migration_two_adds_the_column():
@@ -1142,7 +1199,7 @@ def test_a_v5_database_receives_lifecycle_and_provenance_cleanup(hermes_home: Pa
         ).fetchall()
         version = storage.read_schema_version(conn)
 
-    assert version == 7
+    assert version == 8
     assert [dict(row) for row in rows] == [
         {
             "id": "authority-v5",
@@ -1270,7 +1327,7 @@ def test_a_v6_database_purges_only_legacy_accessibility_data(hermes_home: Path):
         ]
         foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert version == 7
+    assert version == 8
     assert values == ["goal-value"]
     assert revisions == ["goal-revision"]
     assert candidates == ["goal-candidate"]

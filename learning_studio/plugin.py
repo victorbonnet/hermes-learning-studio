@@ -1,8 +1,8 @@
 """Plugin registration.
 
-The plugin's contract with Hermes: one bundled read-only skill and two typed
-tools for learning context. The dashboard, exercise runtime, and Mini App
-land in later PRs.
+The plugin's contract with Hermes: one bundled read-only skill and four typed
+tools for learning context, managed assets, and prepared exercises. The
+dashboard, exercise runtime, and Mini App land in later PRs.
 
 ``register(ctx)`` runs at every Hermes startup for every enabled plugin, so
 it must not raise. It deliberately does **not** open the database: a

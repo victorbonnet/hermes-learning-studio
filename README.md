@@ -5,10 +5,11 @@ learning: structured study sessions built on active recall and spaced
 repetition.
 
 > **Status: early development.** This is not the feature-complete public
-> release. What exists today is a bundled skill plus three tools: two that
+> release. What exists today is a bundled skill plus four tools: two that
 > remember a learner's **context** — their goals, level, preferences, and
 > confirmed learning tracks — and one that validates and stores the
-> **exercises** an agent designs, all in profile-scoped SQLite.
+> **exercises** an agent designs, plus a secure managed-image importer, all in
+> profile-scoped storage.
 >
 > There is still **no delivery runtime**: no card renderer, no Mini App, no
 > scoring engine, no scheduler, and no network requests. A prepared exercise is
@@ -59,6 +60,18 @@ itself and fails with `Plugin 'learning-studio' has no register() function`.
 `tests/test_entry_point.py` verifies the load path behaviourally, and the wheel
 is installed into a clean virtualenv during verification to confirm it.
 
+Managed image import uses Pillow, but plugin import, registration, context, and
+exercise preparation do not. Package installs can opt into it with the
+`media` extra:
+
+```bash
+pip install "hermes-learning-studio[media] @ git+https://github.com/victorbonnet/hermes-learning-studio.git"
+```
+
+For a directory-plugin install, install Pillow into the same Python environment
+that runs Hermes. Without it, the plugin and its other three tools continue to
+work; `learning_studio_import_asset` returns a safe, actionable error.
+
 ## Usage
 
 Ask the agent to load the skill:
@@ -102,8 +115,9 @@ installable **Python package**, which drives the layout:
 │   ├── safety.py               # Content rules — inert text or nothing
 │   ├── components.py           # The trusted component registry (31 types)
 │   ├── manifest.py             # The experience envelope and its validation
+│   ├── assets.py               # Lazy image validation and atomic managed copies
 │   ├── service.py              # Reads, writes, ownership, consent gates
-│   ├── schemas.py              # JSON schemas for the three tools
+│   ├── schemas.py              # JSON schemas for the four tools
 │   ├── tools.py                # Tool handlers
 │   └── skills/
 │       └── adaptive-learning/
@@ -216,16 +230,16 @@ database written by a newer version of the plugin is refused with an
 explanation and left byte-for-byte untouched — deleting or "resetting" an
 unfamiliar database would destroy a learner's record to make the code happy.
 
-**`register()` opens no database.** It registers a skill and three tools and
+**`register()` opens no database.** It registers a skill and four tools and
 returns. Initialising storage at startup would let a corrupt or
 newer-versioned database take the whole plugin down, instead of failing one
 tool call with a message the agent can act on.
 
-**No runtime dependencies.** `dependencies` is empty, so installing the plugin
-adds nothing to a user's Hermes environment. Persistence uses the standard
-library's `sqlite3`. PyYAML is a test-only dependency in the `dev` extra, and
-a test blocks FastAPI, Pillow, Telegram, HTTP clients, and PyYAML at import
-time then asserts the tools still register *and run*.
+**No mandatory runtime dependencies.** `dependencies` is empty, persistence
+uses the standard library's `sqlite3`, and Pillow is isolated in the optional
+`media` extra. Tests block FastAPI, Pillow, Telegram, HTTP clients, and PyYAML
+at import time and still require the plugin and all four tool schemas to
+register; only a real image import needs Pillow.
 
 ## Configuration
 
@@ -261,6 +275,12 @@ learning_studio:
   # Longest single context value, in characters (80–20000).
   max_context_value_chars: 2000
 
+  # Managed-image safety limits, enforced before and during decoding.
+  max_asset_bytes: 10485760
+  max_asset_width: 8192
+  max_asset_height: 8192
+  max_asset_pixels: 40000000
+
   # Context values that apply to everyone on this profile.
   profile_context:
     explanation_language: English
@@ -276,7 +296,8 @@ learning_studio:
 
 **The section fails closed.** A malformed value raises rather than falling
 back to a default, and an unknown key is an error rather than being ignored —
-every setting here governs retention, isolation, or consent, and a misspelled
+every setting here governs retention, isolation, privacy, or resource safety,
+and a misspelled
 `allow_durable_accessibility_needs` that silently degraded to "off" would look
 exactly like the setting working.
 
@@ -293,9 +314,12 @@ profile. Directories are created `0700` and the database `0600` where the
 filesystem supports it. Each Hermes profile gets its own database; nothing is
 shared between them.
 
+Validated images are copied to the sibling `assets/` directory with opaque
+filenames and owner-only permissions. Original source paths are never stored.
+
 ## Tools
 
-Three tools, all in the `plugin_learning_studio` toolset. None takes a learner
+Four tools, all in the `plugin_learning_studio` toolset. None takes a learner
 argument: identity is resolved from the Hermes session, so a call always reads
 and writes the record of whoever sent the current message.
 
@@ -336,6 +360,23 @@ opaque `experience_id` and a learner-safe summary.
 The manifest is the UI contract. It is data, never renderer code: no tool here
 generates HTML, and every string is checked to be inert text. See
 [Exercise manifests](#exercise-manifests).
+
+### `learning_studio_import_asset`
+
+Imports PNG, JPEG, or single-frame WebP bytes from the active profile's trusted
+Hermes image cache. It detects MIME from bytes, fully verifies the image,
+enforces byte/dimension/pixel limits, requires meaningful alternative text (or
+an explicit decorative declaration), rejects embedded private metadata, hashes
+and deduplicates inside the exact learner/track scope, and atomically copies the
+bytes into managed storage. On a duplicate, the first import's metadata remains
+immutable and the response explicitly names any conflicting submitted fields.
+
+The response contains an opaque `asset_id` and safe metadata. It never returns
+or persists the original local path, and it never returns a stored generation
+prompt. Visual manifest components accept only an asset owned by the current
+learner in the experience's exact track scope, with the same alternative text
+recorded at import. The tool does not generate images, serve files over HTTP,
+or open a UI.
 
 ## Exercise manifests
 

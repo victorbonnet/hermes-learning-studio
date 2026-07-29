@@ -26,6 +26,10 @@ def test_an_absent_section_yields_safe_defaults():
     assert config.temporary_context_ttl_hours == 72
     assert config.journal_mode == "wal"
     assert config.busy_timeout_ms == 5000
+    assert config.max_asset_bytes == 10 * 1024 * 1024
+    assert config.max_asset_width == 8192
+    assert config.max_asset_height == 8192
+    assert config.max_asset_pixels == 40_000_000
 
 
 def test_the_defaults_presume_no_subject():
@@ -71,6 +75,10 @@ def test_valid_settings_are_applied():
         memory_candidate_min_evidence=4,
         allow_durable_accessibility_needs=False,
         max_context_value_chars=500,
+        max_asset_bytes=1_000_000,
+        max_asset_width=4096,
+        max_asset_height=2048,
+        max_asset_pixels=8_000_000,
     )
 
     assert config.temporary_context_ttl_hours == 24
@@ -80,6 +88,10 @@ def test_valid_settings_are_applied():
     assert config.memory_candidate_min_evidence == 4
     assert config.allow_durable_accessibility_needs is False
     assert config.max_context_value_chars == 500
+    assert config.max_asset_bytes == 1_000_000
+    assert config.max_asset_width == 4096
+    assert config.max_asset_height == 2048
+    assert config.max_asset_pixels == 8_000_000
 
 
 def test_journal_mode_is_case_insensitive():
@@ -114,6 +126,10 @@ def test_profile_context_and_defaults_accept_context_fields():
         {"busy_timeout_ms": 10_000_000},
         {"memory_candidate_min_evidence": 1},
         {"max_context_value_chars": 5},
+        {"max_asset_bytes": 0},
+        {"max_asset_width": 0},
+        {"max_asset_height": "8192"},
+        {"max_asset_pixels": True},
     ],
 )
 def test_an_out_of_range_or_wrong_typed_number_is_refused(settings: dict):

@@ -18,8 +18,9 @@ runtime is stricter a test names the case.
 
 The checker is a small subset of JSON Schema — objects, arrays, strings,
 numbers, integers, booleans, enums, constants, patterns, bounds, uniqueness,
-local
-``$ref``, and ``oneOf`` — because that is all the tool surface uses, and a
+local ``$ref``, ``oneOf``, ``allOf``, and the narrow ``if``/``then``/``else``
+and ``not`` forms used for cross-field tool requirements — because that is
+all the tool surface uses, and a
 full implementation would be a dependency this plugin does not want. The
 advertised schema is checked against a real JSON Schema implementation in the
 test suite, where a development dependency costs nobody anything.
@@ -62,6 +63,17 @@ def validate(
     """
     root = schema if root is None else root
 
+    if "const" in schema and value != schema["const"]:
+        _fail(path, f"must equal {schema['const']!r}")
+
+    if "not" in schema:
+        try:
+            validate(value, schema["not"], path, root)
+        except SchemaViolation:
+            pass
+        else:
+            _fail(path, "matches a forbidden form")
+
     if "$ref" in schema:
         validate(value, _resolve(schema["$ref"], root, path), path, root)
         return
@@ -71,7 +83,9 @@ def validate(
         return
 
     expected = schema.get("type")
-    if expected == "object":
+    if expected == "object" or any(
+        keyword in schema for keyword in ("properties", "required", "additionalProperties")
+    ):
         _validate_object(value, schema, path, root)
     elif expected == "array":
         _validate_array(value, schema, path, root)
@@ -83,6 +97,19 @@ def validate(
         _validate_number(value, schema, path)
     elif expected == "boolean" and not isinstance(value, bool):
         _fail(path, "must be true or false")
+
+    for requirement in schema.get("allOf", []):
+        validate(value, requirement, path, root)
+
+    if "if" in schema:
+        try:
+            validate(value, schema["if"], path, root)
+        except SchemaViolation:
+            branch = schema.get("else")
+        else:
+            branch = schema.get("then")
+        if branch is not None:
+            validate(value, branch, path, root)
 
 
 def _resolve(pointer: str, root: dict[str, Any], path: str) -> dict[str, Any]:

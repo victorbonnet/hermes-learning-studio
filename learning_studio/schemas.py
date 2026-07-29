@@ -1,4 +1,4 @@
-"""JSON schemas for the two registered tools.
+"""JSON schemas for the four registered tools.
 
 The schemas are the plugin's actual security boundary against a confused or
 adversarial caller, so they are restrictive by construction:
@@ -6,9 +6,9 @@ adversarial caller, so they are restrictive by construction:
 - ``additionalProperties: false`` everywhere, so a typo is an error rather
   than a silently ignored field.
 - Every string is bounded, every array is bounded.
-- No field accepts a filesystem path, executable code, or SQL. There is
-  nothing here a caller could use to reach outside the Learning Studio's own
-  storage, because no such parameter exists to begin with.
+- The asset import tool alone accepts a local path; runtime containment limits
+  it to Hermes' active-profile image cache. No field accepts executable code
+  or SQL.
 - Nothing names a subject, a language, or a discipline.
 """
 
@@ -27,10 +27,12 @@ from .models import (
     ObjectiveStatus,
     TrackStatus,
 )
+from .safety import expressible_rule_summary, text_pattern
 
 GET_TOOL_NAME = "learning_studio_get_context"
 SAVE_TOOL_NAME = "learning_studio_save_context"
 PREPARE_TOOL_NAME = "learning_studio_prepare"
+IMPORT_ASSET_TOOL_NAME = "learning_studio_import_asset"
 
 _MAX_ITEMS = 25
 
@@ -438,8 +440,80 @@ PREPARE_SCHEMA: dict[str, Any] = {
 }
 
 
+IMPORT_ASSET_SCHEMA: dict[str, Any] = {
+    "name": IMPORT_ASSET_TOOL_NAME,
+    "description": (
+        "Securely import a real image produced or selected by the host into managed Learning "
+        "Studio storage. The local source must be an absolute path returned from Hermes' "
+        "trusted profile image cache. Returns an opaque asset id and safe metadata; never "
+        "invent an id or reuse a local path in an exercise. This tool does not generate images."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["source_path", "title", "provenance"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"decorative": {"const": True}},
+                    "required": ["decorative"],
+                },
+                "then": {"not": {"required": ["alt_text"]}},
+                "else": {"required": ["alt_text"]},
+            }
+        ],
+        "properties": {
+            "source_path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "description": (
+                    "Absolute local path from a real Hermes image tool result. Only files "
+                    "inside the active profile's trusted image cache are accepted."
+                ),
+            },
+            "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": text_pattern(),
+                "description": expressible_rule_summary(),
+            },
+            "alt_text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000,
+                "pattern": text_pattern(),
+                "description": (
+                    "Useful text conveying what a meaningful image contributes. Omit only "
+                    "when decorative is explicitly true. " + expressible_rule_summary()
+                ),
+            },
+            "decorative": {"type": "boolean"},
+            "provenance": {
+                "type": "string",
+                "enum": [
+                    "host_image_generation",
+                    "learner_provided",
+                    "operator_selected",
+                ],
+            },
+            "generation_prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4000,
+                "pattern": r"^(?=.*\S)[\s\S]+$",
+                "description": "Generation prompt retained server-side for provenance.",
+            },
+            "track_id": _TRACK_ID,
+        },
+    },
+}
+
+
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     GET_TOOL_NAME: GET_CONTEXT_SCHEMA,
     SAVE_TOOL_NAME: SAVE_CONTEXT_SCHEMA,
     PREPARE_TOOL_NAME: PREPARE_SCHEMA,
+    IMPORT_ASSET_TOOL_NAME: IMPORT_ASSET_SCHEMA,
 }

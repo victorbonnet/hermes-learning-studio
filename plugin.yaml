@@ -17,6 +17,7 @@ provides_tools:
   - learning_studio_get_context
   - learning_studio_save_context
   - learning_studio_prepare
+  - learning_studio_import_asset
 provides_hooks: []
 
 # No credentials are needed. A non-empty `requires_env` would gate the plugin

@@ -45,12 +45,18 @@ Issues = "https://github.com/victorbonnet/hermes-learning-studio/issues"
 learning-studio = "learning_studio"
 
 [project.optional-dependencies]
-# Test-only dependencies. PyYAML parses plugin.yaml and SKILL.md frontmatter;
-# jsonschema checks the advertised tool schema against a real JSON Schema
-# implementation, so "the schema and the runtime agree" is verified rather
-# than asserted. The plugin itself imports neither, and `dependencies` above
-# stays empty.
-dev = ["pytest>=8.0", "PyYAML>=6.0", "ruff>=0.6", "jsonschema>=4.20"]
+# Test dependencies exercise both the dependency-free base path and real media
+# validation. Pillow remains optional for runtime users via the `media` extra.
+dev = [
+    "pytest>=8.0",
+    "PyYAML>=6.0",
+    "ruff>=0.6",
+    "jsonschema>=4.20",
+    "Pillow>=10.0",
+]
+# Pillow is needed only when the import tool validates an image. It is lazy:
+# base plugin import, registration, and the other tools do not import it.
+media = ["Pillow>=10.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["learning_studio"]
