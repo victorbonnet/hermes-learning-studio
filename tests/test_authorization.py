@@ -62,26 +62,53 @@ def test_no_admin_key_grants_access_in_any_shape(key: str):
         assert profile_allowed_users(env={}, host_config=build(**{key: ["9999"]})) == frozenset()
 
 
-def test_an_environment_allowlist_wins_over_stale_configuration():
-    """Regression. Hermes stops consulting ``allow_from`` once env is set.
+def test_a_present_allow_from_bounds_access_whatever_the_environment_says():
+    """Regression. ``allow_from`` is the intake gate's *sole authority*.
 
-    An operator with ``TELEGRAM_ALLOWED_USERS=1001`` and a leftover
-    ``allow_from: [9999]`` has, in Hermes' view, exactly one allowlist. The
-    earlier unconditional union honoured two and authorised 9999.
+    ``plugins/platforms/telegram/adapter.py::_is_user_authorized_from_message``
+    drops a DM from anyone outside ``allow_from`` before the runner is reached,
+    so an environment allowlist cannot add a user back. Letting the environment
+    win — the previous fix's mistake — authorised 2002 here, whom Hermes never
+    delivers a message from at all.
     """
     allowed = profile_allowed_users(
-        env={"TELEGRAM_ALLOWED_USERS": "1001"},
-        host_config=top_level_config(allow_from=["9999"]),
+        env={"TELEGRAM_ALLOWED_USERS": "2002"},
+        host_config=top_level_config(allow_from=["1001"]),
     )
 
-    assert allowed == {"1001"}
+    assert allowed == frozenset()
+    assert "2002" not in allowed
+
+
+def test_neither_gate_can_add_a_user_the_other_denies():
+    """The intersection, stated as a property: both gates must permit."""
+    both = profile_allowed_users(
+        env={"TELEGRAM_ALLOWED_USERS": "1001,2002"},
+        host_config=top_level_config(allow_from=["1001", "3003"]),
+    )
+
+    assert both == {"1001"}
+
+
+def test_an_empty_allow_from_authorises_nobody():
+    """Hermes tests ``is not None``, so a present empty list is a lockout.
+
+    Collapsing "present but empty" into "absent" would turn a deliberate
+    lockout into a fallback onto the environment allowlist.
+    """
+    for build in (extra_config, top_level_config, gateway_config):
+        assert (
+            profile_allowed_users(
+                env={"TELEGRAM_ALLOWED_USERS": "1001,2002"}, host_config=build(allow_from=[])
+            )
+            == frozenset()
+        )
 
 
 @pytest.mark.parametrize("present", ENV_ALLOWLISTS)
-def test_any_environment_allowlist_suppresses_configuration_fallback(present: str):
-    """Even a group-scoped env allowlist means Hermes decides from env."""
+def test_an_environment_allowlist_cannot_widen_a_configured_allow_from(present: str):
     allowed = profile_allowed_users(
-        env={present: "5005"}, host_config=top_level_config(allow_from=["9999"])
+        env={present: "9999"}, host_config=top_level_config(allow_from=["1001"])
     )
 
     assert "9999" not in allowed
@@ -128,13 +155,22 @@ def test_the_configured_allowlist_is_honoured_in_every_shape(build):
     assert profile_allowed_users(env={}, host_config=build(allow_from=["1001"])) == {"1001"}
 
 
-def test_a_configured_allowlist_applies_only_without_an_environment_allowlist():
-    config = top_level_config(allow_from=["1001"])
+def test_the_two_gates_compose_across_the_whole_precedence_table():
+    """Every row of the table in ``authorization``'s docstring, in one place."""
+    cases = [
+        # (allow_from, environment, expected upper bound)
+        (["1001", "2002"], {"TELEGRAM_ALLOWED_USERS": "2002"}, {"2002"}),
+        (["1001"], {}, {"1001"}),
+        ([], {"TELEGRAM_ALLOWED_USERS": "1001"}, set()),
+        (None, {"TELEGRAM_ALLOWED_USERS": "1001"}, {"1001"}),
+        (None, {}, set()),
+    ]
 
-    assert profile_allowed_users(env={}, host_config=config) == {"1001"}
-    assert profile_allowed_users(env={"TELEGRAM_ALLOWED_USERS": "2002"}, host_config=config) == {
-        "2002"
-    }
+    for allow_from, env, expected in cases:
+        host_config = {} if allow_from is None else top_level_config(allow_from=allow_from)
+        assert profile_allowed_users(env=env, host_config=host_config) == expected, (
+            f"allow_from={allow_from!r} env={env!r}"
+        )
 
 
 def test_a_comma_separated_scalar_allow_from_is_read():
@@ -169,6 +205,27 @@ def test_a_wildcard_never_opens_the_mini_app(wildcard: str):
     allowed = profile_allowed_users(env={"TELEGRAM_ALLOWED_USERS": wildcard})
 
     assert "*" not in allowed
+    assert not is_authorized("7777", allowed)
+
+
+def test_a_wildcard_allow_from_grants_nothing_on_its_own():
+    assert profile_allowed_users(env={}, host_config=top_level_config(allow_from=["*"])) == (
+        frozenset()
+    )
+
+
+def test_a_wildcard_allow_from_does_not_deny_an_environment_listed_user():
+    """A wildcard removes the intake bound, exactly as it does in Hermes.
+
+    Treating it as an empty set instead would deny a user the operator named in
+    ``TELEGRAM_ALLOWED_USERS`` because of shorthand written elsewhere — a
+    denial with no diagnosable cause.
+    """
+    allowed = profile_allowed_users(
+        env={"TELEGRAM_ALLOWED_USERS": "1001"}, host_config=top_level_config(allow_from=["*"])
+    )
+
+    assert allowed == {"1001"}
     assert not is_authorized("7777", allowed)
 
 

@@ -65,9 +65,15 @@ image-provider requests, and nothing that reads a real credential.
   payloads with it, so the verification under test is the verification that
   ships. `tests/test_mini_app_security.py` parses the sources and fails on an
   identifier that looks like a bypass.
-- **Authorisation may narrow, never widen.** Mini App access is the profile's
-  Telegram allowlist intersected with this plugin's optional restriction.
-  Nothing in `config.yaml` may grant access to somebody Hermes excludes.
+- **Authorisation may narrow, never widen.** Mini App access is bounded by
+  *both* of Hermes' Telegram gates — adapter intake (`allow_from`, the sole
+  authority when present, even when empty) and runner authorisation (the
+  environment allowlists) — intersected with this plugin's optional restriction.
+  Nothing in `config.yaml` may grant access to somebody Hermes excludes. When
+  you touch `learning_studio/authorization.py`, read the current
+  `plugins/platforms/telegram/adapter.py` and `gateway/authz_mixin.py` rather
+  than the documentation: this resolver has been wrong twice, in both
+  directions, and each time the tests agreed with it.
 - **Resolve paths with the profile-safe helper.** Hermes supports multiple
   profiles via `HERMES_HOME`, so never hardcode `~/.hermes` and never use the
   process CWD. Go through `learning_studio.paths`, which delegates to the

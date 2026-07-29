@@ -748,24 +748,42 @@ is no setting that adds a user, because a plugin able to widen the host's
 allowlist would be a privilege-escalation feature with a configuration file for
 an interface.
 
-The profile side is Hermes' decision, and this plugin reproduces the shape of
-`gateway/authz_mixin.py::_is_user_authorized` for a direct message rather than
-inventing a reading of the raw fields:
+A Telegram DM passes **two** gates in Hermes, in order, and a sender must clear
+both. Mini App access is bounded by both, so it cannot exceed either.
 
-1. If **any** Telegram or gateway environment allowlist is configured —
-   `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_GROUP_ALLOWED_USERS`,
-   `TELEGRAM_GROUP_ALLOWED_CHATS`, `GATEWAY_ALLOWED_USERS` — Hermes decides a DM
-   from the environment alone and never consults the adapter's `allow_from`. The
-   allowlist is then `TELEGRAM_ALLOWED_USERS ∪ GATEWAY_ALLOWED_USERS`.
-2. Only when **no** environment allowlist exists at all does the configured
-   `allow_from` apply — read from every shape Hermes accepts:
-   `platforms.telegram` and `gateway.platforms.telegram`, with the key written
-   directly or inside `extra` (`gateway/config.py` bridges the former into the
-   latter).
+1. **Adapter intake** —
+   `plugins/platforms/telegram/adapter.py::_is_user_authorized_from_message`
+   runs before batching, event construction, and the runner. Its own comment:
+   *"Adapter-level allow_from / group_allow_from: when set, they are the sole
+   authority."* The test is `if adapter_allow_from is not None`, so a present
+   but **empty** `allow_from` authorises nobody, and a message from anyone
+   outside it never reaches the rest of Hermes.
+2. **Runner authorisation** —
+   `gateway/authz_mixin.py::_is_user_authorized` then decides from
+   `TELEGRAM_ALLOWED_USERS ∪ GATEWAY_ALLOWED_USERS` when any environment
+   allowlist is configured, falling back to `allow_from` when none is.
 
-Unioning the two unconditionally would authorise somebody the host denies: an
-operator who sets `TELEGRAM_ALLOWED_USERS` and leaves a stale `allow_from` in
-configuration has, in Hermes' view, one allowlist.
+`allow_from` is read from every shape Hermes accepts: `platforms.telegram` and
+`gateway.platforms.telegram`, with the key written directly or inside `extra`
+(`gateway/config.py` bridges the former into the latter).
+
+The effective upper bound is therefore the intersection:
+
+| `allow_from` | environment allowlist | Mini App upper bound |
+| --- | --- | --- |
+| present (ids) | configured | ids ∩ environment |
+| present (ids) | absent | ids |
+| present but empty | anything | nobody |
+| absent | configured | environment |
+| absent | absent | nobody |
+
+Two earlier versions got this wrong in opposite directions, and both broadened
+host access: unioning the two authorised anyone named in either, and letting
+the environment *win* over a present `allow_from` authorised a user the adapter
+drops at intake — with `allow_from: ["1001"]` and `TELEGRAM_ALLOWED_USERS=2002`,
+Hermes never delivers a message from 2002, yet the Mini App would have admitted
+2002. Intersecting is at least as strict as either gate alone, which is the only
+property that makes "may narrow, never broaden" true rather than intended.
 
 **`allow_admin_from` is not an authorisation source.** Hermes reads it only in
 `gateway/slash_access.py`, to decide which *already authorised* users may run
@@ -780,7 +798,7 @@ promised never to broaden access:
 
 | Not honoured | Why |
 | --- | --- |
-| `allow_from: ["*"]` and other wildcards | A wildcard opens a chat bot to everyone; it does not open one person's learning record to everyone. Name the IDs. |
+| `allow_from: ["*"]` and other wildcards | A wildcard opens a chat bot to everyone; it does not open one person's learning record to everyone. It grants nothing here — though, as in Hermes, it does remove the intake bound, so a wildcard beside an environment allowlist still authorises the users that allowlist names instead of denying them for the operator's choice of shorthand. Name the IDs. |
 | `GATEWAY_ALLOW_ALL_USERS`, `TELEGRAM_ALLOW_ALL_USERS` | Same reason. |
 | `TELEGRAM_GROUP_ALLOWED_USERS`, `TELEGRAM_GROUP_ALLOWED_CHATS`, `group_allow_from`, `group_allowed_chats` | Authorise participation in a room, not access to a personal record. Counted only when deciding whether *any* environment allowlist exists. |
 | DM pairing approvals | A first-class grant in Hermes, stored outside configuration; reading it would mean reaching into host internals. Hermes writes approvals into the allowlist whenever one is configured, so the gap is narrow — the remedy is naming the user in `TELEGRAM_ALLOWED_USERS`. |

@@ -16,23 +16,48 @@ privilege-escalation feature with a configuration file for an interface.
 Reading the profile side correctly
 ----------------------------------
 
-The profile side is Hermes' decision, and this module reproduces the shape of
-``gateway/authz_mixin.py::_is_user_authorized`` for a **direct message**
-rather than inventing a reading of the raw fields:
+A Telegram DM passes **two** gates in Hermes, in order, and a sender must clear
+both. This module bounds Mini App access by both, so it cannot exceed either.
 
-1. If *any* Telegram or gateway environment allowlist is configured
-   (``TELEGRAM_ALLOWED_USERS``, ``TELEGRAM_GROUP_ALLOWED_USERS``,
-   ``TELEGRAM_GROUP_ALLOWED_CHATS``, ``GATEWAY_ALLOWED_USERS``), Hermes decides
-   a DM from the *environment* allowlists alone and never consults the
-   adapter's ``allow_from``. The DM allowlist is then
-   ``TELEGRAM_ALLOWED_USERS ∪ GATEWAY_ALLOWED_USERS``.
-2. Only when **no** environment allowlist is configured at all does Hermes fall
-   back to the adapter's configured ``allow_from``.
+**Gate one — adapter intake.**
+``plugins/platforms/telegram/adapter.py::_is_user_authorized_from_message``
+runs before batching, event construction, and the runner. Its comment is
+explicit — *"Adapter-level allow_from / group_allow_from: when set, they are
+the sole authority"* — and the test is ``if adapter_allow_from is not None``,
+so a **present but empty** ``allow_from`` authorises nobody and a message from
+anyone outside it never reaches the rest of Hermes at all.
 
-Unioning the two unconditionally — which this module did first — can authorise
-somebody the host denies: an operator who sets ``TELEGRAM_ALLOWED_USERS`` and
-leaves a stale ``allow_from`` in configuration has, in Hermes' view, one
-allowlist and this plugin would have honoured two.
+**Gate two — runner authorisation.**
+``gateway/authz_mixin.py::_is_user_authorized`` then decides from the
+environment allowlists (``TELEGRAM_ALLOWED_USERS ∪ GATEWAY_ALLOWED_USERS``)
+when any environment allowlist is configured, falling back to the adapter's
+``allow_from`` when none is.
+
+So the effective host policy is the *intersection* of the two, and that is what
+this module computes:
+
+===========================  ==========================  =========================
+``allow_from``               environment allowlist        Mini App upper bound
+===========================  ==========================  =========================
+present (ids)                configured                  ids ∩ environment
+present (ids)                absent                      ids
+present but empty            anything                    nobody
+absent                       configured                  environment
+absent                       absent                      nobody
+===========================  ==========================  =========================
+
+Two earlier versions of this got it wrong in opposite directions, and both
+broadened host access:
+
+- unioning environment and ``allow_from`` unconditionally authorised anyone
+  named in either;
+- letting the environment *win* over a present ``allow_from`` authorised a user
+  the adapter drops at intake. With ``allow_from: ["1001"]`` and
+  ``TELEGRAM_ALLOWED_USERS=2002``, Hermes never delivers a message from 2002,
+  yet the Mini App would have let 2002 in.
+
+Intersecting is at least as strict as either gate taken alone, which is the
+only property that makes "may narrow, never broaden" true rather than intended.
 
 ``allow_admin_from`` is **not** an authorisation source. Hermes reads it only
 in ``gateway/slash_access.py``, to decide which *already authorised* users may
@@ -52,8 +77,12 @@ somebody Hermes would deny, which is the safe direction for a plugin that has
 promised never to broaden access:
 
 - **Wildcards.** ``allow_from: ["*"]`` opens a chat bot to everyone. It does
-  not open one person's learning record to everyone, so a wildcard authorises
-  nobody here and the operator must name IDs.
+  not open one person's learning record to everyone, so a wildcard grants
+  nothing here and the operator must name IDs. It does *remove* the intake
+  gate's bound, exactly as it does in Hermes — so a wildcard beside an
+  environment allowlist still authorises the users that allowlist names, rather
+  than denying them for the operator's choice of shorthand. A wildcard as the
+  only allowlist authorises nobody.
 - **Allow-all flags.** ``GATEWAY_ALLOW_ALL_USERS`` and
   ``TELEGRAM_ALLOW_ALL_USERS`` are ignored for the same reason.
 - **Group-only grants.** ``TELEGRAM_GROUP_ALLOWED_USERS``,
@@ -76,10 +105,11 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
-#: Environment allowlists whose mere presence makes Hermes decide from the
-#: environment and stop consulting adapter configuration.
+#: Environment allowlists whose mere presence makes the runner gate decide a DM
+#: from the environment rather than from adapter configuration.
 ENV_ALLOWLISTS = (
     "TELEGRAM_ALLOWED_USERS",
     "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -90,9 +120,9 @@ ENV_ALLOWLISTS = (
 #: Of those, the ones that authorise a *direct message* sender.
 _ENV_DM_ALLOWLISTS = ("TELEGRAM_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS")
 
-#: The adapter-configured DM allowlist, consulted only when no environment
-#: allowlist exists. ``allow_admin_from`` is absent on purpose — see the module
-#: docstring.
+#: The adapter-configured DM allowlist. When present it is the intake gate's
+#: sole authority, so it is an upper bound on Mini App access.
+#: ``allow_admin_from`` is absent on purpose — see the module docstring.
 _CONFIG_DM_ALLOWLIST = "allow_from"
 
 #: Every place Hermes accepts a Telegram platform block.
@@ -144,7 +174,7 @@ def _env_value(env: Mapping[str, str], name: str) -> str:
 
 
 def any_env_allowlist_configured(env: Mapping[str, str] | None = None) -> bool:
-    """True when Hermes would decide this DM from the environment alone."""
+    """True when the runner gate bounds a DM by the environment allowlists."""
     environment = os.environ if env is None else env
     return any(_env_value(environment, name) for name in ENV_ALLOWLISTS)
 
@@ -174,6 +204,56 @@ def _telegram_platform_config(host_config: Mapping[str, Any] | None) -> dict[str
     return merged
 
 
+@dataclass(frozen=True)
+class AllowFrom:
+    """The adapter's ``allow_from`` as the intake gate reads it.
+
+    ``present`` mirrors Hermes' ``is not None`` test, which is why it is a
+    separate field from the set: ``allow_from: []`` is *present* and authorises
+    nobody, while an absent key imposes no bound at all. Collapsing the two
+    into "empty set" would turn a deliberate lockout into a fallback.
+    """
+
+    present: bool
+    #: True when the setting contains ``*``. The wildcard lets everyone past
+    #: intake, so it removes this gate's bound — but it grants nothing on its
+    #: own, because a wildcard must never open a personal learning record.
+    wildcard: bool
+    ids: frozenset[str]
+
+    @property
+    def bound(self) -> frozenset[str] | None:
+        """The users this gate permits, or ``None`` for "no bound"."""
+        if not self.present or self.wildcard:
+            return None
+        return self.ids
+
+
+def configured_allow_from(host_config: Mapping[str, Any] | None) -> AllowFrom:
+    """Read ``allow_from`` from every shape Hermes accepts."""
+    platform = _telegram_platform_config(host_config)
+    if _CONFIG_DM_ALLOWLIST not in platform:
+        return AllowFrom(present=False, wildcard=False, ids=frozenset())
+
+    raw = platform[_CONFIG_DM_ALLOWLIST]
+    items = raw.split(",") if isinstance(raw, str) else raw
+    wildcard = isinstance(items, (list, tuple, set, frozenset)) and any(
+        str(item).strip() == "*" for item in items
+    )
+    return AllowFrom(present=True, wildcard=wildcard, ids=frozenset(_identifiers(raw)))
+
+
+def env_allowed_users(env: Mapping[str, str] | None = None) -> frozenset[str] | None:
+    """The runner gate's DM allowlist, or ``None`` when it imposes no bound."""
+    environment = os.environ if env is None else env
+    if not any_env_allowlist_configured(environment):
+        return None
+    allowed: set[str] = set()
+    for name in _ENV_DM_ALLOWLISTS:
+        allowed |= _identifiers(_env_value(environment, name))
+    return frozenset(allowed)
+
+
 def profile_allowed_users(
     *,
     env: Mapping[str, str] | None = None,
@@ -181,20 +261,23 @@ def profile_allowed_users(
 ) -> frozenset[str]:
     """The profile's effective direct-message Telegram allowlist.
 
-    Mirrors Hermes' own precedence: environment allowlists win outright, and
-    the adapter's ``allow_from`` applies only when no environment allowlist is
-    configured.
+    The intersection of Hermes' two gates — adapter intake and runner
+    authorisation — so the result can never exceed either. A gate that imposes
+    no bound contributes nothing; when *neither* bounds anything, the answer is
+    nobody, because an unconfigured deployment is closed.
     """
-    environment = os.environ if env is None else env
+    bounds = [
+        bound
+        for bound in (configured_allow_from(host_config).bound, env_allowed_users(env))
+        if bound is not None
+    ]
+    if not bounds:
+        return frozenset()
 
-    if any_env_allowlist_configured(environment):
-        allowed: set[str] = set()
-        for name in _ENV_DM_ALLOWLISTS:
-            allowed |= _identifiers(_env_value(environment, name))
-        return frozenset(allowed)
-
-    platform = _telegram_platform_config(host_config)
-    return frozenset(_identifiers(platform.get(_CONFIG_DM_ALLOWLIST)))
+    allowed = bounds[0]
+    for bound in bounds[1:]:
+        allowed &= bound
+    return frozenset(allowed)
 
 
 def effective_allowed_users(
