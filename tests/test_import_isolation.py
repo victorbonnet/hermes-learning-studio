@@ -105,6 +105,7 @@ def test_the_tools_are_registered_without_optional_deps(without_optional_deps):
 
     assert sorted(tool.name for tool in ctx.tools) == [
         "learning_studio_get_context",
+        "learning_studio_import_asset",
         "learning_studio_prepare",
         "learning_studio_save_context",
     ]
@@ -125,6 +126,39 @@ def test_the_tools_run_without_optional_deps(without_optional_deps, tmp_path, mo
     result = json.loads(handler({"temporary_context": {"subject": "anything"}}))
 
     assert result["ok"] is True
+
+
+def test_import_tool_fails_safely_when_pillow_is_absent(
+    without_optional_deps, tmp_path, monkeypatch
+):
+    import json
+
+    home = tmp_path / "home"
+    source = home / "cache" / "images" / "candidate.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"not decoded before the lazy Pillow import")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    module = importlib.import_module("learning_studio")
+    from tests.fake_hermes import FakePluginContext
+
+    ctx = FakePluginContext(plugin_name="learning-studio")
+    module.register(ctx)
+    handler = next(t.handler for t in ctx.tools if t.name == "learning_studio_import_asset")
+    result = json.loads(
+        handler(
+            {
+                "source_path": str(source),
+                "title": "Candidate",
+                "alt_text": "A candidate educational image.",
+                "provenance": "operator_selected",
+            }
+        )
+    )
+
+    assert result["ok"] is False
+    assert "optional media dependency" in result["error"]
+    assert str(source) not in json.dumps(result)
+    assert not (home / "workspace" / "learning-studio" / "assets").exists()
 
 
 def test_sqlite3_is_the_only_storage_dependency():

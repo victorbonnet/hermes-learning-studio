@@ -452,6 +452,7 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
     }
     assert sorted(registered) == [
         "learning_studio_get_context",
+        "learning_studio_import_asset",
         "learning_studio_prepare",
         "learning_studio_save_context",
     ]
@@ -495,6 +496,25 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
 
         fetched = json.loads(registry.dispatch("learning_studio_get_context", {}))
         assert fetched["confirmed_context"]["goal"]["value"] == "g"
+
+        from PIL import Image
+
+        source = tmp_path / "live-profile" / "cache" / "images" / "real-host.png"
+        source.parent.mkdir(parents=True)
+        Image.new("RGB", (2, 2), "blue").save(source, format="PNG")
+        imported = json.loads(
+            registry.dispatch(
+                "learning_studio_import_asset",
+                {
+                    "source_path": str(source),
+                    "title": "Real host diagram",
+                    "alt_text": "A blue square used by the real host integration test.",
+                    "provenance": "operator_selected",
+                },
+            )
+        )
+        assert imported["ok"] is True, imported
+        assert str(source) not in json.dumps(imported)
 
         examples = fixtures()
 
@@ -558,11 +578,15 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
             str(row[0])
             for row in inspection.execute("SELECT learner_payload FROM experience_components")
         )
+        asset_count = inspection.execute("SELECT COUNT(*) FROM managed_assets").fetchone()[0]
+        asset_columns = {row[1] for row in inspection.execute("PRAGMA table_info(managed_assets)")}
 
     from learning_studio.storage import SCHEMA_VERSION
 
     assert version == SCHEMA_VERSION
     assert owners == 2, "the two principals' exercises were not stored separately"
+    assert asset_count == 1
+    assert "source_path" not in asset_columns
     assert fixtures().CANARY not in payloads, "evaluator-only data reached the learner-facing table"
 
 

@@ -678,6 +678,70 @@ _MIGRATION_007 = (
 )
 
 
+# Migration 8 adds profile-managed educational image assets. Source paths are
+# intentionally absent: provenance and generation prompts are retained for
+# audit server-side, while the local file that happened to produce the bytes is
+# neither durable identity nor metadata a client should ever receive.
+_MIGRATION_008 = (
+    """
+    CREATE TABLE managed_assets (
+        id                TEXT    PRIMARY KEY,
+        learner_id        TEXT    NOT NULL,
+        profile_id        TEXT    NOT NULL,
+        track_id          TEXT,
+        scope_key         TEXT    NOT NULL,
+        title             TEXT    NOT NULL CHECK (length(trim(title)) BETWEEN 1 AND 200),
+        alt_text          TEXT,
+        decorative        INTEGER NOT NULL CHECK (decorative IN (0, 1)),
+        provenance        TEXT    NOT NULL CHECK (provenance IN (
+            'host_image_generation', 'learner_provided', 'operator_selected'
+        )),
+        generation_prompt TEXT    CHECK (
+            generation_prompt IS NULL
+            OR length(trim(generation_prompt)) BETWEEN 1 AND 4000
+        ),
+        sha256            TEXT    NOT NULL CHECK (
+            length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        mime_type         TEXT    NOT NULL CHECK (mime_type IN (
+            'image/png', 'image/jpeg', 'image/webp'
+        )),
+        byte_size         INTEGER NOT NULL CHECK (byte_size > 0),
+        width             INTEGER NOT NULL CHECK (width > 0),
+        height            INTEGER NOT NULL CHECK (height > 0),
+        storage_name      TEXT    NOT NULL UNIQUE CHECK (
+            length(storage_name) BETWEEN 1 AND 100
+            AND instr(storage_name, '/') = 0
+            AND instr(storage_name, char(92)) = 0
+        ),
+        created_at        TEXT    NOT NULL,
+        updated_at        TEXT    NOT NULL,
+        CHECK (
+            (track_id IS NULL AND scope_key = '')
+            OR (track_id IS NOT NULL AND scope_key = track_id)
+        ),
+        CHECK (
+            (decorative = 1 AND alt_text IS NULL)
+            OR (
+                decorative = 0 AND alt_text IS NOT NULL
+                AND length(trim(alt_text)) BETWEEN 1 AND 1000
+            )
+        ),
+        UNIQUE (id, profile_id, learner_id),
+        UNIQUE (profile_id, learner_id, scope_key, sha256),
+        FOREIGN KEY (learner_id, profile_id)
+            REFERENCES learners (id, profile_id) ON DELETE CASCADE,
+        FOREIGN KEY (track_id, profile_id, learner_id)
+            REFERENCES tracks (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX idx_managed_assets_owner
+        ON managed_assets (profile_id, learner_id, scope_key, created_at)
+    """,
+)
+
+
 #: Ordered, contiguous from 1. The list order is the application order.
 MIGRATIONS: list[Migration] = [
     Migration(version=1, statements=_MIGRATION_001),
@@ -687,6 +751,7 @@ MIGRATIONS: list[Migration] = [
     Migration(version=5, statements=_MIGRATION_005),
     Migration(version=6, statements=_MIGRATION_006),
     Migration(version=7, statements=_MIGRATION_007),
+    Migration(version=8, statements=_MIGRATION_008),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

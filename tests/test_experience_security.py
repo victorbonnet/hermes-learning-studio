@@ -307,9 +307,35 @@ def test_no_source_in_the_package_executes_code():
 
 @pytest.mark.parametrize("forbidden", [*EXECUTION_MODULES, *NETWORK_MODULES, *OPTIONAL_MODULES])
 def test_the_package_imports_no_execution_network_or_optional_module(forbidden: str):
-    offenders = [path.name for path in sources() if forbidden in imported_names(path)]
+    offenders = [
+        path.name
+        for path in sources()
+        if forbidden in imported_names(path)
+        # PR 05 deliberately gives one narrow module a function-local Pillow
+        # import.  Runtime import-isolation tests prove that importing and
+        # registering the plugin never executes it.
+        and not (forbidden == "PIL" and path.name == "assets.py")
+    ]
 
     assert offenders == [], f"{forbidden} is imported by {offenders}"
+
+
+def test_pillow_is_imported_only_inside_the_asset_inspection_function():
+    tree = ast.parse((PACKAGE / "assets.py").read_text(encoding="utf-8"))
+    top_level: list[ast.stmt] = []
+    for node in tree.body:
+        imports_pillow = (
+            isinstance(node, ast.ImportFrom) and (node.module or "").split(".", 1)[0] == "PIL"
+        )
+        imports_pillow = (
+            imports_pillow
+            or isinstance(node, ast.Import)
+            and any(alias.name.split(".", 1)[0] == "PIL" for alias in node.names)
+        )
+        if imports_pillow:
+            top_level.append(node)
+
+    assert top_level == []
 
 
 def test_the_call_scan_would_catch_a_real_offender(tmp_path: Path):

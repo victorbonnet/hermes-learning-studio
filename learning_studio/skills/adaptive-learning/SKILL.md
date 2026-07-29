@@ -17,18 +17,28 @@ it too narrowly.
 
 ## Runtime status: read this first
 
-Three tools exist:
+Four tools exist:
 
 | Tool | What it does |
 | --- | --- |
 | `learning_studio_get_context` | Retrieve what is known about a learner before you plan |
 | `learning_studio_save_context` | Record what you learned; propose memory candidates |
 | `learning_studio_prepare` | Validate and store an exercise you have designed |
+| `learning_studio_import_asset` | Validate a real host image and return an opaque managed asset id |
 
 **There is still no delivery runtime** — no card renderer, no Mini App, no
 scoring engine, no scheduler. `learning_studio_prepare` *stores* a validated
 exercise; it does not run one, and calling it opens nothing on the learner's
 screen. Exercises are still delivered by you, in conversation.
+
+When a visual component genuinely improves the exercise, first use Hermes'
+existing image-generation or image-selection capability. Pass the **real local
+path it returned** to `learning_studio_import_asset`, then use the returned
+`asset_id` as the manifest's `asset_ref` together with the exact returned
+`alt_text`. Never invent an asset id, put a local path or URL in a manifest, or
+claim an image was imported after an error. The import tool does not generate
+images. If its optional media dependency is unavailable, choose a non-visual
+component and continue in chat.
 
 That does not weaken the workflow. Every phase below is executed in
 conversation by default; the runtime, when it exists, replaces the *delivery*
@@ -397,20 +407,26 @@ the objectives from step 2, in their terms.
 
 When an exercise needs a picture — a labelled cell, a circuit, a map:
 
-1. Generate it with the host agent's existing image tool (`image_generate`).
-   This skill does not ship an image generator, and you must not shell out to
-   one.
-2. Import the real output into the exercise through the Studio's managed-asset
-   import step, once that tool exists. Until then, show the image in chat.
-3. **Never invent an asset ID, filename, or path.** Use only identifiers a tool
-   actually returned to you.
-4. Never state that an image was generated or imported without a real tool
-   result to back it. If generation failed, say so and fall back to a text
-   description — a described diagram is a working exercise; a fabricated
-   reference is a broken one.
+1. Generate or select it with the host agent's existing image tooling
+   (`image_generate`). This skill does not ship an image generator, and you
+   must not shell out to one.
+2. Pass the **actual local path that tool returned** to
+   `learning_studio_import_asset`, together with a title, a provenance, and
+   alt text. Do not retype, guess, or construct the path.
+3. Use only the opaque `asset_id` from that **successful** import when you
+   reference the image in a Learning Studio manifest, as
+   `{"asset_ref": "<asset_id>", "alt_text": "..."}`. The local path never
+   belongs in a manifest.
+4. **Never invent an asset ID, filename, path, import result, or generation
+   result.** Use only identifiers and outcomes a tool actually returned to you.
+5. If generation or managed import fails, say so and either build an honest
+   text-only exercise or show the picture as an ordinary image in the
+   conversation — without referencing it as a managed asset. A described
+   diagram is a working exercise; a fabricated reference is a broken one.
 
-Every image needs alternative text that conveys what the image contributes. If
-the answer *is* the image, the alt text must not give it away.
+Every image needs alternative text that conveys what the image contributes,
+and the alt text you pass to the import must match the one you use in the
+manifest. If the answer *is* the image, the alt text must not give it away.
 
 ## Memory
 

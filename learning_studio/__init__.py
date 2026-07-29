@@ -2,8 +2,8 @@
 
 Importing this package must stay cheap and dependency-free: Hermes imports it
 and calls :func:`register` during startup for every enabled plugin. Optional
-web and media dependencies introduced by later PRs belong behind lazy imports
-inside the code paths that need them, never at module scope.
+media dependencies, and the web dependencies later PRs introduce, belong behind
+lazy imports inside the code paths that need them, never at module scope.
 """
 
 from .plugin import PLUGIN_NAME, SKILL_NAME, TOOLSET_NAME, register

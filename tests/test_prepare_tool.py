@@ -36,13 +36,14 @@ def strings_in(value) -> list[str]:
 # ── Registration ──────────────────────────────────────────────────────────
 
 
-def test_exactly_three_tools_are_registered(ctx):
+def test_exactly_four_tools_are_registered(ctx):
     from learning_studio import register
 
     register(ctx)
 
     assert sorted(tool.name for tool in ctx.tools) == [
         "learning_studio_get_context",
+        "learning_studio_import_asset",
         "learning_studio_prepare",
         "learning_studio_save_context",
     ]

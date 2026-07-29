@@ -24,12 +24,12 @@ def _call(handler, **params) -> dict:
 # ── Registration ──────────────────────────────────────────────────────────
 
 
-def test_exactly_three_tools_are_registered(ctx):
+def test_exactly_four_tools_are_registered(ctx):
     from learning_studio import register
 
     register(ctx)
 
-    assert len(ctx.tools) == 3
+    assert len(ctx.tools) == 4
 
 
 def test_the_tool_names_are_the_agreed_ones(ctx):
@@ -39,6 +39,7 @@ def test_the_tool_names_are_the_agreed_ones(ctx):
 
     assert sorted(tool.name for tool in ctx.tools) == [
         "learning_studio_get_context",
+        "learning_studio_import_asset",
         "learning_studio_prepare",
         "learning_studio_save_context",
     ]
@@ -75,6 +76,11 @@ def test_handlers_tolerate_the_kwargs_hermes_passes(ctx, hermes_home, gateway_se
     required = {"learning_studio_prepare": {"manifest": manifest()}}
 
     for tool in ctx.tools:
+        # The media tool has its own successful real-image dispatch test,
+        # including Hermes' extra keyword arguments.  Keeping it out of this
+        # no-argument loop also lets the base suite run without Pillow.
+        if tool.name == "learning_studio_import_asset":
+            continue
         args = required.get(tool.name, {})
         result = tool.handler(args, session_id="abc", task_id="def", agent=object())
         assert json.loads(result)["ok"] is True, result
@@ -177,7 +183,7 @@ FORBIDDEN_PARAM_WORDS = (
 #: reason, so that adding a genuinely executable parameter still fails: the
 #: exemption is per-field, not per-word. Nothing in this plugin compiles,
 #: imports, or runs any of it; see tests/test_experience_security.py.
-INERT_CODE_FIELDS = frozenset({"starter_code"})
+INERT_CODE_FIELDS = frozenset({"starter_code", "source_path"})
 
 
 def _property_words(name: str) -> set[str]:

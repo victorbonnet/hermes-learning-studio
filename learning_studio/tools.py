@@ -28,7 +28,13 @@ from . import service
 from .config import ConfigError
 from .identity import IdentityError, resolve_principal
 from .paths import PathResolutionError
-from .schemas import GET_TOOL_NAME, PREPARE_TOOL_NAME, SAVE_TOOL_NAME, TOOL_SCHEMAS
+from .schemas import (
+    GET_TOOL_NAME,
+    IMPORT_ASSET_TOOL_NAME,
+    PREPARE_TOOL_NAME,
+    SAVE_TOOL_NAME,
+    TOOL_SCHEMAS,
+)
 from .validation import SchemaViolation, validate
 
 logger = logging.getLogger(__name__)
@@ -143,8 +149,27 @@ def handle_prepare(params: Any = None, **_kwargs: Any) -> str:
     return _run(PREPARE_TOOL_NAME, params, call)
 
 
+def handle_import_asset(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_import_asset``."""
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        return service.import_asset(
+            principal=principal,
+            source_path=args["source_path"],
+            title=args["title"],
+            alt_text=args.get("alt_text"),
+            decorative=bool(args.get("decorative", False)),
+            provenance=args["provenance"],
+            generation_prompt=args.get("generation_prompt"),
+            track_id=args.get("track_id"),
+        )
+
+    return _run(IMPORT_ASSET_TOOL_NAME, params, call)
+
+
 HANDLERS = {
     GET_TOOL_NAME: handle_get_context,
     SAVE_TOOL_NAME: handle_save_context,
     PREPARE_TOOL_NAME: handle_prepare,
+    IMPORT_ASSET_TOOL_NAME: handle_import_asset,
 }

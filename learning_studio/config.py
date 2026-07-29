@@ -1,13 +1,13 @@
 """Behavioural configuration, read from Hermes ``config.yaml``.
 
 Everything here is behaviour, not secrets: retention windows, storage
-pragmas, and the consent gate for persisting accessibility needs. Secrets
+pragmas, compatibility policy, and managed-image safety limits. Secrets
 belong in ``.env`` and this plugin has none.
 
 The whole section is validated and **fails closed**. A malformed value is
 raised as :class:`ConfigError` rather than quietly replaced with a default,
-because every setting here governs retention, isolation, or consent — the
-three things a silent fallback must never decide on the operator's behalf.
+because every setting here governs retention, isolation, privacy, or resource
+safety — decisions a silent fallback must never make for the operator.
 An unknown key is an error too: a typo in ``persist_accessibility_needs``
 that degraded to "off" would look identical to the setting working.
 """
@@ -99,6 +99,13 @@ class LearningStudioConfig:
     #: it past what the advertised contract allows.
     max_context_value_chars: int = 2000
 
+    #: Managed images are bounded before decode and again by decoded geometry.
+    #: These are behavioural safety limits, so they belong in config.yaml.
+    max_asset_bytes: int = 10 * 1024 * 1024
+    max_asset_width: int = 8192
+    max_asset_height: int = 8192
+    max_asset_pixels: int = 40_000_000
+
     #: Context values that apply to the whole profile (``profile_config``
     #: provenance) — e.g. an explanation language the operator has set.
     profile_context: dict[str, Any] = field(default_factory=dict)
@@ -128,8 +135,8 @@ class LearningStudioConfig:
         if unknown:
             raise ConfigError(
                 f"unknown {CONFIG_SECTION} settings: {', '.join(sorted(unknown))}. "
-                "Remove them or correct the spelling — a misspelled consent or "
-                "retention setting is indistinguishable from one that is switched off."
+                "Remove them or correct the spelling — a misspelled privacy, retention, or "
+                "resource-safety setting is indistinguishable from one that is switched off."
             )
 
         values: dict[str, Any] = {}
@@ -147,6 +154,10 @@ _PARSERS: dict[str, Any] = {
     "allow_durable_accessibility_needs": _strict_bool,
     # Upper bound is the schema ceiling: config may tighten, never exceed.
     "max_context_value_chars": lambda raw, key: _bounded_int(raw, key, 80, MAX_VALUE_CHARS),
+    "max_asset_bytes": lambda raw, key: _bounded_int(raw, key, 1024, 100 * 1024 * 1024),
+    "max_asset_width": lambda raw, key: _bounded_int(raw, key, 1, 32_768),
+    "max_asset_height": lambda raw, key: _bounded_int(raw, key, 1, 32_768),
+    "max_asset_pixels": lambda raw, key: _bounded_int(raw, key, 1, 200_000_000),
     "profile_context": _context_mapping,
     "defaults": _context_mapping,
 }
