@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { check, press, type } from "./dom.mjs";
+import { check, click, press, type } from "./dom.mjs";
 import { completeCard } from "./complete.mjs";
 import {
   canaryPrefix,
@@ -23,6 +23,7 @@ import {
 
 const FIXTURES = payloads();
 const CANARY = canaryPrefix();
+const FLASHCARD_BACK = "yama";
 const TYPES = Object.keys(FIXTURES).sort();
 
 function fresh(options) {
@@ -35,6 +36,21 @@ function renderType(componentType, options) {
   const component = FIXTURES[componentType];
   const card = api.render(component, ctx);
   return { win, api, ctx, component, card };
+}
+
+/**
+ * A card that can actually be finished, reveal included.
+ *
+ * The default fake `reveal` *refuses*, so a renderer that displayed the back
+ * without asking could not hide behind a permissive stub. The sweeps below are
+ * about completability rather than about authorisation, so they get a reveal that
+ * succeeds — and every authorisation question is asked by
+ * `tests/test_mini_app_reveal.py` against the real route.
+ */
+function renderCompletable(componentType) {
+  return renderType(componentType, {
+    reveal: (attempt) => Promise.resolve({ back: FLASHCARD_BACK, attempt: attempt }),
+  });
 }
 
 function inputsOf(card, kind) {
@@ -116,9 +132,10 @@ test("no canary from any hidden field appears in any rendered card", async () =>
 
 test("a completed card submits no canary either", async () => {
   for (const componentType of TYPES) {
-    const { card, component } = renderType(componentType);
+    const { card, component } = renderCompletable(componentType);
     await settle();
     completeCard(card.element, component.payload);
+    await settle();
     const read = card.read();
 
     assert.ok(
@@ -162,11 +179,12 @@ const PRESEEDED = new Set([
 
 test("every card refuses an empty submission before it accepts a full one", async () => {
   for (const componentType of TYPES) {
-    const { card, component } = renderType(componentType);
+    const { card, component } = renderCompletable(componentType);
     await settle();
 
     const empty = card.read();
     const touched = completeCard(card.element, component.payload);
+    await settle();
     const full = card.read();
 
     const offered =
@@ -175,7 +193,8 @@ test("every card refuses an empty submission before it accepts a full one", asyn
       touched.texts +
       touched.selects +
       touched.hotspots +
-      touched.orderings;
+      touched.orderings +
+      touched.reveals;
     assert.ok(offered > 0, `${componentType} rendered nothing to answer`);
     if (PRESEEDED.has(componentType)) {
       assert.equal(empty.ok, true, `${componentType} should arrive already seeded`);
@@ -220,9 +239,10 @@ test("a submitted response stays inside the API's bounds", async () => {
   }
 
   for (const componentType of TYPES) {
-    const { card, component } = renderType(componentType);
+    const { card, component } = renderCompletable(componentType);
     await settle();
     completeCard(card.element, component.payload);
+    await settle();
     const read = card.read();
 
     assert.ok(depthOf(read.response) <= 4, `${componentType} nests too deeply`);
@@ -371,28 +391,119 @@ test("matching submits a pair per left item", () => {
   );
 });
 
-test("flashcard has no reveal button, because the back is not in the payload", async () => {
+test("flashcard ships without the back of the card anywhere in it", async () => {
   const { card, component } = renderType("flashcard");
   await settle();
 
+  // The payload has no `back` field to leak, and nothing the renderer built
+  // contains one — not the text, not an attribute, not a prefilled value.
   assert.ok(!JSON.stringify(component.payload).includes("back"));
+  assert.ok(!card.element.serialize().includes(FLASHCARD_BACK));
   assert.ok(card.element.textContent.includes(component.payload.content.front));
-  const labels = card.element.byTag("button").map((button) => button.textContent);
-  assert.deepEqual(
-    labels.filter((label) => /reveal|turn over|show answer/i.test(label)),
-    []
-  );
 });
 
-test("flashcard submits a self-rating and the recall text", () => {
+test("flashcard offers an explicit, keyboard-operable turn-over", () => {
+  const { card } = renderType("flashcard");
+  const buttons = card.element.byTag("button");
+  const turn = buttons.find((button) => button.className.includes("primary"));
+
+  assert.ok(turn, "there is no turn-over control");
+  assert.equal(turn.getAttribute("type"), "button", "it must not submit a form");
+  assert.match(turn.textContent, /Turn the card over/);
+});
+
+test("flashcard refuses to turn over with nothing written", async () => {
+  const { card, ctx } = renderType("flashcard");
+  const turn = card.element.byTag("button").find((b) => b.className.includes("primary"));
+
+  click(turn);
+  await settle();
+
+  assert.deepEqual(ctx.revealed, [], "a reveal was requested with no attempt behind it");
+  assert.match(card.element.textContent, /Write what you remember/);
+});
+
+test("flashcard cannot be submitted before it has been turned over", () => {
   const { card } = renderType("flashcard");
   const radios = inputsOf(card, "radio");
 
-  assert.equal(card.read().ok, false, "a card with no rating is not answered");
   type(card.element.byTag("textarea")[0], "yama");
   check(radios[2]);
 
+  const read = card.read();
+  assert.equal(read.ok, false);
+  assert.match(read.error, /Turn the card over/);
+});
+
+test("turning the card over asks the server and shows only what it returned", async () => {
+  const { card, ctx } = renderType("flashcard", {
+    reveal: (attempt) => Promise.resolve({ back: FLASHCARD_BACK, attempt: attempt }),
+  });
+  const turn = card.element.byTag("button").find((b) => b.className.includes("primary"));
+
+  type(card.element.byTag("textarea")[0], "yama, I think");
+  click(turn);
+  await settle();
+
+  assert.deepEqual(ctx.revealed, ["yama, I think"]);
+  assert.ok(card.element.textContent.includes(FLASHCARD_BACK));
+  assert.equal(turn.hidden, true, "the turn-over control is spent");
+});
+
+test("the recall is frozen once the card has been turned over", async () => {
+  const { card } = renderType("flashcard", {
+    reveal: (attempt) => Promise.resolve({ back: FLASHCARD_BACK, attempt: attempt }),
+  });
+  const area = card.element.byTag("textarea")[0];
+
+  type(area, "my honest attempt");
+  click(card.element.byTag("button").find((b) => b.className.includes("primary")));
+  await settle();
+
+  // The server froze it; the field says so rather than inviting an edit that
+  // would then be refused.
+  assert.equal(area.readOnly, true);
+  assert.equal(area.getAttribute("aria-readonly"), "true");
+  assert.equal(area.value, "my honest attempt");
+});
+
+test("flashcard submits the frozen recall and the self-rating", async () => {
+  const { card } = renderType("flashcard", {
+    reveal: (attempt) => Promise.resolve({ back: FLASHCARD_BACK, attempt: attempt }),
+  });
+
+  type(card.element.byTag("textarea")[0], "yama");
+  click(card.element.byTag("button").find((b) => b.className.includes("primary")));
+  await settle();
+
+  assert.equal(card.read().ok, false, "a turned card with no rating is not answered");
+  check(inputsOf(card, "radio")[2]);
+
   assert.deepEqual(plain(card.read().response), { text: "yama", self_rating: "good" });
+});
+
+test("a refused reveal says so and leaves the card answerable later", async () => {
+  const { card } = renderType("flashcard", {
+    reveal: () => Promise.reject({ message: "Turn the card over again." }),
+  });
+  const turn = card.element.byTag("button").find((b) => b.className.includes("primary"));
+
+  type(card.element.byTag("textarea")[0], "yama");
+  click(turn);
+  await settle();
+
+  assert.match(card.element.textContent, /Turn the card over again/);
+  assert.equal(turn.disabled, false, "a failed reveal must be retryable");
+  assert.equal(card.read().ok, false);
+});
+
+test("the revealed answer is announced without stealing focus", async () => {
+  const { card } = renderType("flashcard", {
+    reveal: (attempt) => Promise.resolve({ back: FLASHCARD_BACK, attempt: attempt }),
+  });
+
+  const panel = card.element.all().find((node) => node.className === "reveal");
+  assert.equal(panel.getAttribute("aria-live"), "polite");
 });
 
 test("image_observation asks the loader for its asset and submits text", async () => {
@@ -730,4 +841,348 @@ test("word bounds are enforced before a request is made", () => {
 
   type(area, "one two three four five six seven eight nine");
   assert.equal(card.read().ok, false);
+});
+
+// ── A failed image still says what the picture showed ─────────────────────
+
+test("a failed image renders its alt text as visible content", async () => {
+  const { card, component } = renderType("image_observation", { images: "broken" });
+  await settle();
+  const altText = component.payload.content.image.alt_text;
+
+  assert.equal(card.element.byTag("img").length, 0, "a broken <img> was left in the page");
+  assert.ok(
+    card.element.textContent.includes(altText),
+    "the alt text is promised and then not shown — the exact defect this replaced"
+  );
+  assert.match(card.element.textContent, /could not be loaded/);
+});
+
+test("an image that arrives but will not decode falls back the same way", async () => {
+  // The other failure mode: the fetch succeeds, the element fires `error`.
+  const { card, component } = renderType("image_observation");
+  await settle();
+  const image = card.element.byTag("img")[0];
+
+  image.dispatchEvent({ type: "error" });
+
+  assert.equal(card.element.byTag("img").length, 0);
+  assert.ok(card.element.textContent.includes(component.payload.content.image.alt_text));
+});
+
+test("the alt fallback carries no server error text and no asset identifier", async () => {
+  const { card, component } = renderType("image_observation", { images: "broken" });
+  await settle();
+  const shown = card.element.serialize();
+
+  assert.ok(!shown.includes("no image"), "a raw failure reason reached the page");
+  assert.ok(!shown.includes(component.payload.content.image.asset_ref));
+});
+
+test("a long description stays separate from the alt text", async () => {
+  const { api, ctx } = fresh({ images: "broken" });
+  const card = api.render(
+    {
+      component_id: "x",
+      type: "image_observation",
+      payload: {
+        prompt: "Describe it.",
+        content: {
+          image: {
+            asset_ref: "asset-1",
+            alt_text: "A short alternative.",
+            long_description: "A much longer account of the same picture.",
+          },
+        },
+      },
+    },
+    ctx
+  );
+  await settle();
+
+  assert.ok(card.element.textContent.includes("A short alternative."));
+  assert.ok(card.element.textContent.includes("A much longer account of the same picture."));
+  // The long form is behind a disclosure; the short form is not.
+  assert.equal(card.element.byTag("details").length, 1);
+  assert.equal(card.element.byTag("details")[0].textContent.includes("A short alternative."), false);
+});
+
+test("an image with no long description still shows its alt text", async () => {
+  const { card } = renderType("hotspot", { images: "broken" });
+  await settle();
+
+  assert.equal(card.element.byTag("details").length, 0);
+  assert.ok(card.element.textContent.includes("A cross-section of the human heart, unlabelled."));
+});
+
+// ── The hotspot's structure ───────────────────────────────────────────────
+
+function hotspotSurface(card) {
+  return card.element.byTag("button").find((node) => node.className.includes("hotspot"));
+}
+
+test("no interactive element is nested inside the hotspot control", async () => {
+  const { api, ctx } = fresh();
+  const card = api.render(
+    {
+      component_id: "x",
+      type: "hotspot",
+      payload: {
+        prompt: "Point at it.",
+        content: {
+          image: {
+            asset_ref: "asset-1",
+            alt_text: "A diagram.",
+            long_description: "A much longer account.",
+          },
+        },
+      },
+    },
+    ctx
+  );
+  await settle();
+  const surface = hotspotSurface(card);
+
+  for (const tag of ["button", "a", "input", "select", "textarea", "details", "summary"]) {
+    assert.deepEqual(
+      surface
+        .all()
+        .filter((node) => node !== surface && node.tagName === tag)
+        .map((node) => node.tagName),
+      [],
+      `a <${tag}> is nested inside the hotspot button`
+    );
+  }
+});
+
+test("captions and long descriptions live outside the hotspot control", async () => {
+  const { api, ctx } = fresh();
+  const card = api.render(
+    {
+      component_id: "x",
+      type: "hotspot",
+      payload: {
+        prompt: "Point at it.",
+        content: {
+          image: { asset_ref: "a", alt_text: "A diagram.", long_description: "The long form." },
+        },
+      },
+    },
+    ctx
+  );
+  await settle();
+
+  assert.ok(!hotspotSurface(card).textContent.includes("The long form."));
+  assert.ok(card.element.textContent.includes("The long form."));
+});
+
+test("the hotspot control has an accessible name and describes its own value", async () => {
+  const { card } = renderType("hotspot");
+  await settle();
+  const surface = hotspotSurface(card);
+
+  assert.ok(surface.getAttribute("aria-label"));
+  assert.ok(surface.getAttribute("aria-describedby"));
+});
+
+test("hotspot coordinates are measured against the image, not the whole card", async () => {
+  const { card } = renderType("hotspot");
+  await settle();
+  const surface = hotspotSurface(card);
+  const image = card.element.byTag("img")[0];
+
+  // A 200×100 picture somewhere down the page, with prose above it.
+  image.getBoundingClientRect = () => ({ left: 40, top: 300, width: 200, height: 100 });
+
+  surface.dispatchEvent({ type: "click", clientX: 140, clientY: 350 });
+
+  assert.deepEqual(plain(card.read().response.points[0]), { x: 0.5, y: 0.5 });
+});
+
+test("a longer description does not move the coordinate", async () => {
+  // The regression: measuring the button meant measuring the prose too, so the
+  // same tap landed somewhere else once an author wrote more.
+  const results = [];
+  for (const longDescription of ["Short.", "A very much longer description ".repeat(20)]) {
+    const { api, ctx } = fresh();
+    const card = api.render(
+      {
+        component_id: "x",
+        type: "hotspot",
+        payload: {
+          prompt: "Point.",
+          content: {
+            image: { asset_ref: "a", alt_text: "A diagram.", long_description: longDescription },
+          },
+        },
+      },
+      ctx
+    );
+    await settle();
+    const image = card.element.byTag("img")[0];
+    image.getBoundingClientRect = () => ({ left: 0, top: 0, width: 400, height: 200 });
+    hotspotSurface(card).dispatchEvent({ type: "click", clientX: 100, clientY: 50 });
+    results.push(plain(card.read().response.points[0]));
+  }
+
+  assert.deepEqual(results[0], results[1]);
+  assert.deepEqual(results[0], { x: 0.25, y: 0.25 });
+});
+
+test("hotspot coordinates are clamped into the unit square", async () => {
+  const { card } = renderType("hotspot");
+  await settle();
+  const image = card.element.byTag("img")[0];
+  image.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 100 });
+
+  hotspotSurface(card).dispatchEvent({ type: "click", clientX: -50, clientY: 400 });
+
+  assert.deepEqual(plain(card.read().response.points[0]), { x: 0, y: 1 });
+});
+
+test("a resized image surface maps the same tap to the same fraction", async () => {
+  for (const width of [100, 1000]) {
+    const { card } = renderType("hotspot");
+    await settle();
+    const image = card.element.byTag("img")[0];
+    image.getBoundingClientRect = () => ({ left: 0, top: 0, width: width, height: width });
+    hotspotSurface(card).dispatchEvent({
+      type: "click",
+      clientX: width * 0.75,
+      clientY: width * 0.25,
+    });
+
+    assert.deepEqual(plain(card.read().response.points[0]), { x: 0.75, y: 0.25 });
+  }
+});
+
+test("pointer and keyboard produce the same coordinate shape", async () => {
+  const pointer = renderType("hotspot");
+  await settle();
+  const image = pointer.card.element.byTag("img")[0];
+  image.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 100 });
+  hotspotSurface(pointer.card).dispatchEvent({ type: "click", clientX: 55, clientY: 50 });
+
+  const keyboard = renderType("hotspot");
+  await settle();
+  press(hotspotSurface(keyboard.card), "ArrowRight");
+
+  const byPointer = plain(pointer.card.read().response);
+  const byKeyboard = plain(keyboard.card.read().response);
+  assert.deepEqual(Object.keys(byPointer), Object.keys(byKeyboard));
+  assert.deepEqual(byPointer, byKeyboard);
+});
+
+test("the keyboard instructions name the step sizes they actually use", async () => {
+  const { card } = renderType("hotspot");
+  await settle();
+
+  assert.match(card.element.textContent, /5%/);
+  assert.match(card.element.textContent, /1%/);
+});
+
+test("a hotspot whose image failed is still operable by keyboard", async () => {
+  const { card } = renderType("hotspot", { images: "broken" });
+  await settle();
+  const surface = hotspotSurface(card);
+
+  assert.ok(surface, "the control disappeared when the image did");
+  assert.equal(surface.hidden, false);
+  press(surface, "ArrowRight");
+
+  assert.equal(card.read().ok, true);
+});
+
+test("labeling pins are positioned against the picture alone", async () => {
+  const { card } = renderType("labeling");
+  await settle();
+  const surface = card.element.all().find((node) => node.className === "hotspot");
+
+  assert.ok(!surface.textContent.includes("Full description"));
+  assert.equal(surface.byTag("details").length, 0);
+});
+
+// ── Content language ──────────────────────────────────────────────────────
+
+test("exercise content is marked with the content language", () => {
+  const { card } = renderType("true_false", { locale: "en", contentLocale: "fr" });
+
+  assert.equal(card.element.getAttribute("lang"), "fr");
+});
+
+test("interface strings inside the card stay in the interface language", () => {
+  const { card } = renderType("multi_select", { locale: "en", contentLocale: "fr" });
+  const hintNode = card.element.all().find((node) => node.className === "hint");
+
+  assert.equal(hintNode.getAttribute("lang"), "en");
+});
+
+test("no language is declared when the exercise is in the reader's own language", () => {
+  const { card } = renderType("true_false", { locale: "en", contentLocale: "en" });
+
+  assert.equal(card.element.getAttribute("lang"), null);
+  assert.deepEqual(
+    card.element.all().filter((node) => node.getAttribute("lang")),
+    []
+  );
+});
+
+test("a malformed content locale is left off rather than written to the DOM", () => {
+  for (const bogus of ["", "english", "e", "fr_FR!", "../fr", 42, null]) {
+    const { card } = renderType("true_false", { locale: "en", contentLocale: bogus });
+
+    assert.equal(card.element.getAttribute("lang"), null, `accepted ${bogus}`);
+  }
+});
+
+test("a translation card tags its source text with the source language", () => {
+  const { card, component } = renderType("translation", { locale: "en", contentLocale: "en" });
+  const statement = card.element.all().find((node) => node.className === "statement");
+
+  assert.equal(statement.getAttribute("lang"), component.payload.content.source_locale);
+});
+
+test("option labels carry the content language", () => {
+  const { card } = renderType("multiple_choice", { locale: "en", contentLocale: "pt-BR" });
+  const spans = card.element
+    .byTag("span")
+    .filter((node) => node.parentNode && node.parentNode.tagName === "label");
+
+  assert.ok(spans.length > 0);
+  for (const span of spans) {
+    assert.equal(span.getAttribute("lang"), "pt-BR");
+  }
+});
+
+test("the hotspot describes itself with the alt text only once there is one", async () => {
+  // A dangling `aria-describedby` is a reference to nothing. Naming the fallback
+  // up front meant every successfully loaded hotspot pointed at an id that did
+  // not exist.
+  const loaded = renderType("hotspot");
+  await settle();
+  const loadedSurface = hotspotSurface(loaded.card);
+  const named = loadedSurface.getAttribute("aria-describedby").split(" ");
+  const ids = new Set(
+    loaded.card.element
+      .all()
+      .map((node) => node.getAttribute("id"))
+      .filter(Boolean)
+  );
+  for (const id of named) {
+    assert.ok(ids.has(id), `aria-describedby names ${id}, which is not in the card`);
+  }
+
+  const broken = renderType("hotspot", { images: "broken" });
+  await settle();
+  const brokenIds = new Set(
+    broken.card.element
+      .all()
+      .map((node) => node.getAttribute("id"))
+      .filter(Boolean)
+  );
+  const brokenNamed = hotspotSurface(broken.card).getAttribute("aria-describedby").split(" ");
+  assert.equal(brokenNamed.length, 2, "the alt text was not added to the description");
+  for (const id of brokenNamed) {
+    assert.ok(brokenIds.has(id));
+  }
 });

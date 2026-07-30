@@ -39,19 +39,51 @@ Constraints this project holds itself to:
 - **Profile-safe paths.** Hermes supports multiple profiles via `HERMES_HOME`;
   hardcoding `~/.hermes` would read or corrupt another profile's data. Use the
   host's `get_hermes_home()`.
-- **Least surface.** The plugin registers only what it needs. Today that is one
-  read-only skill: no tools, no hooks, no filesystem access, no network
-  requests, and no data collected, stored, or transmitted.
-- **No runtime dependencies.** `dependencies` is empty, so installing the
-  plugin adds no third-party code to a user's Hermes environment and brings no
-  transitive supply-chain surface with it.
+- **Authorisation lives in the query.** Every learner-owned read carries
+  `profile_id` and `learner_id` in its `WHERE` clause, so a handler that forgot
+  a check still could not reach another learner's data — there is no query that
+  can. Not-found and not-yours return the same message.
+- **No mandatory runtime dependencies.** `dependencies` is empty, so installing
+  the plugin adds no third-party code to a user's Hermes environment. Pillow and
+  FastAPI are optional extras, and `register(ctx)` reaches neither.
 
-## Scope of this foundation
+## What this plugin actually does
 
-This is an early development foundation, not the feature-complete public
-release. It ships one bundled skill and no executable tools. It has no storage
-and does not persist progress, no Mini App or web surface, and makes no network
-requests — so its attack surface is the skill text itself.
+Stated plainly, because a security policy that understates the surface is worse
+than none:
+
+- **Four tools**, which read and write learner context, validate and store
+  exercises, and import managed images.
+- **Profile-scoped SQLite storage** under the Hermes home. Learner identifiers
+  are stored as salted HMAC digests rather than in the clear — a lookup key, not
+  an authorisation check, and not a claim that identity is unrecoverable by
+  somebody holding the file.
+- **Managed image assets** on the filesystem, validated on import and re-hashed
+  against the recorded digest on every delivery. Publication uses
+  descriptor-relative operations so validation cannot be raced by a directory
+  swap, and fails closed on platforms without them.
+- **An optional Telegram Mini App**, behind the `web` extra: a FastAPI service
+  and a static frontend. Nothing starts it — this release launches no server and
+  opens no tunnel — but if an operator runs it, the surface is:
+  - every `/api/` route requires verified Telegram `initData` *and* membership of
+    the profile's allowlist, and all but the bootstrap require a session token
+    minted for that same Telegram account;
+  - the five static frontend files are public, because a webview cannot attach a
+    header to the navigation that loads a page. They are byte-identical for every
+    caller and contain no learner data;
+  - one route, `POST /api/session/reveal`, discloses one field of one component
+    type (a flashcard's back) after an attempt has been committed and frozen.
+    Nothing else from the evaluator-only half is reachable through the API.
+- **No outbound network requests.** The plugin calls no external service. The one
+  external resource the frontend loads is Telegram's own Web App SDK, from
+  `telegram.org`, named explicitly in the document's Content-Security-Policy.
+
+## Reporting scope
+
+Findings in any of the above are in scope. Particularly welcome: a path by which
+an answer key, rubric, hint, or another learner's data becomes reachable; a way
+past the allowlist or the session scope; or content from a manifest that becomes
+executable in the Mini App.
 
 Skill content reaches the model, so treat it as untrusted input to the agent:
 Hermes logs a warning when skill content resembles a prompt-injection attempt

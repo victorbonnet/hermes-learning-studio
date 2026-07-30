@@ -19,10 +19,19 @@
  * 3. **The card cannot show what the server did not send.** A renderer reads
  *    `component.payload`, which is the stored learner projection: it has no
  *    `answer` and no `evaluation` key to leak, so "do not reveal the answer
- *    before submission" is not a discipline here, it is an absence. `flashcard`
- *    is the visible consequence -- there is no "turn over" button, because the
- *    back of the card is not in the payload and this app has no way to ask for
- *    it.
+ *    before submission" is not a discipline here, it is an absence.
+ *
+ *    `flashcard` is where that absence is visible. Its "turn over" button does
+ *    not uncover text the page was already holding -- there is none. It asks the
+ *    server, through `ctx.reveal`, which grants the back of the card only after
+ *    an attempt has been committed and then freezes that attempt. The renderer
+ *    cannot reach the network itself and cannot obtain the answer any other way.
+ *
+ *    The same absence explains the shuffling that is *not* here: an ordering
+ *    card's list arrives already rearranged, because the server rearranges it
+ *    while building the projection. A frontend that received the correct order
+ *    and was trusted to scramble it would be one bug away from displaying the
+ *    answer, and the bug would be invisible.
  *
  * A renderer returns `{ element, read, focus }`. `read()` answers
  * `{ ok: true, response }` or `{ ok: false, error }` with an already-localized
@@ -92,6 +101,63 @@
     return prefix + "-" + uniqueCounter;
   }
 
+  //: A BCP-47-ish language tag, matching what the manifest validator accepts.
+  //: An unrecognised value is left off rather than written to the DOM: a bogus
+  //: `lang` is worse than none, because a screen reader will act on it.
+  var LOCALE = /^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?$/;
+
+  /**
+   * The language to mark exercise content with, or `null`.
+   *
+   * `null` when the exercise is written in the reader's own interface language,
+   * because in that case every `lang` attribute would be noise, and when the tag
+   * is missing or malformed.
+   */
+  function contentLang(ctx) {
+    var locale = ctx.contentLocale;
+    if (typeof locale !== "string" || !LOCALE.test(locale) || locale === ctx.uiLocale) {
+      return null;
+    }
+    return locale;
+  }
+
+  /**
+   * An element holding *exercise content*, tagged with the content language.
+   *
+   * The distinction this exists to keep: a French verb drill is in French
+   * whoever is studying it, and a screen reader has to be told so or it will
+   * pronounce the French with English rules. The interface around it belongs to
+   * the reader and stays in their language.
+   */
+  function content(ctx, tag, options) {
+    var node = el(tag, options);
+    var locale = contentLang(ctx);
+    if (locale) {
+      node.setAttribute("lang", locale);
+    }
+    return node;
+  }
+
+  /**
+   * An element holding *interface chrome*, tagged with the UI language.
+   *
+   * Only needed when the card as a whole is marked with a different language:
+   * these elements sit inside a container carrying `lang="fr"` and would
+   * otherwise inherit it, which would be wrong in the other direction.
+   */
+  function chrome(ctx, tag, options) {
+    var node = el(tag, options);
+    if (contentLang(ctx)) {
+      node.setAttribute("lang", ctx.uiLocale || "en");
+    }
+    return node;
+  }
+
+  /** The most common piece of chrome: a localized hint or notice. */
+  function hint(ctx, key, values, className) {
+    return chrome(ctx, "p", { className: className || "hint", text: ctx.t(key, values) });
+  }
+
   function words(text) {
     var trimmed = String(text || "").trim();
     if (!trimmed) {
@@ -100,8 +166,9 @@
     return trimmed.split(/\s+/).length;
   }
 
-  function list(values, className) {
-    return el("ul", {
+  /** A bulleted list of authored content, in the exercise's own language. */
+  function list(ctx, values, className) {
+    return content(ctx, "ul", {
       className: className || "list",
       children: (values || []).map(function (value) {
         return el("li", { text: value });
@@ -171,14 +238,19 @@
 
       return el("label", {
         className: "choice",
-        children: [input, option.node || el("span", { text: option.label })],
+        children: [
+          input,
+          option.node || content(ctx, "span", { text: option.label }),
+        ],
       });
     });
 
     var fieldset = el("fieldset", {
       className: config.grid ? "choice-grid" : "choices",
       children: [
-        el("legend", {
+        // The legend is a hint the interface wrote, unless the caller says it is
+        // the component's own prompt repeated for the group.
+        (config.legendIsContent ? content : chrome)(ctx, "legend", {
           className: config.hideLegend ? "visually-hidden" : "hint",
           text: config.legend,
         }),
@@ -203,15 +275,15 @@
   function chooser(ctx, label, options) {
     var id = uniqueId("select");
     var select = el("select", { attrs: { id: id } });
-    select.appendChild(el("option", { props: { value: "" }, text: ctx.t("card.unchosen") }));
+    select.appendChild(chrome(ctx, "option", { props: { value: "" }, text: ctx.t("card.unchosen") }));
     options.forEach(function (option) {
-      select.appendChild(el("option", { props: { value: option.value }, text: option.label }));
+      select.appendChild(content(ctx, "option", { props: { value: option.value }, text: option.label }));
     });
     return {
       node: el("div", {
         className: "field",
         children: [
-          el("label", { className: "field-label", attrs: { for: id }, text: label }),
+          chrome(ctx, "label", { className: "field-label", attrs: { for: id }, text: label }),
           select,
         ],
       }),
@@ -253,7 +325,11 @@
     }
 
     var children = [
-      el("label", { className: "field-label", attrs: { for: id }, text: config.label }),
+      (config.labelIsContent ? content : chrome)(ctx, "label", {
+        className: "field-label",
+        attrs: { for: id },
+        text: config.label,
+      }),
       input,
     ];
 
@@ -269,10 +345,10 @@
       });
       children.push(counter);
       if (config.minWords) {
-        children.push(el("p", { className: "hint", text: ctx.t("card.min_words", { count: config.minWords }) }));
+        children.push(hint(ctx, "card.min_words", { count: config.minWords }));
       }
       if (config.maxWords) {
-        children.push(el("p", { className: "hint", text: ctx.t("card.max_words", { count: config.maxWords }) }));
+        children.push(hint(ctx, "card.max_words", { count: config.maxWords }));
       }
     }
 
@@ -285,6 +361,22 @@
         input.focus();
       },
       /** `null` when acceptable, otherwise a localized complaint. */
+      /**
+       * Pin the field to a value and stop it being edited.
+       *
+       * Used when a flashcard is turned over. The server has already frozen the
+       * attempt at that moment and will refuse a submission that disagrees with
+       * it, so leaving the box editable would only invite a learner to write
+       * something that then gets rejected.
+       */
+      freeze: function (value) {
+        if (value !== undefined && value !== null) {
+          input.value = String(value);
+        }
+        input.readOnly = true;
+        input.setAttribute("readonly", "readonly");
+        input.setAttribute("aria-readonly", "true");
+      },
       complaint: function (options) {
         var text = String(input.value || "").trim();
         var required = !options || options.required !== false;
@@ -319,41 +411,82 @@
    */
   function figure(ctx, asset, settings) {
     var config = settings || {};
-    var image = el("img", {
-      attrs: { alt: asset.alt_text || "", decoding: "async" },
-    });
-    var status = el("p", { className: "image-status", text: ctx.t("card.image_loading") });
-    var holder = el("div", { children: [status] });
+    var altText = String(asset.alt_text || "");
+    var fallbackId = uniqueId("image-alt");
 
-    ctx.loadImage(asset.asset_ref).then(
-      function (url) {
-        image.setAttribute("src", url);
-        holder.replaceChildren(image);
-      },
-      function () {
-        status.textContent = ctx.t("card.image_failed");
+    var image = el("img", { attrs: { alt: altText, decoding: "async" } });
+    var holder = el("div", { children: [hint(ctx, "card.image_loading", null, "image-status")] });
+
+    /**
+     * Show the text alternative, visibly, in place of the picture.
+     *
+     * This is the whole point of `alt_text` being mandatory in the registry, and
+     * the first version of this code threw it away: it said "its description is
+     * below" and then put nothing below unless the author had *also* written a
+     * long description. A learner met an empty frame and a promise.
+     *
+     * The alt text is rendered as ordinary text rather than left on a broken
+     * `<img>`, because a broken image's `alt` is displayed inconsistently, is
+     * unstyleable, and disappears entirely in some clients. It keeps the content
+     * language: it is the exercise's own prose.
+     */
+    function showAlternative() {
+      holder.replaceChildren(
+        hint(ctx, "card.image_failed", null, "image-status"),
+        content(ctx, "p", {
+          className: "image-alt",
+          text: altText,
+          attrs: { id: fallbackId },
+        })
+      );
+      if (config.onFallback) {
+        // A control that depends on the picture wants to describe itself with
+        // the text alternative instead — but only now that there is one. Naming
+        // the id up front would leave a dangling `aria-describedby`, which is a
+        // reference to nothing rather than a reference to the description.
+        config.onFallback(fallbackId);
       }
-    );
+    }
+
+    // Two ways an image fails, and only one of them is a failed request. A
+    // response that arrives and then will not decode — truncated bytes, a
+    // mislabelled file — fires `error` on the element instead, and the first
+    // version handled neither that nor the styling consequences.
+    image.addEventListener("error", showAlternative);
+
+    ctx.loadImage(asset.asset_ref).then(function (url) {
+      image.setAttribute("src", url);
+      holder.replaceChildren(image);
+    }, showAlternative);
 
     var extras = [];
+    if (config.caption) {
+      // A caption is authored content, not chrome.
+      extras.push(content(ctx, "figcaption", { text: config.caption }));
+    }
     if (asset.long_description) {
+      // Kept separate from the alt text on purpose: one is the concise
+      // alternative every reader may need, the other is the long form somebody
+      // chooses to open. Collapsing them would mean a reader who wanted the short
+      // version got an essay, and a reader who wanted the detail got nothing.
       extras.push(
         el("details", {
           children: [
-            el("summary", { text: ctx.t("card.long_description") }),
-            el("p", { className: "note", text: asset.long_description }),
+            chrome(ctx, "summary", { text: ctx.t("card.long_description") }),
+            content(ctx, "p", { className: "note", text: asset.long_description }),
           ],
         })
       );
     }
-    if (config.caption) {
-      extras.push(el("figcaption", { text: config.caption }));
-    }
 
     return {
       node: el("figure", { className: "figure", children: [holder].concat(extras) }),
-      surface: holder,
+      /** The element the picture occupies — never the prose around it. */
+      holder: holder,
       image: image,
+      /** For `aria-describedby` on a control that depends on the image. */
+      fallbackId: fallbackId,
+      extras: extras,
     };
   }
 
@@ -409,7 +542,7 @@
                 text: String(index + 1),
                 attrs: { "aria-label": ctx.t("card.position", { position: index + 1 }) },
               }),
-              el("span", { className: "text", text: item.label }),
+              content(ctx, "span", { className: "text", text: item.label }),
               el("span", { className: "move-buttons", children: [up, down] }),
             ],
           })
@@ -433,7 +566,7 @@
 
     return {
       node: el("div", {
-        children: [el("p", { className: "hint", text: ctx.t(hintKey) }), container],
+        children: [hint(ctx, hintKey), container],
       }),
       order: function () {
         return order.map(function (item) {
@@ -464,6 +597,7 @@
       var group = choiceGroup(ctx, parts.options, {
         legend: parts.legend || component.prompt,
         hideLegend: true,
+        legendIsContent: true,
         grid: parts.grid,
       });
       return {
@@ -523,15 +657,15 @@
       var prompts = component.content[field] || [];
       var minimum = component.content.min_words;
       var fields = prompts.map(function (prompt) {
-        return answerField(ctx, { label: prompt, multiline: true, rows: 4 });
+        return answerField(ctx, { label: prompt, multiline: true, rows: 4, labelIsContent: true });
       });
 
       var before = [];
       if (headingKey && prompts.length > 1) {
-        before.push(el("p", { className: "hint", text: ctx.t(headingKey) }));
+        before.push(hint(ctx, headingKey));
       }
       if (minimum) {
-        before.push(el("p", { className: "hint", text: ctx.t("card.min_words", { count: minimum }) }));
+        before.push(hint(ctx, "card.min_words", { count: minimum }));
       }
 
       return {
@@ -604,7 +738,7 @@
       { legend: ctx.t("card.statement"), hideLegend: false }
     );
     return {
-      body: [el("p", { className: "statement", text: component.content.statement }), group.node],
+      body: [content(ctx, "p", { className: "statement", text: component.content.statement }), group.node],
       focus: group.focus,
       read: function () {
         var chosen = group.selection();
@@ -635,7 +769,7 @@
             item: item,
             node: el("div", {
               className: "pair",
-              children: [el("span", { className: "text", text: item.text }), group.node],
+              children: [content(ctx, "span", { className: "text", text: item.text }), group.node],
             }),
             values: group.selection,
           };
@@ -653,7 +787,7 @@
 
       return {
         body: [
-          el("p", { className: "hint", text: ctx.t("card.categorization_hint") }),
+          hint(ctx, "card.categorization_hint"),
           el("div", {
             className: "pairs",
             children: controls.map(function (control) {
@@ -693,7 +827,7 @@
           node: el("span", { children: [picture.node] }),
         };
       }),
-      { legend: component.prompt, hideLegend: true, grid: true }
+      { legend: component.prompt, hideLegend: true, legendIsContent: true, grid: true }
     );
     return {
       body: [group.node],
@@ -708,9 +842,9 @@
     };
   };
 
-  RENDERERS.scenario_choice = singleChoiceRenderer(function (component) {
+  RENDERERS.scenario_choice = singleChoiceRenderer(function (component, ctx) {
     return {
-      before: [el("p", { className: "situation", text: component.content.situation })],
+      before: [content(ctx, "p", { className: "situation", text: component.content.situation })],
       options: component.content.options.map(function (option) {
         return { value: option.id, label: option.text };
       }),
@@ -730,7 +864,7 @@
     });
     return {
       body: [
-        el("p", { className: "situation", text: component.content.situation }),
+        content(ctx, "p", { className: "situation", text: component.content.situation }),
         el("div", {
           className: "pairs",
           children: steps.map(function (entry) {
@@ -755,10 +889,10 @@
   RENDERERS.case_study = function (component, ctx) {
     var render = promptListRenderer("questions", "card.questions");
     var built = render(component, ctx);
-    var before = [el("p", { className: "passage", text: component.content.background })];
+    var before = [content(ctx, "p", { className: "passage", text: component.content.background })];
     if (component.content.materials) {
-      before.push(el("p", { className: "hint", text: ctx.t("card.materials") }));
-      before.push(list(component.content.materials));
+      before.push(hint(ctx, "card.materials"));
+      before.push(list(ctx, component.content.materials));
     }
     built.body = before.concat(built.body);
     return built;
@@ -782,7 +916,7 @@
     var pieces = String(component.content.text).split(
       new RegExp(PLACEHOLDER.source, "g")
     );
-    var paragraph = el("p", { className: "passage" });
+    var paragraph = content(ctx, "p", { className: "passage" });
     var fields = [];
 
     pieces.forEach(function (piece, index) {
@@ -832,8 +966,8 @@
   RENDERERS.short_answer = longTextRenderer({ multiline: false });
   RENDERERS.typed_recall = longTextRenderer({
     multiline: false,
-    before: function (component) {
-      return [el("p", { className: "statement", text: component.content.cue })];
+    before: function (component, ctx) {
+      return [content(ctx, "p", { className: "statement", text: component.content.cue })];
     },
   });
   RENDERERS.free_response = longTextRenderer({ rows: 8 });
@@ -843,17 +977,20 @@
       if (!component.content.requirements) {
         return [];
       }
-      return [el("p", { className: "hint", text: ctx.t("card.requirements") }), list(component.content.requirements)];
+      return [hint(ctx, "card.requirements"), list(ctx, component.content.requirements)];
     },
   });
 
   RENDERERS.translation = longTextRenderer({
     rows: 4,
-    before: function (component) {
+    before: function (component, _ctx) {
       return [
         el("p", {
           className: "statement",
           text: component.content.source_text,
+          // Tagged with the *source* locale rather than the exercise's content
+          // locale: a translation card is the one place where those genuinely
+          // differ, and the source text is the more specific claim.
           attrs: { lang: component.content.source_locale },
         }),
       ];
@@ -871,7 +1008,7 @@
       return component.content.text;
     },
     before: function (component, ctx) {
-      return [el("p", { className: "hint", text: ctx.t("card.error_correction_hint") })];
+      return [hint(ctx, "card.error_correction_hint")];
     },
   });
 
@@ -883,10 +1020,10 @@
       rows: 10,
       value: component.content.starter_code || "",
     });
-    var before = [el("p", { className: "notice", text: ctx.t("card.code_notice") })];
+    var before = [hint(ctx, "card.code_notice", null, "notice")];
     if (component.content.requirements) {
-      before.push(el("p", { className: "hint", text: ctx.t("card.requirements") }));
-      before.push(list(component.content.requirements));
+      before.push(hint(ctx, "card.requirements"));
+      before.push(list(ctx, component.content.requirements));
     }
     return {
       body: before.concat([field.node]),
@@ -921,13 +1058,22 @@
     "card.order_hint"
   );
 
-  RENDERERS.timeline = orderingRenderer(
-    "events",
-    function (event) {
-      return event.date_label ? event.date_label + " — " + event.text : event.text;
-    },
-    "card.timeline_hint"
-  );
+  RENDERERS.timeline = function (component, ctx) {
+    // A date label is an ordering clue, so `show_dates: false` means it must not
+    // be shown. The projection already withholds it in that case — this is the
+    // second half of the same rule, so that a payload which somehow arrived
+    // carrying one still would not display it.
+    var showDates = component.content.show_dates === true;
+    return orderingRenderer(
+      "events",
+      function (event) {
+        return showDates && event.date_label
+          ? event.date_label + " — " + event.text
+          : event.text;
+      },
+      "card.timeline_hint"
+    )(component, ctx);
+  };
 
   RENDERERS.process_flow = function (component, ctx) {
     var built = orderingRenderer(
@@ -939,7 +1085,7 @@
     )(component, ctx);
     if (component.content.start_stage_label) {
       built.body = [
-        el("p", { className: "hint", text: component.content.start_stage_label }),
+        content(ctx, "p", { className: "hint", text: component.content.start_stage_label }),
       ].concat(built.body);
     }
     return built;
@@ -981,10 +1127,19 @@
   var RATINGS = ["again", "hard", "good", "easy"];
 
   RENDERERS.flashcard = function (component, ctx) {
-    // No reveal button: the back of the card lives in the evaluator-only half
-    // of the component and never reaches this app. What a learner can do here
-    // is write down what they remember and say how it went.
-    var recall = answerField(ctx, { label: ctx.t("card.recall_label"), multiline: true, rows: 3 });
+    // The back of the card is not in the payload and never will be: it lives in
+    // the evaluator-only half. Turning the card over is therefore a *request*,
+    // and one the server only grants after an attempt has been committed --
+    // which is also the pedagogy. `ctx.reveal` is the application's authenticated
+    // call; this renderer cannot reach the network itself.
+    var revealed = false;
+    var pending = false;
+
+    var recall = answerField(ctx, {
+      label: ctx.t("card.recall_label"),
+      multiline: true,
+      rows: 3,
+    });
     var rating = choiceGroup(
       ctx,
       RATINGS.map(function (value) {
@@ -993,19 +1148,85 @@
       { legend: ctx.t("card.self_rate"), grid: true }
     );
 
-    var front = [el("p", { className: "statement", text: component.content.front })];
+    var backPanel = el("div", {
+      className: "reveal",
+      attrs: { "aria-live": "polite", id: uniqueId("reveal") },
+    });
+    var ratingPanel = el("div", { children: [rating.node] });
+    ratingPanel.hidden = true;
+
+    var problem = chrome(ctx, "p", { className: "error" });
+    problem.hidden = true;
+
+    var turn = chrome(ctx, "button", {
+      className: "primary",
+      text: ctx.t("card.turn_over"),
+      attrs: { type: "button" },
+    });
+
+    function complain(message) {
+      problem.textContent = message;
+      problem.hidden = false;
+    }
+
+    turn.addEventListener("click", function () {
+      if (revealed || pending) {
+        return;
+      }
+      var attempt = recall.value().trim();
+      if (!attempt) {
+        // Enforced here for the message and on the server for the rule: a reveal
+        // with no attempt behind it is reading, not recall.
+        complain(ctx.t("invalid.attempt_required"));
+        recall.focus();
+        return;
+      }
+      problem.hidden = true;
+      pending = true;
+      turn.disabled = true;
+
+      ctx.reveal(attempt).then(
+        function (result) {
+          pending = false;
+          revealed = true;
+          turn.hidden = true;
+          // Frozen, because the server froze it. Leaving the field editable
+          // would invite a learner to "improve" a recall the submission is then
+          // refused for.
+          recall.freeze(result.attempt);
+          backPanel.replaceChildren(
+            chrome(ctx, "p", { className: "field-label", text: ctx.t("card.back_label") }),
+            content(ctx, "p", { className: "statement", text: result.back })
+          );
+          ratingPanel.hidden = false;
+          rating.focus();
+        },
+        function (failure) {
+          pending = false;
+          turn.disabled = false;
+          complain(failure && failure.message ? failure.message : ctx.t("server.body"));
+        }
+      );
+    });
+
+    var front = [content(ctx, "p", { className: "statement", text: component.content.front })];
     if (component.content.front_note) {
-      front.push(el("p", { className: "note", text: component.content.front_note }));
+      front.push(content(ctx, "p", { className: "note", text: component.content.front_note }));
     }
 
     return {
-      body: front.concat([recall.node, rating.node]),
+      body: front.concat([recall.node, problem, turn, backPanel, ratingPanel]),
       focus: recall.focus,
       read: function () {
+        if (!revealed) {
+          return bad(ctx.t("invalid.reveal_first"));
+        }
         var chosen = rating.selection();
         if (!chosen) {
           return bad(ctx.t("invalid.rating"));
         }
+        // `text` is the frozen attempt, which is what the server will compare
+        // the submission against.
         return ok({ text: recall.value(), self_rating: chosen });
       },
     };
@@ -1018,8 +1239,8 @@
     var field = answerField(ctx, { label: ctx.t("card.answer_label"), multiline: true, rows: 6 });
     var before = [picture.node];
     if (component.content.focus_points) {
-      before.push(el("p", { className: "hint", text: ctx.t("card.focus_points") }));
-      before.push(list(component.content.focus_points));
+      before.push(hint(ctx, "card.focus_points"));
+      before.push(list(ctx, component.content.focus_points));
     }
     return {
       body: before.concat([field.node]),
@@ -1038,6 +1259,7 @@
     if (component.content.callouts) {
       before.push(
         list(
+          ctx,
           component.content.callouts.map(function (callout) {
             return callout.text;
           })
@@ -1054,33 +1276,88 @@
     };
   };
 
+  //: How far one arrow key moves the crosshair, coarse and fine. Both appear in
+  //: the card's own instructions, so a keyboard user is told rather than left to
+  //: discover them.
+  var HOTSPOT_COARSE_STEP = 0.05;
+  var HOTSPOT_FINE_STEP = 0.01;
+
+  //: Decimal places for a normalised coordinate. Four is finer than any screen
+  //: and coarser than floating-point noise.
+  var HOTSPOT_PRECISION = 4;
+
+  function clamp01(value) {
+    return Math.min(1, Math.max(0, value));
+  }
+
   /**
    * Normalised-coordinate hotspot.
    *
-   * The point submitted is a fraction of the image's own width and height, so
-   * it means the same thing on any screen and at any zoom -- the answer key is
-   * in those units too. Two ways in: tap the surface, or focus it and use the
-   * arrow keys, which start the marker at the centre and step by 5% (1% with
-   * Shift). A card that only accepted a tap could not honour `keyboard_only`.
+   * The structure matters as much as the arithmetic, and the first version had
+   * both wrong.
+   *
+   * **Only the picture is the control.** The button used to wrap the whole
+   * `<figure>`: caption, long description, and the `<details>`/`<summary>` that
+   * opens it. A `<summary>` inside a `<button>` is invalid HTML and unreachable
+   * for a keyboard user, who can focus the button but can never open the
+   * description nested inside it. The button now contains the picture and
+   * nothing else, and every piece of prose is a sibling.
+   *
+   * **Coordinates come from the image, not from the control.** Measuring the
+   * button measured the caption and the description too, so the same tap landed
+   * on a different point depending on how much text the author had written --
+   * adding a long description silently moved every answer. The rectangle used is
+   * the `<img>`'s own. That is exact rather than approximate because the image is
+   * sized `width: 100%; height: auto`: with no letterboxing, the element's box
+   * and the picture's box are the same rectangle.
+   *
+   * The point is a fraction of the image's width and height, so it means the same
+   * thing on any screen and at any zoom -- the stored answer's regions are in
+   * those units too. Two ways in, one piece of state: tap the picture, or focus it
+   * and use the arrow keys. A card that only accepted a tap could not honour
+   * `keyboard_only`.
    */
   RENDERERS.hotspot = function (component, ctx) {
-    var picture = figure(ctx, component.content.image);
+    var surface = null;
+    var picture = figure(ctx, component.content.image, {
+      onFallback: function (fallbackId) {
+        if (surface) {
+          surface.setAttribute(
+            "aria-describedby",
+            surface.getAttribute("aria-describedby") + " " + fallbackId
+          );
+        }
+      },
+    });
     var point = null;
 
     var marker = el("span", { className: "marker", attrs: { "aria-hidden": "true" } });
     marker.hidden = true;
 
-    var surface = el("button", {
-      className: "hotspot",
-      attrs: { type: "button", "aria-label": ctx.t("card.hotspot_pick") },
-      children: [picture.node, marker],
-    });
+    var overlay = [picture.holder, marker];
     if (component.content.show_grid) {
-      surface.appendChild(el("span", { className: "hotspot-grid", attrs: { "aria-hidden": "true" } }));
+      overlay.push(el("span", { className: "hotspot-grid", attrs: { "aria-hidden": "true" } }));
     }
 
-    var readout = el("p", { className: "hint", attrs: { "aria-live": "polite" } });
-    var clear = el("button", {
+    var readoutId = uniqueId("hotspot-readout");
+    var readout = chrome(ctx, "p", {
+      className: "hint",
+      attrs: { "aria-live": "polite", id: readoutId },
+    });
+
+    surface = el("button", {
+      className: "hotspot",
+      attrs: {
+        type: "button",
+        "aria-label": ctx.t("card.hotspot_pick"),
+        // The readout is this control's value in words. The picture's text
+        // alternative joins it only if the picture fails — see `onFallback`.
+        "aria-describedby": readoutId,
+      },
+      children: overlay,
+    });
+
+    var clear = chrome(ctx, "button", {
       className: "small",
       text: ctx.t("card.hotspot_clear"),
       attrs: { type: "button" },
@@ -1088,7 +1365,7 @@
     });
 
     function place(x, y) {
-      point = { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+      point = { x: clamp01(x), y: clamp01(y) };
       marker.hidden = false;
       marker.style.left = point.x * 100 + "%";
       marker.style.top = point.y * 100 + "%";
@@ -1100,7 +1377,10 @@
     }
 
     surface.addEventListener("click", function (event) {
-      var box = surface.getBoundingClientRect ? surface.getBoundingClientRect() : null;
+      // Measured on the image, so prose around it cannot move the coordinate.
+      var box = picture.image.getBoundingClientRect
+        ? picture.image.getBoundingClientRect()
+        : null;
       if (!box || !box.width || !box.height) {
         return;
       }
@@ -1122,7 +1402,7 @@
       if (event.preventDefault) {
         event.preventDefault();
       }
-      var size = event.shiftKey ? 0.01 : 0.05;
+      var size = event.shiftKey ? HOTSPOT_FINE_STEP : HOTSPOT_COARSE_STEP;
       var from = point || { x: 0.5, y: 0.5 };
       place(from.x + step[0] * size, from.y + step[1] * size);
     });
@@ -1135,13 +1415,17 @@
     });
 
     return {
+      // Prose lives outside the control, where a keyboard user can reach it.
       body: [
-        el("p", { className: "hint", text: ctx.t("card.hotspot_hint") }),
-        el("p", { className: "hint", text: ctx.t("card.hotspot_keyboard") }),
+        hint(ctx, "card.hotspot_hint"),
+        hint(ctx, "card.hotspot_keyboard", {
+          coarse: Math.round(HOTSPOT_COARSE_STEP * 100),
+          fine: Math.round(HOTSPOT_FINE_STEP * 100),
+        }),
         surface,
         readout,
         clear,
-      ],
+      ].concat(picture.extras),
       focus: function () {
         surface.focus();
       },
@@ -1150,7 +1434,12 @@
           return bad(ctx.t("invalid.point"));
         }
         return ok({
-          points: [{ x: Number(point.x.toFixed(4)), y: Number(point.y.toFixed(4)) }],
+          points: [
+            {
+              x: Number(point.x.toFixed(HOTSPOT_PRECISION)),
+              y: Number(point.y.toFixed(HOTSPOT_PRECISION)),
+            },
+          ],
         });
       },
     };
@@ -1158,7 +1447,11 @@
 
   RENDERERS.labeling = function (component, ctx) {
     var picture = figure(ctx, component.content.image);
-    var surface = el("div", { className: "hotspot", children: [picture.node] });
+    // The pins are positioned as a percentage of their containing box, so that
+    // box has to be the picture and nothing else. Wrapping the whole figure --
+    // caption, long description and all -- put every marker in the wrong place
+    // by however tall the prose happened to be.
+    var surface = el("div", { className: "hotspot", children: [picture.holder] });
 
     component.content.markers.forEach(function (mark, index) {
       var pin = el("span", {
@@ -1190,7 +1483,7 @@
             return el("div", { className: "pair", children: [row.select.node] });
           }),
         }),
-      ],
+      ].concat(picture.extras),
       read: function () {
         var labels = [];
         for (var index = 0; index < rows.length; index += 1) {
@@ -1210,13 +1503,13 @@
   RENDERERS.table_grid = function (component, ctx) {
     var prefilled = {};
     (component.content.prefilled_cells || []).forEach(function (cell) {
-      prefilled[cell.row_id + " " + cell.column_id] = cell.text;
+      prefilled[cell.row_id + " " + cell.column_id] = cell.text;
     });
 
     var head = el("tr", {
       children: [el("th", { attrs: { scope: "col" }, text: "" })].concat(
         component.content.columns.map(function (column) {
-          return el("th", { attrs: { scope: "col" }, text: column.header });
+          return content(ctx, "th", { attrs: { scope: "col" }, text: column.header });
         })
       ),
     });
@@ -1224,9 +1517,9 @@
     var cells = [];
     var rows = component.content.rows.map(function (row) {
       var tds = component.content.columns.map(function (column) {
-        var given = prefilled[row.id + " " + column.id];
+        var given = prefilled[row.id + " " + column.id];
         if (given !== undefined) {
-          return el("td", { text: given });
+          return content(ctx, "td", { text: given });
         }
         var input = el("input", {
           attrs: {
@@ -1241,7 +1534,7 @@
         return el("td", { children: [input] });
       });
       return el("tr", {
-        children: [el("th", { attrs: { scope: "row" }, text: row.header })].concat(tds),
+        children: [content(ctx, "th", { attrs: { scope: "row" }, text: row.header })].concat(tds),
       });
     });
 
@@ -1320,9 +1613,9 @@
   function unsupported(component, ctx) {
     return {
       body: [
-        el("h3", { text: ctx.t("card.unsupported.title") }),
-        el("p", { text: ctx.t("card.unsupported.body") }),
-        el("p", { className: "hint", text: ctx.t("card.unsupported.type", { type: component.type }) }),
+        chrome(ctx, "h3", { text: ctx.t("card.unsupported.title") }),
+        chrome(ctx, "p", { text: ctx.t("card.unsupported.body") }),
+        hint(ctx, "card.unsupported.type", { type: component.type }),
       ],
       unsupported: true,
       read: function () {
@@ -1336,22 +1629,19 @@
     var access = component.accessibility || {};
     var nodes = [];
     if (access.caption) {
-      nodes.push(el("p", { className: "note", text: access.caption }));
+      nodes.push(content(ctx, "p", { className: "note", text: access.caption }));
     }
     if (access.keyboard_alternative) {
       nodes.push(
-        el("p", {
-          className: "hint",
-          text: ctx.t("card.keyboard_alternative", { text: access.keyboard_alternative }),
-        })
+        hint(ctx, "card.keyboard_alternative", { text: access.keyboard_alternative })
       );
     }
     if (access.long_description) {
       nodes.push(
         el("details", {
           children: [
-            el("summary", { text: ctx.t("card.long_description") }),
-            el("p", { className: "note", text: access.long_description }),
+            chrome(ctx, "summary", { text: ctx.t("card.long_description") }),
+            content(ctx, "p", { className: "note", text: access.long_description }),
           ],
         })
       );
@@ -1360,8 +1650,8 @@
       nodes.push(
         el("details", {
           children: [
-            el("summary", { text: ctx.t("card.transcript") }),
-            el("p", { className: "note", text: access.transcript }),
+            chrome(ctx, "summary", { text: ctx.t("card.transcript") }),
+            content(ctx, "p", { className: "note", text: access.transcript }),
           ],
         })
       );
@@ -1402,10 +1692,19 @@
     var section = el("section", {
       className: "state",
       attrs: { "data-component-type": component.type },
-      children: [el("h2", { className: "prompt", text: view.prompt })]
+      children: [content(ctx, "h2", { className: "prompt", text: view.prompt })]
         .concat(alternatives(view, ctx))
         .concat(built.body),
     });
+
+    // The card is the learner-content container, so it carries the exercise's
+    // own language. Interface strings inside it are marked back to the UI
+    // language by `chrome()`; everything outside it -- the title bar, the
+    // progress text, the action button -- is chrome and inherits the document's.
+    var locale = contentLang(ctx);
+    if (locale) {
+      section.setAttribute("lang", locale);
+    }
 
     if (view.accessibility.reduced_motion) {
       section.setAttribute("data-reduced-motion", "true");

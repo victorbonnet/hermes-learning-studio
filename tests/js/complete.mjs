@@ -38,6 +38,7 @@ export function completeCard(card, payload = {}) {
     selects: 0,
     hotspots: 0,
     orderings: 0,
+    reveals: 0,
   };
 
   const groups = new Map();
@@ -78,6 +79,17 @@ export function completeCard(card, payload = {}) {
     if (surface.className.includes("hotspot")) {
       press(surface, "ArrowRight");
       touched.hotspots += 1;
+    }
+  }
+
+  // A flashcard has to be turned over before it can be rated, and turning it
+  // over is a request. The click is fired here; the caller has to `await settle()`
+  // before reading, because the back arrives asynchronously — which is exactly
+  // what happens on a phone.
+  for (const button of card.byTag("button")) {
+    if (button.className.includes("primary") && !button.hidden) {
+      click(button);
+      touched.reveals += 1;
     }
   }
 

@@ -20,6 +20,10 @@ from typing import Any
 #: Prefix shared by every string that must never reach a learner.
 CANARY = "ZZCANARY"
 
+#: The back of the flashcard example. Not a canary, deliberately — see the note
+#: on that example. Distinctive enough to search a response body for.
+FLASHCARD_BACK = "yama"
+
 
 def canary(component_type: str, field: str) -> str:
     """A distinctive marker for one hidden field of one component type."""
@@ -311,8 +315,15 @@ EXAMPLES: dict[str, dict[str, Any]] = {
         "type": "flashcard",
         "prompt": "Recall the reading, then turn the card over.",
         "content": {"front": "山", "front_note": "One character."},
+        # `back` is the one evaluator-only field in the whole registry that a
+        # learner may ever be shown, and only through an authorised reveal after
+        # committing an attempt. So it carries a real value rather than a canary:
+        # a canary here would mean "this string reached a learner" was both the
+        # definition of a leak and the definition of the feature working, and
+        # every canary test would have to carve out an exception. The mnemonic
+        # beside it stays canaried, because nothing discloses that.
         "answer": {
-            "back": canary("flashcard", "back"),
+            "back": FLASHCARD_BACK,
             "mnemonic": canary("flashcard", "mnemonic"),
         },
         "evaluation": _evaluation("flashcard", scoring={"mode": "self_check"}),

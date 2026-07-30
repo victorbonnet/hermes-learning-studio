@@ -39,7 +39,11 @@
   --fg: var(--tg-text-color, #f2f5f8);
   --muted: var(--tg-hint-color, #9aa8b6);
   --link: var(--tg-link-color, #78b6ff);
-  --accent: var(--tg-button-color, #3a86d6);
+  /* White on #3a86d6 measures 3.78:1, which fails WCAG 2.1 AA for normal text.
+     #2470c0 measures 5.06:1 with the same foreground and still reads as the
+     saturated blue a Telegram client uses for its own buttons.
+     `tests/test_mini_app_contrast.py` computes both and fails below 4.5. */
+  --accent: var(--tg-button-color, #2470c0);
   --accent-fg: var(--tg-button-text-color, #ffffff);
   --surface: var(--tg-secondary-bg-color, #22303d);
   --border: rgba(154, 168, 182, 0.42);
@@ -526,6 +530,40 @@ table.grid input {
   font-size: 0.9rem;
 }
 
+/* The text alternative, shown in place of a picture that did not arrive. Styled
+   as content rather than as an error, because that is what it is: the exercise's
+   own description of the image. Full contrast, not muted -- somebody is reading
+   this instead of looking at the picture. */
+.image-alt {
+  margin: 0;
+  padding: var(--gap);
+  background: var(--surface);
+  border-left: 4px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+/* The back of a flashcard, once the server has granted it. */
+.reveal:not(:empty) {
+  margin: 0;
+  padding: var(--gap);
+  background: var(--surface);
+  border-left: 4px solid var(--ok);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* A frozen recall: still readable, visibly no longer editable. */
+textarea[readonly],
+input[readonly] {
+  background: var(--surface);
+  color: var(--fg);
+  cursor: default;
+}
+
 .hotspot {
   position: relative;
   display: block;
@@ -540,6 +578,24 @@ table.grid input {
 
 .hotspot img {
   border-radius: 0;
+}
+
+/* `line-height: 0` above exists so the image sits flush against the control's
+   edges with no descender gap. It is wrong for *text*, and the control does hold
+   text when the picture fails to load: without this the alternative renders as
+   overlapping lines on top of each other. */
+.hotspot .image-status,
+.hotspot .image-alt {
+  line-height: 1.5;
+  text-align: left;
+  border-left: 0;
+  border-radius: 0;
+}
+
+.hotspot .image-alt {
+  /* Enough room that the coordinate marker reads as an overlay on the
+     description rather than as part of a word. */
+  padding-block: calc(var(--gap) * 1.5);
 }
 
 .hotspot-grid {

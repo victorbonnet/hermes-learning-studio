@@ -123,8 +123,15 @@ GALLERY_JS = """/* Render one card per fixture, with the real renderers and no a
 
   var context = {
     t: t,
+    uiLocale: t.locale,
+    contentLocale: window.PREVIEW_CONTENT_LOCALE || null,
     loadImage: function () {
       return Promise.resolve(window.PREVIEW_PLACEHOLDER);
+    },
+    // The gallery has no server, so nothing can be turned over. Refusing is the
+    // honest stand-in: the back of a card is never in the page, here either.
+    reveal: function () {
+      return Promise.reject({ message: t("server.body") });
     },
   };
 
@@ -175,7 +182,7 @@ def fixtures(types: list[str]) -> list[dict]:
     return built
 
 
-def generate(out: Path, *, locale: str, types: list[str]) -> Path:
+def generate(out: Path, *, locale: str, types: list[str], content_locale: str = "en") -> Path:
     out.mkdir(parents=True, exist_ok=True)
     for name in COPIED:
         shutil.copyfile(STATIC_DIR / name, out / name)
@@ -186,6 +193,8 @@ def generate(out: Path, *, locale: str, types: list[str]) -> Path:
         + json.dumps(fixtures(types), indent=2, ensure_ascii=False)
         + ";\nwindow.PREVIEW_LOCALE = "
         + json.dumps(locale)
+        + ";\nwindow.PREVIEW_CONTENT_LOCALE = "
+        + json.dumps(content_locale)
         + ";\nwindow.PREVIEW_PLACEHOLDER = "
         + json.dumps(PLACEHOLDER)
         + ";\n",
@@ -202,6 +211,11 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "dist" / "preview")
     parser.add_argument("--locale", default="en", help="UI locale for the interface strings")
     parser.add_argument(
+        "--content-locale",
+        default="en",
+        help="the exercise's own language, which the cards are marked with",
+    )
+    parser.add_argument(
         "--types",
         nargs="*",
         default=list(COMPONENT_TYPES),
@@ -213,7 +227,12 @@ def main() -> int:
     if unknown:
         parser.error(f"unknown component type(s): {', '.join(unknown)}")
 
-    page = generate(args.out, locale=args.locale, types=list(args.types))
+    page = generate(
+        args.out,
+        locale=args.locale,
+        types=list(args.types),
+        content_locale=args.content_locale,
+    )
     print(f"wrote {page}")
     return 0
 

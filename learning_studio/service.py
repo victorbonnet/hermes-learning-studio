@@ -2347,6 +2347,86 @@ def _experience_payload(row: sqlite3.Row, components: list[sqlite3.Row]) -> dict
     }
 
 
+# ── The one authorised read of evaluator-only data ────────────────────────
+
+#: Component types whose hidden half may ever be disclosed to a learner, and the
+#: single answer field each one may disclose.
+#:
+#: This mapping is the whole permission. It is not a filter applied to a general
+#: "read the hidden half" query — there is no such query — it decides which
+#: *field* of which *type* a caller can ask for, and the function below refuses
+#: everything else. A flashcard's ``back`` is here because retrieval practice is
+#: not retrieval practice unless the learner finds out whether they were right;
+#: a rubric, a hint, per-option feedback, a branch, an evaluator note, and every
+#: other type's answer key are not here and cannot be requested.
+REVEALABLE_ANSWER_FIELDS: dict[str, str] = {"flashcard": "back"}
+
+#: Said when a reveal is not available. The same message for "no such component",
+#: "not that type", and "nothing stored", for the usual reason: the difference
+#: would turn the route into a description of somebody's exercise.
+NOT_REVEALABLE_MESSAGE = "There is nothing to turn over on this card."
+
+
+def reveal_component_answer(
+    *,
+    principal: Principal,
+    experience_id: str,
+    component_key: str,
+    config: LearningStudioConfig | None = None,
+) -> str:
+    """Return the one disclosable answer field of one component, or refuse.
+
+    Every scope is in the ``WHERE`` clause rather than in a check around it: the
+    profile, the learner resolved from the authenticated principal, the
+    experience, and the component key. A caller holding a valid session for their
+    own experience cannot reach a component of another, and no argument to this
+    function can widen it.
+
+    What comes back is a *string*, not the hidden record. Returning the row and
+    letting the caller pick a field would make every future caller a chance to
+    return the whole thing by accident; there is no code path here that produces
+    the rubric, the hints, the feedback, or the branching.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            raise NotFoundError(NOT_FOUND_EXPERIENCE_MESSAGE)
+
+        row = conn.execute(
+            "SELECT c.component_type, e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ? AND c.component_key = ?"
+            "   AND c.profile_id = ? AND c.learner_id = ?"
+            "   AND e.profile_id = ? AND e.learner_id = ?",
+            (
+                str(experience_id),
+                str(component_key),
+                profile,
+                learner_id,
+                profile,
+                learner_id,
+            ),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(NOT_REVEALABLE_MESSAGE)
+
+    component_type = str(row["component_type"])
+    field_name = REVEALABLE_ANSWER_FIELDS.get(component_type)
+    if field_name is None:
+        raise ValidationError(NOT_REVEALABLE_MESSAGE)
+
+    hidden = json.loads(str(row["evaluation"]))
+    value = (hidden.get("answer") or {}).get(field_name)
+    if not isinstance(value, str) or not value:
+        raise NotFoundError(NOT_REVEALABLE_MESSAGE)
+    return value
+
+
 # ── Managed asset delivery ────────────────────────────────────────────────
 
 

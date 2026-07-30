@@ -88,6 +88,15 @@ class MiniAppSession:
     #: ``component_id -> submitted response``. Held in memory for the life of
     #: the session; durable attempt storage is a later PR's decision to make.
     answers: dict[str, Any] = field(default_factory=dict)
+    #: ``component_id -> the attempt recorded when the card was turned over``.
+    #:
+    #: This is what makes a reveal safe to grant. A learner may see the back of a
+    #: flashcard only after committing an attempt, and the attempt is *frozen*
+    #: here at that moment: the submission is later checked against this value, so
+    #: reading the answer and then quietly improving the recall is refused rather
+    #: than merely discouraged. It also makes a repeated reveal idempotent — a
+    #: refresh returns the same card and keeps the first attempt.
+    revealed: dict[str, str] = field(default_factory=dict)
     completed_at: float | None = None
 
     @property
@@ -96,6 +105,19 @@ class MiniAppSession:
 
     def expired(self, now: float) -> bool:
         return now >= self.expires_at
+
+    def attempt_before_reveal(self, component_id: str) -> str | None:
+        """The frozen attempt for ``component_id``, or ``None`` if never revealed."""
+        return self.revealed.get(component_id)
+
+    def freeze_attempt(self, component_id: str, attempt: str) -> str:
+        """Record the attempt that buys a reveal, and never overwrite it.
+
+        Returning the stored value rather than the argument is the whole point:
+        the second call gets the first call's attempt back, so a client that
+        re-posts a different recall does not get to replace it.
+        """
+        return self.revealed.setdefault(component_id, attempt)
 
 
 class SessionStore:

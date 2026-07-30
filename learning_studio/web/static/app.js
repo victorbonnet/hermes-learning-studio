@@ -44,6 +44,7 @@
     session: "/api/session",
     component: "/api/session/component",
     answer: "/api/session/answer",
+    reveal: "/api/session/reveal",
     result: "/api/session/result",
     assets: "/api/assets/",
   };
@@ -54,12 +55,21 @@
   //: "not found" card instead of a pointless round trip.
   var EXPERIENCE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
-  //: Telegram theme values are colours, and this is what a colour may look
-  //: like. Custom properties accept almost any token sequence, so an unchecked
-  //: value from the host client would be a way to write arbitrary CSS into the
-  //: page; a rejected value simply falls through to the stylesheet's own
-  //: fallback, which is legible by construction.
-  var COLOUR = /^#[0-9a-fA-F]{3,8}$/;
+  //: Telegram theme values are colours, and this is what a CSS hex colour may
+  //: look like: exactly 3, 4, 6, or 8 digits. Custom properties accept almost
+  //: any token sequence, so an unchecked value from the host client would be a
+  //: way to write arbitrary CSS into the page; a rejected value falls through to
+  //: the stylesheet's own fallback, which is legible by construction.
+  //
+  //: `{3,8}` was wrong, not merely loose. It accepted `#12345` and `#1234567`,
+  //: which are not colours at all. A custom property accepts them anyway — it is
+  //: only checked where it is *used* — so the property ends up set to an invalid
+  //: value rather than left unset, and `var(--tg-…, fallback)` never gets its
+  //: chance. Measured in Chromium: `--tg-bg-color: #12345` computes the page
+  //: background to `rgba(0, 0, 0, 0)`, fully transparent, against which the
+  //: stylesheet's own foreground colours are anybody's guess. Removing the
+  //: property instead computes the intended `rgb(255, 255, 255)`.
+  var COLOUR = /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 
   var THEME_KEYS = [
     "bg_color",
@@ -85,6 +95,10 @@
     var currentCard = null;
     var currentComponent = null;
     var objectUrls = [];
+    //: Told to us by the bootstrap response. Defaults are the shipped
+    //: configuration's, so a request made before the session opens is still
+    //: bounded, but the server's answer is what governs.
+    var limits = { max_response_chars: 4000, max_request_bytes: 16384 };
 
     var nodes = {};
     [
@@ -132,8 +146,13 @@
     function applyLocale() {
       t = I18n.translator(experience ? experience.ui_locale : I18n.FALLBACK_LOCALE);
       if (doc.documentElement) {
+        // The document language is the *interface* language. Exercise content
+        // carries its own `lang`, applied to the card by the renderers.
         doc.documentElement.setAttribute("lang", t.locale);
       }
+      // The tab and the task switcher show this, and an untranslated title in an
+      // otherwise translated app is the kind of detail that reads as unfinished.
+      doc.title = t("app.title");
       nodes["skip-link"].textContent = t("app.skip");
       nodes.progress.setAttribute("aria-label", t("progress.label"));
     }
@@ -179,6 +198,38 @@
       nodes["progress-text"].textContent = progress.completed
         ? ""
         : t("progress.text", { position: position, count: total });
+    }
+
+    /**
+     * The size a request body will actually be, in bytes rather than characters.
+     *
+     * The server's ceiling is on bytes, and the difference matters: a card
+     * answered in Japanese or with an emoji in it costs three or four bytes per
+     * character, so a `length` check would pass a body the server then refuses.
+     */
+    function byteLength(text) {
+      if (global.TextEncoder) {
+        return new global.TextEncoder().encode(text).length;
+      }
+      // Counted directly rather than via `unescape(encodeURIComponent(...))`:
+      // that idiom works but relies on a deprecated global, and this is a dozen
+      // arithmetic operations on a string we already hold.
+      var bytes = 0;
+      for (var index = 0; index < text.length; index += 1) {
+        var code = text.charCodeAt(index);
+        if (code < 0x80) {
+          bytes += 1;
+        } else if (code < 0x800) {
+          bytes += 2;
+        } else if (code >= 0xd800 && code <= 0xdbff) {
+          // A surrogate pair is one four-byte code point; skip its low half.
+          bytes += 4;
+          index += 1;
+        } else {
+          bytes += 3;
+        }
+      }
+      return bytes;
     }
 
     function releaseImages() {
@@ -350,12 +401,48 @@
         });
     }
 
+    /**
+     * Ask the server to turn the current card over.
+     *
+     * Rejects with an already-localized message, because the renderer shows it
+     * and the API's own English is written for an operator. The attempt goes in
+     * the body; the server freezes it and answers with the frozen value, which is
+     * what the card then displays and submits.
+     */
+    function reveal(attempt) {
+      return request("POST", API.reveal, {
+        component_id: currentComponent.component_id,
+        attempt: attempt,
+      }).then(function (result) {
+        if (result.ok) {
+          return { back: result.data.back, attempt: result.data.attempt };
+        }
+        if (result.offline) {
+          throw { message: t("offline.body") };
+        }
+        if (result.status === 400) {
+          throw { message: t("invalid.attempt_required") };
+        }
+        if (result.status === 401) {
+          // The session went away mid-card; the state machine owns that.
+          fail(result, "session");
+          throw { message: t("expired.body") };
+        }
+        throw { message: t("server.body") };
+      });
+    }
+
     function renderContext() {
       return {
         t: function (key, values) {
           return t(key, values);
         },
         loadImage: loadImage,
+        reveal: reveal,
+        uiLocale: t.locale,
+        // The exercise's own language, which is not the interface's. Absent until
+        // a session is open, which is also when the first card can be rendered.
+        contentLocale: experience ? experience.content_locale : null,
       };
     }
 
@@ -410,6 +497,9 @@
           }
           sessionToken = result.data.session_token || "";
           experience = result.data.experience || null;
+          if (result.data.limits) {
+            limits = result.data.limits;
+          }
           progress = result.data.progress || null;
           applyLocale();
           showExperience();
@@ -464,6 +554,21 @@
         }
         payload = read.response;
       }
+
+      // The per-field limit is enforced by each textarea's `maxlength`, but a
+      // card with eight prompts can clear every field limit and still exceed the
+      // request ceiling. Left unchecked that arrives as a 413 rendered as "the
+      // server said no", which is both wrong and unactionable; caught here it is
+      // a sentence telling the learner to shorten what they wrote.
+      var body = JSON.stringify({
+        component_id: currentComponent.component_id,
+        response: payload,
+      });
+      if (byteLength(body) > limits.max_request_bytes) {
+        showFieldError(t("invalid.too_long"));
+        return Promise.resolve();
+      }
+
       showFieldError("");
       nodes["primary-action"].disabled = true;
 

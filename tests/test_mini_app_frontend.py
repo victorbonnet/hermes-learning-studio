@@ -494,3 +494,86 @@ def test_the_readme_documents_the_response_contract():
 
     for key in sorted(set(RESPONSE_KEYS.values())):
         assert f"`{key}`" in text, f"the README does not document the {key} response"
+
+
+# ── The files themselves are what they claim to be ────────────────────────
+
+
+@pytest.mark.parametrize("asset", STATIC_ASSETS, ids=lambda asset: asset.filename)
+def test_no_static_file_contains_a_control_character(asset):
+    """A stray NUL is invisible in a diff and breaks every text tool quietly.
+
+    This is not hypothetical: a composite lookup key in `renderers.js` was written
+    with a NUL byte where a space belonged. The JavaScript ran — a NUL is legal in
+    a string literal — but `grep` classified the file as binary and silently
+    stopped matching, so every shell-based review of that file had been returning
+    nothing at all.
+    """
+    raw = (STATIC_DIR / asset.filename).read_bytes()
+
+    offenders = {byte for byte in raw if byte < 0x09 or 0x0D < byte < 0x20 or byte == 0x7F}
+    assert offenders == set(), f"{asset.filename} contains control bytes {sorted(offenders)}"
+
+
+@pytest.mark.parametrize("asset", STATIC_ASSETS, ids=lambda asset: asset.filename)
+def test_every_static_file_is_valid_utf8_text(asset):
+    (STATIC_DIR / asset.filename).read_bytes().decode("utf-8")
+
+
+# ── The hotspot's numbers agree with the answer schema ────────────────────
+
+
+def test_the_hotspot_submits_coordinates_the_answer_schema_can_be_compared_with():
+    """Normalised to 0–1, which is the unit the stored regions are declared in."""
+    from learning_studio.components import SPEC_BY_TYPE, object_schema
+
+    answer = object_schema(SPEC_BY_TYPE["hotspot"].answer)
+    points = answer["properties"]["regions"]["items"]["properties"]["points"]["items"]
+
+    assert points["minimum"] == 0.0
+    assert points["maximum"] == 1.0
+
+    body = code("renderers.js")
+    assert "HOTSPOT_PRECISION" in body
+    assert "clamp01" in body
+
+
+def test_the_hotspot_step_sizes_are_stated_to_the_learner():
+    """A keyboard affordance nobody is told about is not an affordance."""
+    english = locale_tables()["en"]
+
+    assert "{coarse}" in _string_for("card.hotspot_keyboard")
+    assert "{fine}" in _string_for("card.hotspot_keyboard")
+    assert "card.hotspot_keyboard" in english
+
+
+def _string_for(key: str) -> str:
+    body = source("i18n.js")
+    match = re.search(rf'"{re.escape(key)}":\s*"((?:[^"\\]|\\.)*)"', body)
+    assert match, f"{key} is not declared"
+    return match.group(1)
+
+
+# ── The reveal is wired end to end ────────────────────────────────────────
+
+
+def test_the_frontend_knows_how_to_turn_a_card_over():
+    body = code("renderers.js")
+
+    assert "ctx.reveal(" in body, "the renderer has no way to ask for a reveal"
+    assert "card.turn_over" in body
+
+
+def test_only_the_application_talks_to_the_reveal_route():
+    """Renderers reach the network through injected functions and no other way."""
+    renderers = code("renderers.js")
+
+    assert "/api/" not in renderers
+    assert "fetch" not in renderers
+
+
+def test_the_renderers_cannot_reach_the_network_at_all():
+    renderers = code("renderers.js")
+
+    for reachable in ("XMLHttpRequest", "WebSocket", "EventSource", "navigator.sendBeacon"):
+        assert reachable not in renderers

@@ -22,6 +22,7 @@ import { canaryPrefix, loadApp, payloads, settle } from "./harness.mjs";
 const FIXTURES = payloads();
 const CANARY = canaryPrefix();
 const ALL_TYPES = Object.keys(FIXTURES).sort();
+const FLASHCARD_BACK = "yama";
 
 const INIT_DATA_HEADER = "X-Telegram-Init-Data";
 const SESSION_HEADER = "X-Learning-Studio-Session";
@@ -72,7 +73,12 @@ function jsonResponse(status, body) {
  * `failWith` injects a status for the *next* request to a given path, which is
  * how the error states are reached without a second fake.
  */
-function fakeApi({ types = ["multiple_choice"], uiLocale = "en", failWith = {} } = {}) {
+function fakeApi({
+  types = ["multiple_choice"],
+  uiLocale = "en",
+  contentLocale = "en",
+  failWith = {},
+} = {}) {
   const components = types.map((componentType, index) =>
     Object.assign({}, FIXTURES[componentType], {
       position: index,
@@ -84,7 +90,7 @@ function fakeApi({ types = ["multiple_choice"], uiLocale = "en", failWith = {} }
     title: "A short practice set",
     instructions: "Work through each item in order.",
     ui_locale: uiLocale,
-    content_locale: "en",
+    content_locale: contentLocale,
     expected_duration_minutes: 12,
     difficulty: "intermediate",
     accessibility: {},
@@ -93,6 +99,7 @@ function fakeApi({ types = ["multiple_choice"], uiLocale = "en", failWith = {} }
 
   const log = [];
   const answers = [];
+  const reveals = new Map();
   let token = "";
   let position = 0;
 
@@ -129,16 +136,48 @@ function fakeApi({ types = ["multiple_choice"], uiLocale = "en", failWith = {} }
         expires_in_seconds: 1800,
         experience,
         progress: progress(),
+        limits: { max_response_chars: 4000, max_request_bytes: 16384 },
       });
     }
     if (path === "/api/session/component") {
       return jsonResponse(200, { progress: progress(), component: componentAt(position) });
+    }
+    if (path === "/api/session/reveal") {
+      // Mirrors the real route: current card only, attempt required, attempt
+      // frozen on the first call.
+      const sent = JSON.parse(init.body);
+      const current = componentAt(position);
+      if (!current || sent.component_id !== current.component_id) {
+        return jsonResponse(409, { error: "not the current question" });
+      }
+      if (typeof sent.attempt !== "string" || !sent.attempt.trim()) {
+        return jsonResponse(400, { error: "no attempt" });
+      }
+      if (!reveals.has(current.component_id)) {
+        reveals.set(current.component_id, sent.attempt);
+      }
+      return jsonResponse(200, {
+        component_id: current.component_id,
+        revealed: true,
+        back: FLASHCARD_BACK,
+        attempt: reveals.get(current.component_id),
+        notice: "Nothing has been marked.",
+      });
     }
     if (path === "/api/session/answer") {
       const sent = JSON.parse(init.body);
       const current = componentAt(position);
       if (!current || sent.component_id !== current.component_id) {
         return jsonResponse(409, { error: "not the current question" });
+      }
+      if (current.type === "flashcard") {
+        const frozen = reveals.get(current.component_id);
+        if (frozen === undefined) {
+          return jsonResponse(409, { error: "reveal required" });
+        }
+        if (!sent.response || sent.response.text !== frozen) {
+          return jsonResponse(409, { error: "recall changed after reveal" });
+        }
       }
       answers.push(sent);
       position += 1;
@@ -171,7 +210,7 @@ function fakeApi({ types = ["multiple_choice"], uiLocale = "en", failWith = {} }
     return jsonResponse(404, { error: "no such route" });
   }
 
-  return { fetchImpl, log, answers, components, experience, progress, failWith };
+  return { fetchImpl, log, answers, reveals, components, experience, progress, failWith };
 }
 
 async function boot(options = {}) {
@@ -202,6 +241,9 @@ async function answerCurrent(context) {
   const payload = componentType ? FIXTURES[componentType].payload : {};
 
   completeCard(card, payload);
+  // A flashcard's turn-over is a request; give it a chance to come back before
+  // the answer is submitted.
+  await settle(20);
   click(context.node("primary-action"));
   await settle(20);
 
@@ -661,4 +703,230 @@ test("an unsupported card can be skipped so the exercise is not a dead end", asy
 
   assert.equal(api.answers.length, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(api.answers[0].response)), { skipped: true });
+});
+
+// ── Turning a flashcard over, through the real application ────────────────
+
+test("a flashcard is turned over before it can be submitted", async () => {
+  const context = await boot({ types: ["flashcard", "true_false"] });
+  const card = cardOf(context.win);
+
+  const turn = card.byTag("button").find((button) => button.className.includes("primary"));
+  assert.ok(turn, "the card offers no way to turn it over");
+
+  // Nothing has been asked for yet, and nothing has been shown.
+  assert.equal(context.api.log.filter((e) => e.path === "/api/session/reveal").length, 0);
+  assert.ok(!context.win.document.documentElement.serialize().includes(FLASHCARD_BACK));
+
+  const area = card.byTag("textarea")[0];
+  area.value = "my recall";
+  click(turn);
+  await settle(20);
+
+  const reveal = context.api.log.find((entry) => entry.path === "/api/session/reveal");
+  assert.ok(reveal, "no reveal request was made");
+  assert.equal(JSON.parse(reveal.body).attempt, "my recall");
+  assert.ok(cardOf(context.win).textContent.includes(FLASHCARD_BACK));
+});
+
+test("the answer is not in the page until the server sends it", async () => {
+  const context = await boot({ types: ["flashcard"] });
+
+  const before = context.win.document.documentElement.serialize();
+  assert.ok(!before.includes(FLASHCARD_BACK));
+  // And not in any response body received so far either.
+  for (const entry of context.api.log) {
+    assert.ok(!String(entry.body || "").includes(FLASHCARD_BACK));
+  }
+});
+
+test("a flashcard reveal carries the session headers like every other request", async () => {
+  const context = await boot({ types: ["flashcard"] });
+  const card = cardOf(context.win);
+  card.byTag("textarea")[0].value = "recall";
+  click(card.byTag("button").find((b) => b.className.includes("primary")));
+  await settle(20);
+
+  const reveal = context.api.log.find((entry) => entry.path === "/api/session/reveal");
+
+  assert.equal(reveal.headers[INIT_DATA_HEADER], INIT_DATA);
+  assert.equal(reveal.headers[SESSION_HEADER], "session-token-value");
+});
+
+test("the recall the server froze is what gets submitted", async () => {
+  const context = await boot({ types: ["flashcard", "true_false"] });
+  const card = cardOf(context.win);
+  card.byTag("textarea")[0].value = "my first answer";
+  click(card.byTag("button").find((b) => b.className.includes("primary")));
+  await settle(20);
+
+  // Rate it and submit.
+  const radios = cardOf(context.win)
+    .byTag("input")
+    .filter((input) => input.type === "radio");
+  radios[1].checked = true;
+  radios[1].dispatchEvent({ type: "change" });
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(context.api.answers.length, 1);
+  assert.equal(context.api.answers[0].response.text, "my first answer");
+  assert.equal(context.api.reveals.get("component-0"), "my first answer");
+});
+
+test("a flashcard that was never turned over cannot be submitted", async () => {
+  const context = await boot({ types: ["flashcard", "true_false"] });
+  const radios = cardOf(context.win)
+    .byTag("input")
+    .filter((input) => input.type === "radio");
+  radios[0].checked = true;
+  radios[0].dispatchEvent({ type: "change" });
+
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(context.api.answers.length, 0, "an unrevealed card was submitted");
+  assert.match(context.node("field-error").textContent, /Turn the card over/);
+});
+
+// ── Document title and locale ─────────────────────────────────────────────
+
+test("the document title is translated with the rest of the interface", async () => {
+  const english = await boot({ types: ["true_false"] });
+  assert.equal(english.win.document.title, "Learning Studio");
+
+  const french = await boot({ types: ["true_false"], uiLocale: "fr" });
+  assert.equal(french.win.document.title, "Studio d'apprentissage");
+});
+
+test("the card is marked with the exercise's language, the document with the reader's", async () => {
+  const context = await boot({ types: ["true_false"], uiLocale: "fr", contentLocale: "ja" });
+
+  assert.equal(context.win.document.documentElement.getAttribute("lang"), "fr");
+  assert.equal(cardOf(context.win).children[0].getAttribute("lang"), "ja");
+});
+
+// ── Theme values ──────────────────────────────────────────────────────────
+
+const THEME_CASES = [
+  ["#abc", true],
+  ["#abcd", true],
+  ["#a1b2c3", true],
+  ["#a1b2c3d4", true],
+  ["#a", false],
+  ["#ab", false],
+  ["#abcde", false],
+  ["#abcdefg", false],
+  ["#abcdef123", false],
+  ["#12345", false],
+  ["#1234567", false],
+  ["abcdef", false],
+  ["red", false],
+  ["var(--x)", false],
+  ["#abc; } * { display: none", false],
+  ["#abc\\3b  color: red", false],
+  ["url(x)", false],
+  ["", false],
+];
+
+for (const [value, accepted] of THEME_CASES) {
+  test(`a theme colour of ${JSON.stringify(value)} is ${accepted ? "used" : "ignored"}`, async () => {
+    const context = await boot({
+      types: ["true_false"],
+      telegram: { themeParams: { bg_color: value } },
+    });
+    const applied = context.win.document.documentElement.style.getPropertyValue("--tg-bg-color");
+
+    assert.equal(applied, accepted ? value : "");
+  });
+}
+
+test("one bad theme value does not discard the good ones beside it", async () => {
+  const context = await boot({
+    types: ["true_false"],
+    telegram: { themeParams: { bg_color: "#12345", text_color: "#f0f0f0" } },
+  });
+  const style = context.win.document.documentElement.style;
+
+  assert.equal(style.getPropertyValue("--tg-bg-color"), "");
+  assert.equal(style.getPropertyValue("--tg-text-color"), "#f0f0f0");
+});
+
+// ── Aggregate request size ────────────────────────────────────────────────
+
+/**
+ * A card with the most prompts the registry allows.
+ *
+ * The aggregate check only matters where it can actually be reached: each field
+ * is capped at 4,000 characters by its own `maxlength`, so two fields can never
+ * exceed a 16 KB body. Eight of them can, which is precisely the case a
+ * per-field limit does not see.
+ */
+function eightPromptCard() {
+  const api = fakeApi({ types: ["reflection"] });
+  api.components[0] = {
+    position: 0,
+    component_id: "component-0",
+    type: "reflection",
+    payload: {
+      prompt: "Look back over this session.",
+      content: {
+        prompts: Array.from({ length: 8 }, (_index, n) => `Prompt ${n + 1}?`),
+        min_words: 40,
+      },
+    },
+  };
+  return api;
+}
+
+async function bootWith(api) {
+  const { win, booted } = loadApp({ telegram: telegramStub(), fetch: api.fetchImpl });
+  await booted;
+  await settle(20);
+  return { win, api, node: (id) => win.document.getElementById(id) };
+}
+
+test("an over-large answer is refused locally with a readable reason", async () => {
+  const context = await bootWith(eightPromptCard());
+  const before = context.api.log.length;
+
+  // Every field is inside the per-string limit; together they are not.
+  for (const area of cardOf(context.win).byTag("textarea")) {
+    area.value = "word ".repeat(800).trim();
+    area.dispatchEvent({ type: "input" });
+  }
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(context.api.log.length, before, "an oversized body was sent anyway");
+  assert.match(context.node("field-error").textContent, /too long to send/);
+});
+
+test("an answer within the ceiling is sent", async () => {
+  const context = await bootWith(eightPromptCard());
+
+  for (const area of cardOf(context.win).byTag("textarea")) {
+    area.value = "word ".repeat(20).trim();
+    area.dispatchEvent({ type: "input" });
+  }
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(context.api.answers.length, 1);
+});
+
+test("the size ceiling is counted in bytes, not characters", async () => {
+  const context = await bootWith(eightPromptCard());
+
+  // Three bytes per character: well inside every character limit, well over the
+  // byte ceiling. A `length` check would have let this through.
+  for (const area of cardOf(context.win).byTag("textarea")) {
+    area.value = "\u3042 ".repeat(1500).trim();
+    area.dispatchEvent({ type: "input" });
+  }
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(context.api.answers.length, 0, "a body over the byte ceiling was sent");
+  assert.match(context.node("field-error").textContent, /too long to send/);
 });

@@ -86,6 +86,11 @@ class Dependencies:
     #: a stated reason instead of an ``AttributeError`` three frames deeper.
     load_experience: Callable[..., Any] = field(default=lambda *_: _unwired("load_experience"))
     load_asset: Callable[..., Any] = field(default=lambda *_: _unwired("load_asset"))
+    #: The single authorised read of evaluator-only data, for a flashcard's back.
+    #: Narrow by construction — see
+    #: :func:`learning_studio.service.reveal_component_answer`, which returns one
+    #: string and has no way to return the hidden record.
+    reveal_answer: Callable[..., Any] = field(default=lambda *_: _unwired("reveal_answer"))
 
     def now(self) -> float:
         return float(self.clock())
@@ -138,5 +143,13 @@ def build_dependencies(
         ),
         load_asset=lambda principal, asset_id: service.read_managed_asset(
             principal=principal, asset_id=asset_id, config=resolved
+        ),
+        reveal_answer=lambda principal, experience_id, component_key: (
+            service.reveal_component_answer(
+                principal=principal,
+                experience_id=experience_id,
+                component_key=component_key,
+                config=resolved,
+            )
         ),
     )

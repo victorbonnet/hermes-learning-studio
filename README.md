@@ -847,6 +847,7 @@ with an older captured payload.
 | `POST` | `/api/session` | Bootstrap a session for one experience |
 | `GET` | `/api/session/component` | The component currently in view |
 | `POST` | `/api/session/answer` | Record a response and advance |
+| `POST` | `/api/session/reveal` | Turn a flashcard over, after an attempt |
 | `GET` | `/api/session/result` | Progress summary for the session |
 | `GET` | `/api/assets/{id}` | One managed image, verified on the way out |
 | `GET` | `/`, `/index.html` | The Mini App document |
@@ -1103,7 +1104,7 @@ with like. Nothing is scored yet; this is the wire format that scoring will read
 | `decision_path` | `decisions` of `{step_id, option_id}` |
 | `case_study`, `reflection`, `self_explanation` | `responses`, one per prompt |
 | `confidence_rating` | `rating` (an integer on the declared scale) |
-| `flashcard` | `text` and `self_rating` |
+| `flashcard` | `text` (the frozen attempt) and `self_rating`, after a reveal |
 
 Every shape stays inside the API's own bounds — depth 4, 100 items per container,
 4000 characters per string — which a test checks by walking each completed card.
@@ -1111,10 +1112,42 @@ Every shape stays inside the API's own bounds — depth 4, 100 items per contain
 applying it per field would silently demand forty words twice from somebody told
 forty once.
 
+**One limit contract, derived rather than chosen.** The shortest text containing
+*n* words needs `2n − 1` characters, so a word bound above `(chars + 1) / 2` is a
+requirement nothing could satisfy. The registry used to accept `min_words: 5000`
+against a 4,000-character ceiling: such a component validated, stored, rendered,
+and then refused every possible answer a learner could type. `MAX_WORDS` is now
+`(MAX_RESPONSE_CHARS + 1) // 2` — 2,000 — and a test fails if the two ever drift.
+
+Above the per-string limit sits the request body ceiling
+(`mini_app_max_request_bytes`, 16 KB by default), which is the only *aggregate*
+bound there is: eight prompts can each be inside the character limit and still
+exceed it together. The bootstrap response tells the client both numbers rather
+than the client duplicating them, and the frontend measures the encoded body in
+**bytes** before sending — a `length` check would pass a Japanese answer the
+server then refuses with a 413 the learner could do nothing about.
+
 Ordering cards, `code_response`, and `error_correction` arrive answerable —
 an ordering list is already in *some* order, and the other two are seeded with the
 declared starter code and the passage to be corrected. Every other card refuses an
 empty submission locally, with a localized reason and no request made.
+
+**That order is never the correct one.** An author writes the steps of a
+titration in the order they happen and states the same order under `answer.order`,
+so the visible list *is* the key — and every canonical fixture in this repository
+had exactly that shape. The learner projection therefore rearranges it, using
+`secrets.SystemRandom` rather than a seedable generator, with a guard that rejects
+an arrangement equal to the source so a two-item list is genuinely swapped rather
+than left alone by an unlucky draw. The same applies to `matching.right` and
+`labeling.label_bank`, whose option lists are naturally written parallel to the
+rows they answer.
+
+The shuffle is server-side, in `Component.learner_payload()`, and there is no way
+to ask for "no shuffle" — a frontend that received the correct order and was
+trusted to scramble it would be one bug away from displaying the answer, and the
+bug would be invisible. A `timeline` with `show_dates: false` is served without
+its `date_label` at all, for the same reason: a date is an ordering clue, and
+withholding it beats sending it and trusting the client not to render it.
 
 A component type this build does not know renders an *unsupported* card naming
 the type, and can be skipped — it submits `{"skipped": true}` — so the exercise
@@ -1122,21 +1155,41 @@ is not a dead end. A registry the server validates against can legitimately be
 ahead of a frontend nobody updated; a blank screen would be the dishonest
 response.
 
-**One known gap, stated rather than hidden.** `references/flashcards-and-recall.md`
-tells the agent that a flashcard's reveal "must be explicit and
-keyboard-operable", and this renderer has no reveal at all: the back of the card
-is in the evaluator-only half, the API has no route that returns it, and adding
-one would mean shipping "the server will tell you the answer" before the design
-that governs when it should. So the card collects a written recall and a
-self-rating, and a real reveal arrives with the evaluation runtime that can decide
-it is allowed. Any manifest whose flashcard prompt says *turn the card over* will
-read slightly oddly until then.
+**Turning a flashcard over.** The one place a learner is ever shown something
+from the evaluator-only half, and the only route that discloses any of it. The
+back of the card is not in the payload, so "turn over" is a *request*:
+
+1. the learner writes what they remember and presses **Turn the card over**;
+2. `POST /api/session/reveal` checks the Telegram account, the allowlist, the
+   session, the profile, the learner, the experience, and that the named
+   component is the one the session is currently on;
+3. the attempt is **frozen** — the first one recorded is the one that counts, so
+   a refresh is safe, and a second call carrying a different recall does not
+   replace it;
+4. the server returns one string: `answer.back`. A mapping in `service.py` names
+   the single field of the single type that may ever be disclosed, and
+   `reveal_component_answer` returns a `str` rather than a record, so no code path
+   there could hand back the rubric, the hints, the feedback, the branches, or the
+   mnemonic sitting beside it in the same object.
+
+Submitting is then checked against the frozen attempt: a flashcard cannot be
+submitted before it has been turned over, and the recall cannot be rewritten
+afterwards. Both are enforced server-side, because the frontend is a convenience
+and anybody can post to the route directly. The recall field visibly becomes
+read-only at the moment of the reveal, so the rule is apparent rather than only
+enforced.
+
+This is what `references/flashcards-and-recall.md` has always asked for — "the
+reveal must be explicit and keyboard-operable" — and what the first version of
+this Mini App did not have.
 
 ### What it looks like
 
-| Light, English | Dark, French |
+| Light, English | Dark, French UI over English content |
 | --- | --- |
-| ![Six cards rendered in the light theme with an English interface](docs/screenshots/cards-light.png) | ![The same interface in the dark theme with a French interface](docs/screenshots/cards-dark-fr.png) |
+| ![Six cards rendered in the light theme with an English interface](docs/screenshots/cards-light.png) | ![The same interface in the dark theme with a French interface, showing a flashcard's turn-over control and two ordering cards that are not in their correct order](docs/screenshots/cards-dark-fr.png) |
+
+![Three cards whose managed image failed to load, each showing the exercise's own alternative text as readable content](docs/screenshots/image-fallback.png)
 
 Both were captured at a phone viewport from a deterministic gallery that renders
 the shipped renderers and stylesheet against payloads built by the shipped
@@ -1160,8 +1213,14 @@ executed under Node's built-in test runner against a small DOM shim
 `node:vm`:
 
 ```bash
-uv run pytest tests/test_frontend_js.py     # generates fixtures, then runs node --test
+uv run python tools/run_frontend_tests.py
 ```
+
+That is the whole command, and it is what the Python suite runs too. A bare
+`node --test tests/js/*.test.mjs` does **not** work and is no longer documented as
+though it does: the fixtures have to be generated by Python first and handed over
+by path. Run it that way and the suite fails with a message naming the script,
+rather than passing vacuously.
 
 The component fixtures are generated *by the Python side*, from the real
 component registry through the real `build_component`, so the JavaScript is

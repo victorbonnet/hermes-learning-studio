@@ -39,7 +39,9 @@ answer, and there is no code path here that could — see
 from __future__ import annotations
 
 import re
+import secrets
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -75,6 +77,25 @@ LABEL_MAX = 200
 TEXT_MAX = 1000
 PROMPT_MAX = 2000
 PASSAGE_MAX = 4000
+
+#: The longest a single submitted response string may be, and the largest word
+#: count that can therefore actually be written.
+#:
+#: These two numbers are one decision, not two, and getting that wrong made a
+#: whole class of manifest impossible to complete. The API caps a response string
+#: at :data:`learning_studio.web.security.MAX_RESPONSE_CHARS` characters. The
+#: shortest text containing *n* words is *n* one-character words joined by
+#: *n − 1* spaces, so it needs ``2n − 1`` characters — which means a word bound
+#: above ``(chars + 1) // 2`` is a requirement no learner and no client could
+#: ever satisfy, whatever they typed.
+#:
+#: The bound used to be 5,000 words against a 4,000-character ceiling: a
+#: ``min_words: 5000`` component validated, stored, and rendered, and then
+#: refused every possible answer. It is now derived, and
+#: ``tests/test_components.py`` fails if the derivation and the API's own limit
+#: ever drift apart.
+RESPONSE_CHARS_MAX = 4000
+MAX_WORDS = (RESPONSE_CHARS_MAX + 1) // 2
 
 MAX_OPTIONS = 12
 MAX_ITEMS = 20
@@ -848,8 +869,8 @@ SPECS: tuple[ComponentSpec, ...] = (
         family="text_input",
         summary="Extended writing, judged against a rubric.",
         content=(
-            Int("min_words", minimum=1, maximum=5000),
-            Int("max_words", minimum=1, maximum=5000),
+            Int("min_words", minimum=1, maximum=MAX_WORDS),
+            Int("max_words", minimum=1, maximum=MAX_WORDS),
         ),
         answer=None,
         requires_rubric=True,
@@ -1297,8 +1318,14 @@ SPECS: tuple[ComponentSpec, ...] = (
         family="reflection",
         summary="Explain the reasoning, judged against a rubric.",
         content=(
-            TextList("prompts", max_items=MAX_PROMPT_LIST, max_chars=PROMPT_MAX),
-            Int("min_words", minimum=1, maximum=5000),
+            # Required, exactly as `reflection` requires it. Optional `prompts`
+            # meant a component could validate, store, and then render *no
+            # response field at all* -- an exercise card with nothing to answer,
+            # which submitted an empty `responses` array and advanced. There is
+            # no such thing as a self-explanation with nothing to explain, so the
+            # honest place to say so is here rather than in the renderer.
+            TextList("prompts", required=True, max_items=MAX_PROMPT_LIST, max_chars=PROMPT_MAX),
+            Int("min_words", minimum=1, maximum=MAX_WORDS),
         ),
         answer=None,
         requires_rubric=True,
@@ -1310,7 +1337,7 @@ SPECS: tuple[ComponentSpec, ...] = (
         summary="Look back on the work. A self-report, never marked.",
         content=(
             TextList("prompts", required=True, max_items=MAX_PROMPT_LIST, max_chars=PROMPT_MAX),
-            Int("min_words", minimum=1, maximum=5000),
+            Int("min_words", minimum=1, maximum=MAX_WORDS),
         ),
         answer=None,
         self_report=True,
@@ -1322,8 +1349,8 @@ SPECS: tuple[ComponentSpec, ...] = (
         summary="Open work produced explicitly against named criteria.",
         content=(
             TextList("requirements", max_items=MAX_PROMPT_LIST),
-            Int("min_words", minimum=1, maximum=5000),
-            Int("max_words", minimum=1, maximum=5000),
+            Int("min_words", minimum=1, maximum=MAX_WORDS),
+            Int("max_words", minimum=1, maximum=MAX_WORDS),
         ),
         answer=None,
         requires_rubric=True,
@@ -1517,6 +1544,119 @@ def _content_required(spec: ComponentSpec) -> bool:
 # ── Validation ────────────────────────────────────────────────────────────
 
 
+#: Visible lists whose *order* would otherwise disclose the answer, by type.
+#:
+#: Two different leaks, both mechanical:
+#:
+#: - the ordering families (``sentence_order``, ``sequence_order``, ``timeline``,
+#:   ``process_flow``) are graded on ``answer.order``, and an author naturally
+#:   writes the list in the correct order — so the list *is* the key;
+#:  - ``matching.right`` and ``labeling.label_bank`` are the option lists behind
+#:   each row's ``<select>``, and an author naturally writes them parallel to the
+#:   rows they belong to — so "the first option of the first dropdown" is the key.
+#:
+#: Not listed, deliberately: ``multiple_choice.options`` and friends, where the
+#: answer is an id rather than a position, so the order discloses nothing. Those
+#: types carry their own ``shuffle`` flag for presentation variety, which is a
+#: different concern with a different name.
+ANSWER_BEARING_ORDER: dict[str, tuple[str, ...]] = {
+    "sentence_order": ("tokens",),
+    "sequence_order": ("steps",),
+    "timeline": ("events",),
+    "process_flow": ("stages",),
+    "matching": ("right",),
+    "labeling": ("label_bank",),
+}
+
+#: Content fields that are only meant to be shown when a sibling flag says so.
+#: ``timeline.date_label`` is the case that matters: with ``show_dates`` off the
+#: renderer must not show it, and a projection that carried it anyway would be
+#: shipping the ordering clue to the client and trusting the client not to look.
+GATED_CONTENT: dict[str, tuple[tuple[str, str, str], ...]] = {
+    # (list field, entry field to drop, flag that must be true to keep it)
+    "timeline": (("events", "date_label", "show_dates"),),
+}
+
+
+def _unpredictable_shuffle(items: list[Any]) -> None:
+    """Shuffle in place, using randomness a learner cannot anticipate.
+
+    ``secrets.SystemRandom`` rather than the default ``random`` module: the
+    module-level generator is a Mersenne Twister that can be seeded — and *is*
+    seeded, reproducibly, by anything that calls ``random.seed()`` anywhere in the
+    process — which would make the arrangement of an exercise predictable from
+    outside. This is cheap and it removes the question.
+
+    A fixed transformation such as reversing the list would also "not be the
+    answer", and would be worse than either: it is a pattern a learner learns
+    once and then reads backwards forever.
+    """
+    _SYSTEM_RANDOM.shuffle(items)
+
+
+_SYSTEM_RANDOM = secrets.SystemRandom()
+
+
+def shuffled_content(
+    component_type: str,
+    content: dict[str, Any],
+    *,
+    shuffle: Callable[[list[Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Return ``content`` with any answer-bearing order rearranged.
+
+    Guarantees, each one tested:
+
+    - every entry survives exactly once — this is a permutation, never a filter;
+    - the result differs from the input whenever a different arrangement exists,
+      so a one-item list is returned as it came and a two-item list is genuinely
+      rearranged rather than left alone by an unlucky draw;
+    - identity travels with the opaque ``id``, so duplicate visible labels and
+      per-entry extras (a ``date_label``, coordinates) stay attached to the entry
+      they belong to;
+    - the input is not mutated, and neither is the evaluator-only answer.
+    """
+    fields = ANSWER_BEARING_ORDER.get(component_type, ())
+    gates = GATED_CONTENT.get(component_type, ())
+    if not fields and not gates:
+        return content
+
+    rearrange = shuffle or _unpredictable_shuffle
+    projected = dict(content)
+
+    for field_name in fields:
+        entries = projected.get(field_name)
+        if not isinstance(entries, list) or len(entries) < 2:
+            # Nothing to hide: an empty or single-entry list has exactly one
+            # arrangement, and returning it unchanged is the whole truth.
+            continue
+        order = list(entries)
+        for _attempt in range(8):
+            rearrange(order)
+            if order != entries:
+                break
+        else:
+            # Astronomically unlikely, and a silent no-op here would be the one
+            # outcome that reveals the answer. Rotating by one is guaranteed to
+            # differ for any list of two or more.
+            order = order[1:] + order[:1]
+        projected[field_name] = order
+
+    for list_field, entry_field, flag in gates:
+        if projected.get(flag) is True:
+            continue
+        entries = projected.get(list_field)
+        if isinstance(entries, list):
+            projected[list_field] = [
+                {key: value for key, value in entry.items() if key != entry_field}
+                if isinstance(entry, dict)
+                else entry
+                for entry in entries
+            ]
+
+    return projected
+
+
 @dataclass(frozen=True)
 class Component:
     """One validated component, with its two halves kept apart.
@@ -1543,17 +1683,32 @@ class Component:
             hidden["evaluation"] = self.evaluation
         return hidden
 
-    def learner_payload(self) -> dict[str, Any]:
+    def learner_payload(
+        self, *, shuffle: Callable[[list[Any]], None] | None = None
+    ) -> dict[str, Any]:
         """The safe projection, assembled from an allowlist.
 
         Constructed rather than filtered. A field added to this class later is
         hidden by default and stays hidden until someone deliberately adds it
         to :data:`LEARNER_VISIBLE_KEYS`, which is the failure mode worth
         having: the safe direction is the one you get for free.
+
+        **Omitting the answer is not the same as not showing it.** For the
+        ordering families the *order of the visible list is itself the answer*:
+        an author writes the steps of a titration in the right order and states
+        the same order under ``answer.order``, so a projection that copied the
+        list through displayed the correct sequence to a learner who had only to
+        press Submit. Every canonical fixture in this repository did exactly
+        that. :func:`shuffled_content` is therefore part of the projection, not a
+        nicety the frontend could be trusted to add — the client never receives
+        an answer-bearing order it would have to repair.
+
+        ``shuffle`` exists so tests can make the permutation deterministic. It
+        defaults to an unpredictable one; there is no way to ask for "no shuffle".
         """
         payload: dict[str, Any] = {"id": self.id, "type": self.type, "prompt": self.prompt}
         if self.content:
-            payload["content"] = self.content
+            payload["content"] = shuffled_content(self.type, self.content, shuffle=shuffle)
         if self.accessibility:
             payload["accessibility"] = self.accessibility
         return payload

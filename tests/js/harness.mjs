@@ -120,16 +120,39 @@ export function translatorFor(win, locale) {
  * `requested` records what a card asked for, which is how the tests check that
  * a renderer goes through the loader instead of building a URL of its own.
  */
-export function renderContext(win, { locale = "en", images = "ok" } = {}) {
+export function renderContext(win, options = {}) {
+  const {
+    locale = "en",
+    contentLocale = null,
+    images = "ok",
+    reveal = null,
+  } = options;
   const requested = [];
+  const revealed = [];
   return {
     t: translatorFor(win, locale),
+    uiLocale: translatorFor(win, locale).locale,
+    contentLocale,
     requested,
+    revealed,
     loadImage(assetRef) {
       requested.push(assetRef);
       return images === "ok"
         ? Promise.resolve(`blob:fake/${assetRef}`)
         : Promise.reject(new Error("no image"));
+    },
+    /**
+     * Stands in for the authenticated reveal call.
+     *
+     * Defaults to refusing, so a renderer that somehow displayed the back
+     * without asking would not be able to hide behind a permissive fake.
+     */
+    reveal(attempt) {
+      revealed.push(attempt);
+      if (typeof reveal === "function") {
+        return reveal(attempt);
+      }
+      return Promise.reject({ message: "no reveal configured" });
     },
   };
 }
