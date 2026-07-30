@@ -1,0 +1,80 @@
+<!doctype html>
+<!--
+  The Mini App shell.
+
+  Everything here is structure. No exercise text, no learner data, and no
+  identifier appears in this file: the elements below are empty, and `app.js`
+  fills them from the protected API using `textContent`. That is why the same
+  bytes can be served to an unauthenticated request.
+
+  Nothing is inline. There is no <script> body, no <style> block, and no style
+  attribute, so the document's Content-Security-Policy needs neither
+  'unsafe-inline' nor 'unsafe-eval'. Telegram's SDK is the single external
+  script, loaded first and synchronously because `window.Telegram` must exist
+  before `app.js` runs; the deferred scripts execute in source order after
+  parsing, which is also their dependency order.
+
+  The visible strings are set by `i18n.js` at boot, so nothing localizable is
+  hardcoded here -- including the skip link.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Learning Studio</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="/static/i18n.js" defer></script>
+    <script src="/static/renderers.js" defer></script>
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" id="skip-link" href="#card"></a>
+
+    <header class="top-bar" id="top-bar" hidden>
+      <h1 class="exercise-title" id="exercise-title"></h1>
+      <p class="exercise-meta" id="exercise-meta"></p>
+      <div
+        class="progress-track"
+        id="progress"
+        role="progressbar"
+        aria-valuemin="0"
+        aria-valuenow="0"
+        aria-valuemax="1"
+      >
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <p class="progress-text" id="progress-text"></p>
+    </header>
+
+    <!--
+      The card is the live region for the exercise itself: replacing its
+      contents is what "next question" means, and `tabindex="-1"` is what lets
+      focus follow that change for a screen reader and for the skip link.
+    -->
+    <main class="card" id="card" tabindex="-1" aria-labelledby="exercise-title"></main>
+
+    <!-- Announcements that must not steal focus: errors, recorded answers,
+         connection trouble. Polite, and kept out of the card so that replacing
+         a question does not re-announce the last message. -->
+    <p class="visually-hidden" id="announcer" role="status" aria-live="polite"></p>
+
+    <footer class="actions" id="actions" hidden>
+      <p class="error" id="field-error" hidden></p>
+      <button class="primary" type="button" id="primary-action"></button>
+    </footer>
+
+    <!--
+      The one string in this application that is not localizable, for the one
+      condition under which the code that would localize it cannot run.
+    -->
+    <noscript>
+      <p class="notice">
+        This exercise needs JavaScript. Open it from the Telegram button again,
+        or ask for the exercise in the chat instead.
+      </p>
+    </noscript>
+  </body>
+</html>

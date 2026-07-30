@@ -1,12 +1,21 @@
-"""The protected Mini App API.
+"""The protected Mini App API, and the static shell that calls it.
 
-Six routes, one authentication rule, and no way round it.
+Six API routes, one authentication rule, and no way round it.
 
-**Every route is protected.** Health included. There is no public endpoint, no
-"just for the loading screen" exception, and no development bypass: each
-request must carry a Telegram ``initData`` payload that verifies against the
-bot token, and every route except the bootstrap must additionally carry a
-session token that was minted for *that* Telegram account.
+**Every route that can return learner data is protected.** Health included.
+There is no development bypass: each such request must carry a Telegram
+``initData`` payload that verifies against the bot token, and every route
+except the bootstrap must additionally carry a session token that was minted
+for *that* Telegram account.
+
+**The frontend shell is the one unauthenticated thing here**, and it is not an
+exception to the rule above so much as a consequence of how a webview loads a
+page: the navigation that fetches the document cannot carry a header, so there
+is no request in which the shell could prove who wants it. What is served is
+five checked-in files that are byte-identical for every caller and contain no
+learner data, no identifier, and no configured value — see
+:mod:`learning_studio.web.static_files`. The document that comes back knows
+nothing; it has to ask, with headers, for everything it displays.
 
 **Authorisation is an intersection and it fails closed.** A verified payload
 buys nothing on its own; the account must also be on the profile's Telegram
@@ -57,8 +66,20 @@ from .security import (
     log_unhandled,
     validate_response_value,
 )
+from .static_files import (
+    DOCUMENT,
+    DOCUMENT_CONTENT_SECURITY_POLICY,
+    STATIC_ASSETS,
+    asset_bytes,
+)
 
 logger = logging.getLogger(__name__)
+
+#: The URL paths that receive the document policy — derived from the allowlist's
+#: own ``document`` flag rather than restated, so a second HTML page could not be
+#: added without deciding which policy it runs under. ``/`` is what a Mini App
+#: button opens; ``/index.html`` is what a reload may ask for.
+DOCUMENT_PATHS = frozenset({"/"} | {asset.url_path for asset in STATIC_ASSETS if asset.document})
 
 #: Carries the raw ``initData`` string Telegram handed the webview. A custom
 #: header rather than a cookie or query parameter: cookies are sent by the
@@ -135,6 +156,12 @@ def create_app(dependencies: Dependencies | None = None):
         openapi_url=None,
     )
 
+    # A URL is either in the allowlist or it is a 404. With slash redirection
+    # on, ``/static/app.js/`` and ``/api/health/`` answer 307 towards paths this
+    # server does intend to serve, which quietly makes the reachable URL space
+    # larger than the declared one for no benefit anybody wanted.
+    app.router.redirect_slashes = False
+
     # ── Cross-cutting ────────────────────────────────────────────────────
 
     @app.middleware("http")
@@ -146,6 +173,10 @@ def create_app(dependencies: Dependencies | None = None):
             response = JSONResponse({"error": INTERNAL}, status_code=500)
         for header, value in SECURITY_HEADERS.items():
             response.headers[header] = value
+        if request.url.path in DOCUMENT_PATHS:
+            # The one response that may execute anything, and therefore the only
+            # one whose policy has to say what it may execute.
+            response.headers["Content-Security-Policy"] = DOCUMENT_CONTENT_SECURITY_POLICY
         return response
 
     @app.exception_handler(ApiError)
@@ -306,6 +337,27 @@ def create_app(dependencies: Dependencies | None = None):
             raise ApiError(404, NOT_FOUND, reason="experience_not_found") from exc
         except ServiceError as exc:
             raise ApiError(400, BAD_REQUEST, reason="experience_unavailable") from exc
+
+    # ── The static shell ─────────────────────────────────────────────────
+    #
+    # One route per file, bound at startup. No path parameter, no directory
+    # walk, no ``StaticFiles`` mount: the set of URLs this server answers is
+    # written down in ``static_files.STATIC_ASSETS`` and nowhere else.
+
+    def serve_static(asset):
+        async def serve():
+            return Response(content=asset_bytes(asset.filename), media_type=asset.media_type)
+
+        return serve
+
+    for static_asset in STATIC_ASSETS:
+        app.add_api_route(
+            static_asset.url_path,
+            serve_static(static_asset),
+            methods=["GET"],
+            include_in_schema=False,
+        )
+    app.add_api_route("/", serve_static(DOCUMENT), methods=["GET"], include_in_schema=False)
 
     # ── Routes ───────────────────────────────────────────────────────────
 
