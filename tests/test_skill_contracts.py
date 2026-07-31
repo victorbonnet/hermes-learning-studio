@@ -479,3 +479,83 @@ def test_ui_reference_examples_span_unrelated_subjects(references: dict[str, str
         f"references/{name}.md illustrates only {represented}; "
         f"examples must span unrelated subjects"
     )
+
+
+# ── The renderer exists; nothing launches it ───────────────────────────────
+#
+# Both halves matter, and the guidance was wrong about the first for a whole PR:
+# it told the agent there was no card renderer and no Mini App, which had stopped
+# being true. A skill that understates what exists routes work to chat that had a
+# better destination; one that overstates it describes a screen nobody can see.
+
+
+def test_the_skill_says_a_trusted_renderer_exists(skill_md: str):
+    assert_states(
+        skill_md,
+        (
+            r"(trusted )?card renderer now exists|mini app that renders",
+            r"every component type|thirty-one|31 component",
+        ),
+        "renderer availability",
+    )
+
+
+def test_the_skill_still_says_nothing_launches_it(skill_md: str):
+    """The half that keeps the agent honest about what the learner can see."""
+    assert_states(
+        skill_md,
+        (
+            r"nothing in this release\s+starts the server|no launch tool",
+            r"deliver exercises in conversation|delivered? .{0,20}in conversation",
+        ),
+        "launch scope",
+    )
+
+
+def test_the_skill_does_not_claim_the_renderer_is_missing(skill_md: str):
+    """The specific stale sentences, so they cannot come back by copy-paste."""
+    stale = (
+        "no card renderer",
+        "no mini app",
+        "there is still no delivery runtime",
+    )
+    body = normalize(skill_md)
+
+    present = [phrase for phrase in stale if phrase in body]
+    assert present == [], f"the skill still claims the renderer is absent: {present}"
+
+
+def test_the_skill_says_the_agent_writes_manifests_not_frontend_code(skill_md: str):
+    assert_states(
+        skill_md,
+        (
+            r"you write manifests; you never write frontend code"
+            r"|never write, generate, or emit html",
+            r"validated, inert data|declarative",
+        ),
+        "manifest-not-code",
+    )
+
+
+def test_the_skill_says_learning_intent_is_enough_to_start(skill_md: str):
+    """Nobody should have to know an internal skill name to be taught."""
+    assert_states(
+        skill_md,
+        (
+            r"nobody has to ask for this by name"
+            r"|do not make somebody\s+guess an internal skill name",
+            r"practise|revise|tested on",
+        ),
+        "activation without jargon",
+    )
+
+
+def test_the_repository_states_the_renderer_consistently():
+    """One claim, in three places that a reader might check."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for document in ("README.md", "SECURITY.md"):
+        body = normalize((root / document).read_text(encoding="utf-8"))
+        assert "no mini app" not in body, f"{document} still says there is no Mini App"
+        assert "no card renderer" not in body, f"{document} still says there is no renderer"

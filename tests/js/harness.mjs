@@ -32,9 +32,11 @@ export function payloads() {
   const path = process.env.LS_PAYLOADS;
   if (!path) {
     throw new Error(
-      "LS_PAYLOADS is not set. This suite is driven by `uv run pytest " +
-        "tests/test_frontend_js.py`, which generates the payload fixture from the " +
-        "component registry so that it cannot drift from the server."
+      "LS_PAYLOADS is not set, so there are no component fixtures to test against.\n" +
+        "Run the suite with:\n\n" +
+        "    uv run python tools/run_frontend_tests.py\n\n" +
+        "That command generates the fixtures from the component registry and hands " +
+        "them over, which is why a bare `node --test` cannot work on its own."
     );
   }
   return JSON.parse(readFileSync(path, "utf8"));

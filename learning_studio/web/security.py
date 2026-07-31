@@ -16,11 +16,15 @@ logger = logging.getLogger("learning_studio.web")
 
 #: Sent on every response, success or failure.
 #:
-#: ``default-src 'none'`` with per-directive opt-ins is the shape to keep: this
-#: PR serves JSON and images and nothing else, so scripts and styles are
-#: refused outright. When a later PR adds the card renderer it will have to
-#: widen ``script-src`` deliberately, in a diff where that is the visible
-#: change, rather than inheriting a policy that already allowed it.
+#: ``default-src 'none'`` with per-directive opt-ins is the shape to keep. This
+#: is the policy for the *API*: it serves JSON and images and nothing else, so
+#: scripts and styles are refused outright.
+#:
+#: The frontend needs more than that, and it does not get it here. The document
+#: carries its own, wider policy —
+#: :data:`learning_studio.web.static_files.DOCUMENT_CONTENT_SECURITY_POLICY` —
+#: which is the only response that may execute anything. Keeping the two apart
+#: means the API's policy never had to be widened for the renderer at all.
 #:
 #: ``frame-ancestors`` is what lets Telegram — and only Telegram — embed the
 #: Mini App. ``X-Frame-Options`` is deliberately absent: it cannot express

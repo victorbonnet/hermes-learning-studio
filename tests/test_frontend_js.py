@@ -61,26 +61,64 @@ def test_the_fixtures_carry_no_hidden_field_before_node_is_asked_to_check():
     assert CANARY in json.dumps({name: example(name) for name in COMPONENT_TYPES})
 
 
-def test_the_fixture_generator_shuffles_every_answer_bearing_order():
-    """The fixtures the frontend sees must not be the ones that leak.
+def test_the_fixture_generator_serves_no_canonical_identifier():
+    """The payloads the frontend suite asserts against must be the safe ones.
 
-    Generated through the real projection, so this is the same guarantee
-    ``tests/test_answer_order_privacy.py`` makes of the server — restated here
-    because these are the payloads the JavaScript suite asserts against.
+    Two properties at once, and the second is the one a JavaScript test could not
+    check for itself: the arrangement is not the answer, and the identifiers on
+    the card are aliases, so nothing in the fixture can be sorted back into the
+    order the manifest was authored in.
     """
     from learning_studio.components import ANSWER_BEARING_ORDER, build_component
 
     fixtures = _runner().component_fixtures()
 
-    for component_type, fields in ANSWER_BEARING_ORDER.items():
+    for component_type, rules in ANSWER_BEARING_ORDER.items():
         source = build_component(example(component_type), "component")
-        for field_name in fields:
-            shown = [
-                entry["id"] for entry in fixtures[component_type]["payload"]["content"][field_name]
-            ]
-            original = [entry["id"] for entry in source.content[field_name]]
-            assert sorted(shown) == sorted(original)
-            assert shown != original, f"{component_type}.{field_name} was handed over in order"
+        served = fixtures[component_type]["payload"]["content"]
+        for rule in rules:
+            shown = [entry["id"] for entry in served[rule.field]]
+            canonical = [entry["id"] for entry in source.content[rule.field]]
+            assert len(shown) == len(canonical)
+            assert not set(shown) & set(canonical), (
+                f"{component_type}.{rule.field} was handed over with canonical identifiers"
+            )
+
+
+def _declared_identifiers(node, found: set[str]) -> None:
+    """Every ``id`` anywhere in a content structure."""
+    if isinstance(node, dict):
+        if isinstance(node.get("id"), str):
+            found.add(node["id"])
+        for value in node.values():
+            _declared_identifiers(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _declared_identifiers(value, found)
+
+
+def test_no_fixture_contains_a_canonical_content_identifier():
+    """Across every type, not only the answer-bearing ones.
+
+    An id is a name an author chose, and authors name things after what they are:
+    `correct`, `distractor-1`, `t1`. None of that reaches a learner.
+    """
+    import json
+
+    from learning_studio.components import build_component
+
+    fixtures = _runner().component_fixtures()
+
+    for component_type in COMPONENT_TYPES:
+        source = build_component(example(component_type), "component")
+        declared: set[str] = set()
+        _declared_identifiers(source.content, declared)
+
+        served = json.dumps(fixtures[component_type]["payload"].get("content", {}))
+        for identifier in declared:
+            assert f'"{identifier}"' not in served, (
+                f"{component_type} served the canonical identifier {identifier}"
+            )
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed; the frontend suite needs it")

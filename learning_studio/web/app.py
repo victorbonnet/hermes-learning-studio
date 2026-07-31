@@ -64,6 +64,11 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from ..responses import (
+    INVALID_RESPONSE_MESSAGE,
+    ResponseContractError,
+    validate_component_response,
+)
 from ..service import REVEALABLE_ANSWER_FIELDS, NotFoundError, ServiceError
 from ..sessions import SessionError, SessionScope
 from ..telegram_auth import InitDataError, verify_init_data
@@ -472,12 +477,33 @@ def create_app(dependencies: Dependencies | None = None):
             raise ApiError(409, "That is not the current question.", reason="component_mismatch")
 
         try:
-            response = validate_response_value(payload.get("response"))
+            submitted = validate_response_value(payload.get("response"))
         except InvalidResponseValue as exc:
             raise ApiError(400, BAD_REQUEST, reason="response_invalid") from exc
 
+        # Generic bounds are not a contract. What follows checks the response
+        # against *this* component — its declared shape, its required fields, and
+        # the identifiers this learner was actually served — and translates the
+        # served aliases back into the ones an evaluator will read. Both happen
+        # before any session state moves, so a refused response leaves the
+        # exercise exactly where it was.
+        aliases = deps.component_aliases(
+            deps.principal(verified.user_id),
+            session.scope.experience_id,
+            current["component_id"],
+        )
+        try:
+            response = validate_component_response(
+                current["type"],
+                current["payload"].get("content", {}),
+                submitted,
+                resolve=lambda alias: aliases.get(alias, alias),
+            )
+        except ResponseContractError as exc:
+            raise ApiError(400, INVALID_RESPONSE_MESSAGE, reason=exc.reason) from exc
+
         if current["type"] in REVEALABLE_ANSWER_FIELDS:
-            _enforce_reveal_contract(session, current["component_id"], response)
+            _enforce_reveal_contract(session, current["component_id"], submitted)
 
         session.answers[current["component_id"]] = response
         session.position += 1
@@ -545,8 +571,12 @@ def create_app(dependencies: Dependencies | None = None):
         except InvalidResponseValue as exc:
             raise ApiError(400, BAD_REQUEST, reason="attempt_invalid") from exc
 
-        frozen = session.freeze_attempt(current["component_id"], attempt)
-
+        # Retrieve *before* committing anything. Freezing first meant a card that
+        # could not be turned over — the wrong type, a transient failure reading
+        # the store — still recorded the attempt that bought the reveal, and the
+        # learner was then held to a recall they never got an answer for. Now a
+        # failed reveal changes nothing and the next attempt is the one that
+        # counts.
         try:
             back = deps.reveal_answer(
                 deps.principal(verified.user_id),
@@ -557,6 +587,10 @@ def create_app(dependencies: Dependencies | None = None):
             raise ApiError(404, NOT_REVEALABLE, reason="nothing_to_reveal") from exc
         except ServiceError as exc:
             raise ApiError(409, NOT_REVEALABLE, reason="type_not_revealable") from exc
+
+        # Committed only now, and only once: a repeat keeps the first attempt, so
+        # a refresh is safe and a second try with a better recall is not.
+        frozen = session.freeze_attempt(current["component_id"], attempt)
 
         log_request(
             event="answer_revealed",

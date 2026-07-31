@@ -55,6 +55,21 @@ def ids(entries: list[dict]) -> list[str]:
     return [entry["id"] for entry in entries]
 
 
+def served(component, **kwargs):
+    """The projection a learner receives, and the key to reading it back."""
+    return component.project(**kwargs)
+
+
+def canonical_order(projection, field: str) -> list[str]:
+    """The visible arrangement, translated back into canonical identifiers.
+
+    Every assertion about *order* has to go through this now: the ids on the card
+    are aliases, so comparing them to an answer key directly would compare two
+    different vocabularies and pass for the wrong reason.
+    """
+    return [projection.aliases[entry["id"]] for entry in projection.payload["content"][field]]
+
+
 # ── The leak itself ───────────────────────────────────────────────────────
 
 
@@ -81,7 +96,7 @@ def test_the_projected_order_is_not_the_answer(component_type: str):
     correct = component.answer[answer_field]
 
     for _attempt in range(40):
-        shown = ids(component.learner_payload()["content"][visible_field])
+        shown = canonical_order(served(component), visible_field)
         assert shown != correct, f"{component_type} was served in its correct order"
 
 
@@ -94,7 +109,7 @@ def test_a_choice_list_is_not_served_parallel_to_its_rows(component_type: str):
         "the fixture is no longer authored in answer order, so this test proves nothing"
     )
     for _attempt in range(40):
-        shown = ids(component.learner_payload()["content"][visible_field])
+        shown = canonical_order(served(component), visible_field)
         assert shown != answer_order(component.answer)
 
 
@@ -102,8 +117,8 @@ def test_a_choice_list_is_not_served_parallel_to_its_rows(component_type: str):
 def test_submitting_the_order_as_shown_is_not_correct_by_construction(component_type: str):
     """The learner-visible arrangement must not double as a correct submission."""
     component = build(component_type)
-    visible_field = ANSWER_BEARING_ORDER[component_type][0]
-    shown = ids(component.learner_payload()["content"][visible_field])
+    visible_field = ANSWER_BEARING_ORDER[component_type][0].field
+    shown = canonical_order(served(component), visible_field)
 
     if component_type in LEAK_SHAPES:
         assert shown != component.answer["order"]
@@ -118,23 +133,27 @@ def test_submitting_the_order_as_shown_is_not_correct_by_construction(component_
 @pytest.mark.parametrize("component_type", ORDERING_TYPES + tuple(CHOICE_LIST_SHAPES))
 def test_every_entry_survives_exactly_once(component_type: str):
     component = build(component_type)
-    visible_field = ANSWER_BEARING_ORDER[component_type][0]
+    visible_field = ANSWER_BEARING_ORDER[component_type][0].field
     source = component.content[visible_field]
 
     # Compared as an id → entry map so the assertion is about identity rather
     # than position, and so a gated field the projection withholds (a timeline's
     # `date_label`) does not read as a lost entry.
-    def by_id(entries: list[dict]) -> dict[str, dict]:
+    def by_id(entries: list[dict], translate=None) -> dict[str, dict]:
         return {
-            entry["id"]: {k: v for k, v in entry.items() if k != "date_label"} for entry in entries
+            (translate[entry["id"]] if translate else entry["id"]): {
+                key: value for key, value in entry.items() if key not in {"date_label", "id"}
+            }
+            for entry in entries
         }
 
     for _attempt in range(20):
-        shown = component.learner_payload()["content"][visible_field]
+        projection = served(component)
+        shown = projection.payload["content"][visible_field]
         assert len(shown) == len(source)
-        assert sorted(ids(shown)) == sorted(ids(source))
-        # Entries travel whole: an id never picks up another entry's text.
-        assert by_id(shown) == by_id(source)
+        assert sorted(projection.aliases[entry["id"]] for entry in shown) == sorted(ids(source))
+        # Entries travel whole: an alias never picks up another entry's text.
+        assert by_id(shown, projection.aliases) == by_id(source)
 
 
 def test_the_source_component_is_never_mutated():
@@ -202,17 +221,70 @@ def test_an_already_scrambled_source_is_still_rearranged_safely():
 
 
 def test_a_degenerate_shuffle_cannot_leave_the_answer_showing():
-    """An injected shuffle that does nothing must still not return the source.
+    """An injected shuffle that does nothing must still not return the answer.
 
-    The guard matters because "shuffle" is the only thing standing between the
+    The guard matters because the shuffle is the only thing standing between the
     learner and the key: a no-op has to be corrected, not trusted.
     """
     content = {"steps": [{"id": name, "text": name} for name in ("a", "b", "c", "d")]}
+    answer = {"order": ["a", "b", "c", "d"]}
 
-    shown = ids(shuffled_content("sequence_order", content, shuffle=lambda items: None)["steps"])
+    shown = ids(
+        shuffled_content("sequence_order", content, answer=answer, shuffle=lambda items: None)[
+            "steps"
+        ]
+    )
 
-    assert shown != ["a", "b", "c", "d"]
+    assert shown != answer["order"]
     assert sorted(shown) == ["a", "b", "c", "d"]
+
+
+def test_a_shuffle_that_proposes_the_answer_is_overruled():
+    """The defect this replaced: the projection compared against the *source*.
+
+    A manifest may legitimately be authored pre-scrambled — the source order is
+    then not the answer — and a shuffle landing on the answer passed the old
+    check, because it was different from what the author had typed.
+    """
+    content = {"steps": [{"id": "b", "text": "B"}, {"id": "a", "text": "A"}]}
+    answer = {"order": ["a", "b"]}
+
+    def propose_the_answer(items):
+        items.sort(key=lambda entry: answer["order"].index(entry["id"]))
+
+    for _attempt in range(20):
+        shown = ids(
+            shuffled_content("sequence_order", content, answer=answer, shuffle=propose_the_answer)[
+                "steps"
+            ]
+        )
+        assert shown != answer["order"]
+        assert sorted(shown) == ["a", "b"]
+
+
+@pytest.mark.parametrize("component_type", ORDERING_TYPES + tuple(CHOICE_LIST_SHAPES))
+def test_a_pre_scrambled_manifest_is_still_never_served_in_answer_order(component_type: str):
+    """Source order and answer order genuinely differ, and only one is forbidden."""
+    component = build(component_type)
+    field = ANSWER_BEARING_ORDER[component_type][0]
+    forbidden = field.forbidden(component.answer)
+
+    # Author the source in an order that is not the answer.
+    scrambled = list(reversed(component.content[field.field]))
+    content = {**component.content, field.field: scrambled}
+    assert ids(scrambled) != forbidden
+
+    def propose_the_answer(items):
+        items.sort(key=lambda entry: forbidden.index(entry["id"]))
+
+    shown = ids(
+        shuffled_content(
+            component_type, content, answer=component.answer, shuffle=propose_the_answer
+        )[field.field]
+    )
+
+    assert shown != forbidden
+    assert sorted(shown) == sorted(ids(scrambled))
 
 
 def test_a_type_with_no_answer_bearing_order_is_left_alone():
@@ -221,7 +293,11 @@ def test_a_type_with_no_answer_bearing_order_is_left_alone():
     source = ids(component.content["options"])
 
     for _attempt in range(20):
-        assert ids(component.learner_payload()["content"]["options"]) == source
+        projection = served(component)
+        shown = [
+            projection.aliases[entry["id"]] for entry in projection.payload["content"]["options"]
+        ]
+        assert shown == source
 
 
 # ── Gated content ─────────────────────────────────────────────────────────
@@ -258,8 +334,11 @@ def test_a_timeline_that_shows_dates_keeps_each_date_with_its_own_event():
     expected = {"perry": "1853", "alliance": "1866", "restoration": "1868"}
 
     for _attempt in range(20):
-        events = component.learner_payload()["content"]["events"]
-        assert {event["id"]: event["date_label"] for event in events} == expected
+        projection = served(component)
+        events = projection.payload["content"]["events"]
+        assert {
+            projection.aliases[event["id"]]: event["date_label"] for event in events
+        } == expected
 
 
 def test_the_gate_list_names_only_real_fields():
@@ -276,10 +355,13 @@ def test_the_gate_list_names_only_real_fields():
 def test_the_order_table_names_only_real_fields():
     from learning_studio.components import SPEC_BY_TYPE
 
-    for component_type, fields in ANSWER_BEARING_ORDER.items():
+    for component_type, rules in ANSWER_BEARING_ORDER.items():
         content_fields = {field.name for field in SPEC_BY_TYPE[component_type].content}
-        for field_name in fields:
-            assert field_name in content_fields, f"{component_type}.{field_name}"
+        for rule in rules:
+            assert rule.field in content_fields, f"{component_type}.{rule.field}"
+            # And the rule really reads an arrangement out of the answer, rather
+            # than silently returning nothing and forbidding nothing.
+            assert rule.forbidden(build(component_type).answer)
 
 
 # ── Nothing else leaks along the way ─────────────────────────────────────

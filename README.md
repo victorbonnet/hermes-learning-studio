@@ -220,14 +220,17 @@ own bundled skills use for sibling files, and warns explicitly against the
 against a real Hermes checkout, and fails if Hermes ever fixes the plugin path
 so the workaround can be removed.
 
-**The skill tells the truth about its own scope.** `SKILL.md` states plainly
-that this foundation has no tools and no persistence, because a skill that
-implies otherwise sends the agent after tools that do not exist. A test fails if
-the skill body references tool names while `register()` registers no tools, and
-textual contract tests pin the load-bearing rules: what may launch without
-asking, that a missing tool falls back to chat, that exercises are declarative
-data rather than generated frontend code, that image assets come from real tool
-results, and who owns which memory store.
+**The skill tells the truth about its own scope.** A skill that overstates what
+exists sends the agent after tools that are not there; one that understates it
+sends the agent to chat when a better route is available. `SKILL.md` therefore
+names the four tools it has, says that a trusted renderer for all thirty-one
+component types exists, and says just as plainly that **nothing launches it yet**
+— so an exercise is prepared for that renderer and delivered in conversation until
+the launch tooling lands. Textual contract tests pin the load-bearing rules: what
+may launch without asking, that a missing tool falls back to chat, that the agent
+writes validated manifests and never frontend code, that a learner never has to
+name an internal skill for the workflow to start, that image assets come from real
+tool results, and who owns which memory store.
 
 **Subject-agnostic by construction.** No subject is the plugin's default.
 Examples span language learning, programming, history, and science, and a test
@@ -1253,9 +1256,9 @@ languages. See [The Mini App interface](#the-mini-app-interface).
 Deliberately **not** here yet: image-generation providers, anything that starts
 or supervises the server process, Cloudflare tunnels, slash commands, sending a
 Telegram launch button, launch/status/stop tools, scoring, attempt and score
-storage, progress dashboards, and any scheduler. Each lands in a later PR. The
-skill describes how the agent will use those capabilities and instructs it to
-fall back to chat until they exist.
+storage, progress dashboards, and any scheduler. The skill says which of these
+exist and which do not, and instructs the agent to deliver in conversation until
+the launch tooling lands.
 
 An exercise can now be served *and rendered*, but nothing starts the server, so
 in practice the agent still delivers exercises in conversation until the launch

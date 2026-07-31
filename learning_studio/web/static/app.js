@@ -164,10 +164,23 @@
       var root = doc.documentElement;
       root.setAttribute("data-theme", telegram.colorScheme === "dark" ? "dark" : "light");
       var params = telegram.themeParams || {};
+      if (!root.style) {
+        return;
+      }
       THEME_KEYS.forEach(function (key) {
         var value = params[key];
-        if (typeof value === "string" && COLOUR.test(value) && root.style) {
-          root.style.setProperty("--tg-" + key.replace(/_/g, "-"), value);
+        var property = "--tg-" + key.replace(/_/g, "-");
+        if (typeof value === "string" && COLOUR.test(value)) {
+          root.style.setProperty(property, value);
+        } else {
+          // Removed rather than left alone. `themeChanged` sends a whole palette,
+          // and a key that is absent this time — or arrives malformed — means the
+          // client no longer has a colour for it. Keeping the previous value
+          // would paint a light-theme background under dark-theme text, which is
+          // exactly the case a switch between themes produces. Removing the
+          // property hands the decision back to the stylesheet, whose fallbacks
+          // are contrast-checked.
+          root.style.removeProperty(property);
         }
       });
     }

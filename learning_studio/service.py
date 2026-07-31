@@ -2184,7 +2184,8 @@ def _insert_experience(
     )
 
     for position, component in enumerate(manifest.components, start=1):
-        payload = component.learner_payload()
+        projection = component.project()
+        payload = projection.payload
         _assert_payload_is_safe(payload, component)
         component_row_id = _new_id()
         conn.execute(
@@ -2205,6 +2206,13 @@ def _insert_experience(
             ),
         )
         hidden = component.hidden()
+        if projection.aliases:
+            # The alias map belongs with the evaluator's data and nowhere else:
+            # it is the one thing that turns a learner-facing identifier back into
+            # the one an answer key names. Stored under its own key so that
+            # `reveal_component_answer`, which reads `answer`, cannot reach it and
+            # a future reader has to ask for it deliberately.
+            hidden = {**hidden, "aliases": projection.aliases}
         if hidden:
             conn.execute(
                 "INSERT INTO experience_component_evaluations"
@@ -2365,6 +2373,59 @@ REVEALABLE_ANSWER_FIELDS: dict[str, str] = {"flashcard": "back"}
 #: "not that type", and "nothing stored", for the usual reason: the difference
 #: would turn the route into a description of somebody's exercise.
 NOT_REVEALABLE_MESSAGE = "There is nothing to turn over on this card."
+
+
+def component_aliases(
+    *,
+    principal: Principal,
+    experience_id: str,
+    component_key: str,
+    config: LearningStudioConfig | None = None,
+) -> dict[str, str]:
+    """The ``alias -> canonical`` map for one component, or an empty map.
+
+    Read to translate a submitted response back into the identifiers an evaluator
+    will eventually compare against. Scoped in SQL by profile, learner,
+    experience, and component key, exactly like every other learner-owned read —
+    so a session for one experience cannot obtain the mapping for another, and a
+    mapping for a component that does not exist is an empty map rather than an
+    error a caller could learn from.
+
+    Returns only the mapping. The row it comes from also holds the answer, the
+    rubric, the hints and the branching; none of those leaves this function.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            return {}
+
+        row = conn.execute(
+            "SELECT e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ? AND c.component_key = ?"
+            "   AND c.profile_id = ? AND c.learner_id = ?"
+            "   AND e.profile_id = ? AND e.learner_id = ?",
+            (
+                str(experience_id),
+                str(component_key),
+                profile,
+                learner_id,
+                profile,
+                learner_id,
+            ),
+        ).fetchone()
+
+    if row is None:
+        return {}
+    stored = json.loads(str(row["evaluation"])).get("aliases")
+    if not isinstance(stored, dict):
+        return {}
+    return {str(alias): str(canonical) for alias, canonical in stored.items()}
 
 
 def reveal_component_answer(

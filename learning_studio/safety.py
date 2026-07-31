@@ -24,13 +24,16 @@ The design rule is **inert text or nothing**:
 
 **A known limitation, stated plainly.** These rules make it impossible to ship
 HTML, CSS, or JavaScript *as subject matter* through the manifest: a lesson on
-the box model cannot put ``<div>`` in a prompt. That is a deliberate trade —
-this PR has no renderer, and a store that accepts markup before a renderer
-exists is a store that will be read by one that forgets to escape it. Those
-subjects are still teachable in conversation, which is where the skill already
-delivers exercises. Lifting the restriction needs a reviewed, explicitly
-escaped inert-code channel, and that belongs with the renderer that would have
-to honour it.
+the box model cannot put ``<div>`` in a prompt. Those subjects are still
+teachable in conversation, which is where the skill delivers exercises today.
+
+The trade is deliberate and it survives the renderer now existing. That renderer
+does escape everything it displays — it writes text with ``textContent`` and
+builds elements one at a time, so a stored ``<div>`` would appear as those five
+characters. But the store is read by more than one consumer over its lifetime,
+and this restriction is the layer that does not depend on the next one being as
+careful. Lifting it needs a reviewed, explicitly escaped inert-code channel with
+a name of its own, not an assumption about who reads the field.
 
 Every check is a fixed rule over the string. Nothing here asks a model whether
 something is safe.

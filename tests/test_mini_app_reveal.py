@@ -74,6 +74,12 @@ def deps(hermes_home, clock, config, allowlist) -> Dependencies:
         load_asset=lambda principal, asset_id: service.read_managed_asset(
             principal=principal, asset_id=asset_id, config=config
         ),
+        component_aliases=lambda principal, experience_id, component_key: service.component_aliases(
+            principal=principal,
+            experience_id=experience_id,
+            component_key=component_key,
+            config=config,
+        ),
         reveal_answer=lambda principal, experience_id, component_key: (
             service.reveal_component_answer(
                 principal=principal,
@@ -562,3 +568,111 @@ def test_the_reveal_writes_no_secret_to_the_logs(client, flashcard_experience, c
     assert "my private recall" not in written
     assert token not in written
     assert BOT_TOKEN not in written
+
+
+# ── A failed reveal changes nothing ───────────────────────────────────────
+
+
+def test_a_failed_reveal_leaves_the_session_untouched(
+    client, deps, flashcard_experience, monkeypatch
+):
+    """The reported defect: the attempt was frozen before the reveal succeeded.
+
+    Attempt A hits a failure; attempt B succeeds. B must be the frozen recall — if
+    A had been committed, the learner would be held forever to a recall they never
+    received an answer for, and no retry could correct it.
+    """
+    failures = {"count": 0}
+    real = deps.reveal_answer
+
+    def fail_once(*args):
+        failures["count"] += 1
+        if failures["count"] == 1:
+            raise service.ServiceError("the store was unavailable")
+        return real(*args)
+
+    object.__setattr__(deps, "reveal_answer", fail_once)
+    token = open_session(client, flashcard_experience)
+
+    first = client.post(
+        "/api/session/reveal",
+        json={"component_id": "card-one", "attempt": "attempt A"},
+        headers=headers(token),
+    )
+    assert first.status_code >= 400
+    assert FLASHCARD_BACK not in first.text
+
+    second = client.post(
+        "/api/session/reveal",
+        json={"component_id": "card-one", "attempt": "attempt B"},
+        headers=headers(token),
+    )
+
+    assert second.status_code == 200
+    assert second.json()["attempt"] == "attempt B", "the failed attempt was committed"
+    assert second.json()["back"] == FLASHCARD_BACK
+
+    # And the submission is checked against B, not A.
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "card-one", "response": {"text": "attempt A", "self_rating": "good"}},
+        headers=headers(token),
+    )
+    assert refused.status_code == 409
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "card-one", "response": {"text": "attempt B", "self_rating": "good"}},
+        headers=headers(token),
+    )
+    assert accepted.status_code == 200
+
+
+def test_a_reveal_of_an_unrevealable_type_commits_nothing(client, hermes_home, principal, config):
+    """The other way a reveal fails: the card has nothing to turn over.
+
+    The card must remain submittable afterwards, which it would not be if the
+    refused reveal had left a frozen attempt behind demanding a match.
+    """
+    experience_id = make_experience(principal, config, [example("true_false", id="only-card")])
+    token = open_session(client, experience_id)
+
+    refused = client.post(
+        "/api/session/reveal",
+        json={"component_id": "only-card", "attempt": "peeking"},
+        headers=headers(token),
+    )
+    assert refused.status_code in (404, 409)
+
+    answered = client.post(
+        "/api/session/answer",
+        json={"component_id": "only-card", "response": {"value": True}},
+        headers=headers(token),
+    )
+
+    assert answered.status_code == 200
+
+
+def test_a_failed_reveal_does_not_count_as_having_turned_the_card_over(
+    client, deps, flashcard_experience
+):
+    """A refused reveal must not unlock the submission it was refusing."""
+
+    def always_fail(*args):
+        raise service.ServiceError("unavailable")
+
+    object.__setattr__(deps, "reveal_answer", always_fail)
+    token = open_session(client, flashcard_experience)
+
+    client.post(
+        "/api/session/reveal",
+        json={"component_id": "card-one", "attempt": "attempt A"},
+        headers=headers(token),
+    )
+    submitted = client.post(
+        "/api/session/answer",
+        json={"component_id": "card-one", "response": {"text": "attempt A", "self_rating": "good"}},
+        headers=headers(token),
+    )
+
+    assert submitted.status_code == 409

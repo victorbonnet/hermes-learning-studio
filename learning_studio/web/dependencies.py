@@ -91,6 +91,15 @@ class Dependencies:
     #: :func:`learning_studio.service.reveal_component_answer`, which returns one
     #: string and has no way to return the hidden record.
     reveal_answer: Callable[..., Any] = field(default=lambda *_: _unwired("reveal_answer"))
+    #: ``alias -> canonical`` for one component. Returns the mapping and nothing
+    #: else; an unknown component yields an empty map rather than an error.
+    #:
+    #: Unwired by default rather than defaulting to "no aliases". An empty map is
+    #: a *valid* answer for a component that declares no identifiers, so a default
+    #: that returned one would make a half-wired application store learner-facing
+    #: aliases as though they were canonical — quietly, and only discovered by
+    #: whatever tried to grade them later.
+    component_aliases: Callable[..., Any] = field(default=lambda *_: _unwired("component_aliases"))
 
     def now(self) -> float:
         return float(self.clock())
@@ -143,6 +152,12 @@ def build_dependencies(
         ),
         load_asset=lambda principal, asset_id: service.read_managed_asset(
             principal=principal, asset_id=asset_id, config=resolved
+        ),
+        component_aliases=lambda principal, experience_id, component_key: service.component_aliases(
+            principal=principal,
+            experience_id=experience_id,
+            component_key=component_key,
+            config=resolved,
         ),
         reveal_answer=lambda principal, experience_id, component_key: (
             service.reveal_component_answer(

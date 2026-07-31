@@ -15,6 +15,7 @@ frontend's word check, the API's per-string ceiling, and the HTTP body ceiling.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 
@@ -22,6 +23,7 @@ import pytest
 
 from learning_studio.components import (
     MAX_WORDS,
+    MINIMUM_REQUEST_BYTES,
     PASSAGE_MAX,
     RESPONSE_CHARS_MAX,
     ComponentError,
@@ -250,3 +252,100 @@ def test_the_aggregate_ceiling_is_the_request_body_limit_not_the_string_limit():
 
     assert validate_response_value(payload) == payload
     assert len(json.dumps(payload).encode("utf-8")) > limit
+
+
+# ── Every accepted configuration, not just the default one ────────────────
+
+
+def accepted_request_sizes() -> list[int]:
+    """The minimum, the default, and the maximum an operator may configure."""
+    import re
+
+    import learning_studio.config as configuration
+
+    source = inspect.getsource(configuration)
+    match = re.search(
+        r'"mini_app_max_request_bytes": lambda raw, key: _bounded_int\(\s*raw, key, '
+        r"([A-Z_]+|\d[\d_]*), ([\d_]+)\s*\)",
+        source,
+    )
+    assert match, "the request-size bound is no longer declared where this test reads it"
+    low = (
+        MINIMUM_REQUEST_BYTES
+        if match.group(1) == "MINIMUM_REQUEST_BYTES"
+        else int(match.group(1).replace("_", ""))
+    )
+    high = int(match.group(2).replace("_", ""))
+    return [low, LearningStudioConfig().mini_app_max_request_bytes, high]
+
+
+def worst_case_body() -> bytes:
+    """The largest body the *shortest* satisfying answer could ever need.
+
+    The most demanding accepted manifest: the maximum word requirement, spread
+    across the maximum number of prompts, with a full-length component id. If this
+    fits, everything fits.
+    """
+    from learning_studio.components import MAX_PROMPT_LIST
+
+    per_prompt = -(-MAX_WORDS // MAX_PROMPT_LIST)
+    return json.dumps(
+        {
+            "component_id": "c" * 64,
+            "response": {"responses": [shortest_text_of(per_prompt)] * MAX_PROMPT_LIST},
+        }
+    ).encode("utf-8")
+
+
+def test_the_configured_floor_is_derived_from_the_component_contract():
+    """Not a chosen number: below it, an accepted manifest is unanswerable."""
+    assert accepted_request_sizes()[0] == MINIMUM_REQUEST_BYTES
+    assert MINIMUM_REQUEST_BYTES > RESPONSE_CHARS_MAX
+
+
+@pytest.mark.parametrize("configured", accepted_request_sizes())
+def test_the_worst_accepted_manifest_fits_every_accepted_configuration(configured: int):
+    """The reported defect: 512 bytes was accepted, and 2,000 words did not fit."""
+    body = worst_case_body()
+
+    assert len(body) <= configured, (
+        f"a manifest the registry accepts needs {len(body)} bytes, "
+        f"which a configuration of {configured} refuses"
+    )
+
+
+@pytest.mark.parametrize("configured", accepted_request_sizes())
+def test_a_single_field_maximum_also_fits_every_accepted_configuration(configured: int):
+    body = json.dumps(
+        {"component_id": "c" * 64, "response": {"text": shortest_text_of(MAX_WORDS)}}
+    ).encode("utf-8")
+
+    assert len(body) <= configured
+
+
+def test_a_configuration_below_the_floor_is_refused():
+    from learning_studio.config import CONFIG_SECTION, ConfigError
+
+    for refused in (1, 512, MINIMUM_REQUEST_BYTES - 1):
+        with pytest.raises(ConfigError):
+            LearningStudioConfig.from_mapping(
+                {CONFIG_SECTION: {"mini_app_max_request_bytes": refused}}
+            )
+
+
+def test_the_floor_itself_is_accepted():
+    from learning_studio.config import CONFIG_SECTION
+
+    parsed = LearningStudioConfig.from_mapping(
+        {CONFIG_SECTION: {"mini_app_max_request_bytes": MINIMUM_REQUEST_BYTES}}
+    )
+
+    assert parsed.mini_app_max_request_bytes == MINIMUM_REQUEST_BYTES
+
+
+def test_the_floor_leaves_room_for_the_envelope_not_just_the_answer():
+    """A ceiling equal to the character limit would forget the JSON around it."""
+    body = worst_case_body()
+
+    assert len(body) > RESPONSE_CHARS_MAX, "the envelope should cost something"
+    assert len(body) <= MINIMUM_REQUEST_BYTES

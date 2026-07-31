@@ -26,10 +26,18 @@ Four tools exist:
 | `learning_studio_prepare` | Validate and store an exercise you have designed |
 | `learning_studio_import_asset` | Validate a real host image and return an opaque managed asset id |
 
-**There is still no delivery runtime** — no card renderer, no Mini App, no
-scoring engine, no scheduler. `learning_studio_prepare` *stores* a validated
-exercise; it does not run one, and calling it opens nothing on the learner's
-screen. Exercises are still delivered by you, in conversation.
+**A trusted card renderer now exists, and nothing here launches it.** The plugin
+ships a Telegram Mini App that renders every component type in the registry —
+selection, cloze, ordering, matching, flashcards with an explicit reveal, images,
+hotspots, tables, scenarios, reflection — keyboard-operable, in three interface
+languages. `learning_studio_prepare` stores a validated exercise that the Mini App
+can serve.
+
+What is still missing is the step between the two: **nothing in this release
+starts the server or opens a tunnel**, so calling `learning_studio_prepare` does
+not by itself put anything on the learner's screen. Until the launch tooling
+lands, deliver exercises in conversation and treat the renderer as the
+destination the manifest is being written for, not as a screen you can open.
 
 When a visual component genuinely improves the exercise, first use Hermes'
 existing image-generation or image-selection capability. Pass the **real local
@@ -40,9 +48,9 @@ claim an image was imported after an error. The import tool does not generate
 images. If its optional media dependency is unavailable, choose a non-visual
 component and continue in chat.
 
-That does not weaken the workflow. Every phase below is executed in
-conversation by default; the runtime, when it exists, replaces the *delivery*
-of exercises, not the thinking that produces them. So:
+That does not weaken the workflow. Every phase below is executed in conversation
+by default; the renderer replaces the *delivery* of an exercise, never the
+thinking that produces one. So:
 
 - **Check before you route.** A runtime step happens only if the corresponding
   tool is actually in your tool list.
@@ -50,8 +58,19 @@ of exercises, not the thinking that produces them. So:
   chat.** Present the exercise as text, take the answer as a message, evaluate
   it yourself, and carry the state in the conversation.
 - **Never claim that an exercise or a Mini App was launched, opened, or is
-  running** unless a tool call returned a result saying so. Do not describe a
-  screen the learner cannot see. Do not report a score you did not receive.
+  running** unless a tool call returned a result saying so. The renderer existing
+  is not the same as it being open: there is no launch tool yet, so any statement
+  that a learner should "tap the button" is a description of a screen that is not
+  there. Do not report a score you did not receive.
+- **You write manifests; you never write frontend code.** The renderer is trusted
+  precisely because the only thing it displays is validated, inert data from the
+  registry. Generated HTML, CSS or JavaScript is not an exercise format here, and
+  a manifest is not a place to smuggle one — the store refuses markup, and the app
+  would render it as the literal text it is.
+- **Nobody has to ask for this by name.** A learner saying they want to practise
+  irregular verbs, revise for an exam, or be tested on what they read is asking
+  for the workflow below. Load the skill and get on with it; do not make somebody
+  guess an internal skill name, a tool name, or the phrase "Mini App".
 - Say plainly that **attempts and scores are not stored** — only context,
   tracks, objectives, and the exercises you prepare are — and that a review
   schedule is advice the learner has to keep themselves.

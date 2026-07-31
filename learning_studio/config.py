@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .components import MINIMUM_REQUEST_BYTES
 from .models import MAX_VALUE_CHARS
 
 #: The one ``config.yaml`` section this plugin reads. Nothing else in the
@@ -143,9 +144,13 @@ class LearningStudioConfig:
     #: payload and it is deliberately tight.
     mini_app_init_data_max_age_seconds: int = 300
 
-    #: Largest accepted request body. An answer is a short JSON object; this
-    #: is the ceiling that keeps a submission endpoint from being a memory
+    #: Largest accepted request body. An answer is a short JSON object; this is
+    #: the ceiling that keeps a submission endpoint from being a memory
     #: exhaustion endpoint.
+    #:
+    #: It cannot be configured below
+    #: :data:`learning_studio.components.MINIMUM_REQUEST_BYTES`, which is what the
+    #: longest *accepted* manifest needs in order to be answerable at all.
     mini_app_max_request_bytes: int = 16 * 1024
 
     #: Sliding-window rate limit, applied per Telegram user and per session.
@@ -215,7 +220,12 @@ _PARSERS: dict[str, Any] = {
     "max_asset_pixels": lambda raw, key: _bounded_int(raw, key, 1, 200_000_000),
     "mini_app_session_ttl_seconds": lambda raw, key: _bounded_int(raw, key, 60, 86_400),
     "mini_app_init_data_max_age_seconds": lambda raw, key: _bounded_int(raw, key, 30, 3_600),
-    "mini_app_max_request_bytes": lambda raw, key: _bounded_int(raw, key, 512, 1_048_576),
+    # The floor is derived from the component contract rather than chosen: below
+    # it, a manifest the registry accepts has no response any client could send.
+    # See `components.MINIMUM_REQUEST_BYTES`.
+    "mini_app_max_request_bytes": lambda raw, key: _bounded_int(
+        raw, key, MINIMUM_REQUEST_BYTES, 1_048_576
+    ),
     "mini_app_rate_limit_requests": lambda raw, key: _bounded_int(raw, key, 1, 10_000),
     "mini_app_rate_limit_window_seconds": lambda raw, key: _bounded_int(raw, key, 1, 3_600),
     "mini_app_max_sessions": lambda raw, key: _bounded_int(raw, key, 1, 100_000),

@@ -60,6 +60,12 @@ class Style {
     this[name] = String(value);
   }
 
+  removeProperty(name) {
+    const previous = this.getPropertyValue(name);
+    delete this[name];
+    return previous;
+  }
+
   getPropertyValue(name) {
     return this[name] === undefined ? "" : this[name];
   }

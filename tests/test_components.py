@@ -114,6 +114,17 @@ def test_the_registry_names_no_subject():
         assert subject not in blob, f"the registry presumes the subject '{subject}'"
 
 
+def _fixed_mint():
+    """Deterministic aliases, for tests that compare two projections.
+
+    Production mints random ones — that is the point of them — so a test wanting
+    to compare has to say which aliases it means, exactly as it has to say which
+    arrangement it means.
+    """
+    counter = iter(range(1, 10_000))
+    return lambda: f"alias{next(counter):04d}"
+
+
 def _reverse(items: list) -> None:
     """A fixed permutation, for tests that need to name an arrangement.
 
@@ -146,10 +157,12 @@ def test_a_component_round_trips_through_json(component_type: str):
     """
     component = build(component_type)
 
-    payload = json.loads(json.dumps(component.learner_payload(shuffle=_reverse)))
+    payload = json.loads(
+        json.dumps(component.learner_payload(shuffle=_reverse, mint=_fixed_mint()))
+    )
     hidden = json.loads(json.dumps(component.hidden()))
 
-    assert payload == component.learner_payload(shuffle=_reverse)
+    assert payload == component.learner_payload(shuffle=_reverse, mint=_fixed_mint())
     assert hidden == component.hidden()
 
 

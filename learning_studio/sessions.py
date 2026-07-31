@@ -86,7 +86,8 @@ class MiniAppSession:
     #: Zero-based cursor into the experience's ordered components.
     position: int = 0
     #: ``component_id -> submitted response``. Held in memory for the life of
-    #: the session; durable attempt storage is a later PR's decision to make.
+    #: the session; durable attempt storage belongs with the evaluation runtime,
+    #: which is what will decide how long a learner's performance is kept.
     answers: dict[str, Any] = field(default_factory=dict)
     #: ``component_id -> the attempt recorded when the card was turned over``.
     #:

@@ -72,7 +72,24 @@ web = [
 packages = ["learning_studio"]
 
 [tool.hatch.build.targets.sdist]
-include = ["learning_studio", "tests", "plugin.yaml", "__init__.py", "README.md", "LICENSE"]
+# Everything the packaged tests and the packaged documentation need in order to
+# be true. The sdist shipped `tests/` and `docs/screenshots/README.md` while
+# omitting `tools/`, which those tests import and that documentation names — so
+# the suite could not run from an extracted tree and the instructions pointed at
+# files that were not there. `tests/test_packaging.py` extracts a built sdist and
+# fails if any of this drifts again.
+include = [
+    "learning_studio",
+    "tests",
+    "tools",
+    "docs",
+    "plugin.yaml",
+    "__init__.py",
+    "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

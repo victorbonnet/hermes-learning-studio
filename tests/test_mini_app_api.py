@@ -28,6 +28,7 @@ from learning_studio.web.app import (
 from learning_studio.web.dependencies import Dependencies
 from tests.component_examples import CANARY, all_canaries, example, manifest
 from tests.init_data import BOT_TOKEN, OTHER_USER_ID, USER_ID, build_init_data
+from tests.served_responses import response_for
 
 NOW = 1_800_000_000
 
@@ -78,6 +79,12 @@ def deps(hermes_home, clock, config, allowlist) -> Dependencies:
         ),
         load_asset=lambda principal, asset_id: service.read_managed_asset(
             principal=principal, asset_id=asset_id, config=config
+        ),
+        component_aliases=lambda principal, experience_id, component_key: service.component_aliases(
+            principal=principal,
+            experience_id=experience_id,
+            component_key=component_key,
+            config=config,
         ),
     )
 
@@ -242,7 +249,15 @@ def test_a_full_exercise_can_be_served_and_answered(client, experience_id):
 
         answered = client.post(
             "/api/session/answer",
-            json={"component_id": component_id, "response": "an answer"},
+            json={
+                "component_id": component_id,
+                # Built from the component *as served*, aliased identifiers and
+                # all — which is the only response a real client could produce.
+                "response": response_for(
+                    current["component"]["type"],
+                    current["component"]["payload"].get("content", {}),
+                ),
+            },
             headers=session_headers(token),
         )
         assert answered.status_code == 200, answered.text
@@ -991,3 +1006,149 @@ def test_a_tampered_asset_is_not_served(client, hermes_home, principal, config):
     response = client.get(f"/api/assets/{asset_id}", headers=session_headers(token))
 
     assert response.status_code == 404
+
+
+# ── The response contract, at the route ───────────────────────────────────
+
+
+def test_a_missing_response_no_longer_advances_the_exercise(client, experience_id):
+    """The reported defect, exactly as reported.
+
+    `{"component_id": "q-one"}` carries no answer at all, and used to be recorded
+    as one — because the only check was that the body was bounded JSON.
+    """
+    token, _ = open_session(client, experience_id)
+
+    response = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one"},
+        headers=session_headers(token),
+    )
+
+    assert response.status_code == 400
+    still_here = client.get("/api/session/component", headers=session_headers(token)).json()
+    assert still_here["component"]["component_id"] == "q-one"
+    assert still_here["progress"] == {
+        "position": 0,
+        "component_count": 3,
+        "answered": 0,
+        "completed": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "response_value",
+    [None, "an answer", 42, [], {"value": "true"}, {"wrong_field": True}, {}],
+)
+def test_a_response_that_does_not_fit_its_component_is_refused(
+    client, experience_id, response_value
+):
+    token, _ = open_session(client, experience_id)
+
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": response_value},
+        headers=session_headers(token),
+    )
+
+    assert refused.status_code == 400
+    assert (
+        client.get("/api/session/component", headers=session_headers(token)).json()["progress"][
+            "answered"
+        ]
+        == 0
+    )
+
+
+def test_a_refused_response_is_not_recorded_anywhere(client, experience_id):
+    """State moves only after the contract is satisfied."""
+    token, _ = open_session(client, experience_id)
+
+    client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": "invented"}},
+        headers=session_headers(token),
+    )
+    result = client.get("/api/session/result", headers=session_headers(token)).json()
+
+    assert result["answered_components"] == []
+    assert result["progress"]["answered"] == 0
+
+
+def test_the_refusal_says_nothing_about_what_was_submitted(client, experience_id):
+    token, _ = open_session(client, experience_id)
+
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": "a-distinctive-guess"}},
+        headers=session_headers(token),
+    )
+
+    assert "a-distinctive-guess" not in refused.text
+
+
+def test_a_response_naming_a_canonical_identifier_is_refused(client, experience_id, config):
+    """A client may name only the identifiers it was served.
+
+    The canonical option ids never reach a learner, so one arriving in a request
+    came from somewhere else — and it is refused for the same reason an invented
+    one is.
+    """
+    from tests.component_examples import example
+
+    canonical = example("multiple_choice")["content"]["options"][0]["id"]
+    token, _ = open_session(client, experience_id)
+
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": canonical}},
+        headers=session_headers(token),
+    )
+
+    assert refused.status_code == 400
+
+
+def test_a_served_alias_is_accepted_and_stored_canonically(client, experience_id, deps):
+    """The round trip: alias out, canonical in."""
+    from tests.component_examples import example
+
+    token, _ = open_session(client, experience_id)
+    current = client.get("/api/session/component", headers=session_headers(token)).json()
+    served = current["component"]["payload"]["content"]["options"]
+    canonical_ids = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+
+    assert not {entry["id"] for entry in served} & canonical_ids
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served[0]["id"]}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+    stored = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+    assert stored["option_id"] in canonical_ids
+
+
+def test_the_alias_mapping_is_never_served_to_a_client(client, experience_id):
+    token, opened = open_session(client, experience_id)
+    bodies = [
+        json.dumps(opened),
+        client.get("/api/session/component", headers=session_headers(token)).text,
+        client.get("/api/session/result", headers=session_headers(token)).text,
+    ]
+
+    for body in bodies:
+        assert "aliases" not in body
+
+
+def test_a_card_the_client_cannot_draw_may_still_be_skipped(client, experience_id):
+    token, _ = open_session(client, experience_id)
+
+    skipped = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"skipped": True}},
+        headers=session_headers(token),
+    )
+
+    assert skipped.status_code == 200

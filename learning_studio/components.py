@@ -97,6 +97,26 @@ PASSAGE_MAX = 4000
 RESPONSE_CHARS_MAX = 4000
 MAX_WORDS = (RESPONSE_CHARS_MAX + 1) // 2
 
+#: The smallest request-body ceiling under which *every* accepted manifest is
+#: still completable — and therefore the smallest one an operator may configure.
+#:
+#: Deriving the word bound from the character limit fixed half the problem. The
+#: other half is that the character limit is not the only ceiling a submission
+#: has to clear: the body carries a JSON envelope, a component identifier, and
+#: for a multi-prompt card one pair of quotes and a comma per field. A
+#: configuration of 512 bytes was accepted, and under it a ``min_words: 2000``
+#: component — which the registry accepts — could not be answered at all.
+#:
+#: Sized for the worst accepted case: the longest satisfiable response, split
+#: across the largest number of prompts, plus the envelope. The margin is
+#: deliberate and small; the point is that the floor is *computed from the
+#: contract* rather than picked, so raising one of these numbers cannot silently
+#: strand the other. ``tests/test_response_limits.py`` builds that worst case and
+#: fails if it does not fit.
+_ENVELOPE_BYTES = 256
+_PER_PROMPT_BYTES = 8
+MINIMUM_REQUEST_BYTES = RESPONSE_CHARS_MAX + _ENVELOPE_BYTES + _PER_PROMPT_BYTES * 8
+
 MAX_OPTIONS = 12
 MAX_ITEMS = 20
 MAX_CATEGORIES = 8
@@ -1544,28 +1564,61 @@ def _content_required(spec: ComponentSpec) -> bool:
 # ── Validation ────────────────────────────────────────────────────────────
 
 
-#: Visible lists whose *order* would otherwise disclose the answer, by type.
-#:
+@dataclass(frozen=True)
+class OrderRule:
+    """One visible list whose *order* would otherwise disclose the answer.
+
+    ``forbidden`` reads the arrangement out of the *hidden* answer. Comparing
+    against the source list is not enough and was the first version's mistake: a
+    manifest may legitimately be authored pre-scrambled, and then "different from
+    what the author typed" and "different from the correct answer" are two
+    different tests — with the shuffle free to land on the second one.
+    """
+
+    field: str
+    forbidden: Callable[[dict[str, Any]], list[str]]
+
+
+def _answer_order(answer: dict[str, Any]) -> list[str]:
+    order = answer.get("order")
+    return [str(entry) for entry in order] if isinstance(order, list) else []
+
+
+def _pair_order(answer: dict[str, Any]) -> list[str]:
+    """The right-hand ids in row order — what a parallel option list would be."""
+    pairs = answer.get("pairs")
+    if not isinstance(pairs, list):
+        return []
+    return [str(pair.get("right_id")) for pair in pairs if isinstance(pair, dict)]
+
+
+def _label_order(answer: dict[str, Any]) -> list[str]:
+    labels = answer.get("labels")
+    if not isinstance(labels, list):
+        return []
+    return [str(entry.get("label_id")) for entry in labels if isinstance(entry, dict)]
+
+
 #: Two different leaks, both mechanical:
 #:
-#: - the ordering families (``sentence_order``, ``sequence_order``, ``timeline``,
-#:   ``process_flow``) are graded on ``answer.order``, and an author naturally
-#:   writes the list in the correct order — so the list *is* the key;
-#:  - ``matching.right`` and ``labeling.label_bank`` are the option lists behind
-#:   each row's ``<select>``, and an author naturally writes them parallel to the
-#:   rows they belong to — so "the first option of the first dropdown" is the key.
+#: - the ordering families are graded on ``answer.order``, and an author writes
+#:   the list in the correct order, so the list *is* the key;
+#: - ``matching.right`` and ``labeling.label_bank`` are the option lists behind
+#:   each row's ``<select>``, written parallel to the rows they belong to, so
+#:   "the first option of the first dropdown" is the key.
 #:
 #: Not listed, deliberately: ``multiple_choice.options`` and friends, where the
 #: answer is an id rather than a position, so the order discloses nothing. Those
 #: types carry their own ``shuffle`` flag for presentation variety, which is a
-#: different concern with a different name.
-ANSWER_BEARING_ORDER: dict[str, tuple[str, ...]] = {
-    "sentence_order": ("tokens",),
-    "sequence_order": ("steps",),
-    "timeline": ("events",),
-    "process_flow": ("stages",),
-    "matching": ("right",),
-    "labeling": ("label_bank",),
+#: different concern with a different name — and every content id is aliased
+#: regardless, so a *name* cannot disclose anything either.
+ANSWER_BEARING_ORDER: dict[str, tuple[OrderRule, ...]] = {
+    "sentence_order": (OrderRule("tokens", _answer_order),),
+    "sequence_order": (OrderRule("steps", _answer_order),),
+    "timeline": (OrderRule("events", _answer_order),),
+    "process_flow": (OrderRule("stages", _answer_order),),
+    "matching": (OrderRule("right", _pair_order),),
+    "labeling": (OrderRule("label_bank", _label_order),),
 }
 
 #: Content fields that are only meant to be shown when a sibling flag says so.
@@ -1576,6 +1629,11 @@ GATED_CONTENT: dict[str, tuple[tuple[str, str, str], ...]] = {
     # (list field, entry field to drop, flag that must be true to keep it)
     "timeline": (("events", "date_label", "show_dates"),),
 }
+
+_SYSTEM_RANDOM = secrets.SystemRandom()
+
+#: How many random arrangements to try before falling back to rotation.
+_SHUFFLE_ATTEMPTS = 8
 
 
 def _unpredictable_shuffle(items: list[Any]) -> None:
@@ -1594,53 +1652,92 @@ def _unpredictable_shuffle(items: list[Any]) -> None:
     _SYSTEM_RANDOM.shuffle(items)
 
 
-_SYSTEM_RANDOM = secrets.SystemRandom()
+def mint_alias() -> str:
+    """An opaque learner-facing identifier with nothing to read into it.
+
+    Random hex, so it sorts arbitrarily and carries no sequence, no authoring
+    order, and no semantic name. It satisfies the registry's own identifier
+    pattern, so an aliased payload is still a structurally valid component.
+    """
+    return "x" + secrets.token_hex(8)
+
+
+def _rearranged(
+    entries: list[Any],
+    forbidden: list[str],
+    rearrange: Callable[[list[Any]], None],
+) -> list[Any]:
+    """A permutation of ``entries`` that is not the forbidden arrangement.
+
+    ``forbidden`` is the *answer*. The loop also avoids returning the input
+    unchanged where it can, because an exercise that looks untouched invites the
+    learner to submit it untouched — but that is a preference, and not serving the
+    key is the rule. Where the two conflict (a two-entry list whose source order
+    is already the only alternative to the answer) the rule wins.
+    """
+    ids = [entry.get("id") if isinstance(entry, dict) else entry for entry in entries]
+    if len(entries) < 2 or ids == forbidden and len(entries) < 2:
+        return list(entries)
+
+    source = list(ids)
+    order = list(entries)
+
+    def arrangement(candidate: list[Any]) -> list[str]:
+        return [item.get("id") if isinstance(item, dict) else item for item in candidate]
+
+    for _attempt in range(_SHUFFLE_ATTEMPTS):
+        rearrange(order)
+        shown = arrangement(order)
+        if shown != forbidden and shown != source:
+            return order
+
+    # Either the draws were unlucky or there is nothing else to pick. Rotation is
+    # exhaustive enough to guarantee an arrangement that is not the answer, since
+    # ids are unique and a list of two or more has at least two arrangements.
+    #
+    # Offset 0 is tried *last*: it is the identity, and reaching for it first
+    # would satisfy "not the answer" by handing back exactly what came in, which
+    # is the outcome the loop above spent eight attempts avoiding.
+    for offset in [*range(1, len(order)), 0]:
+        candidate = order[offset:] + order[:offset]
+        if arrangement(candidate) != forbidden:
+            return candidate
+    return order
 
 
 def shuffled_content(
     component_type: str,
     content: dict[str, Any],
     *,
+    answer: dict[str, Any] | None = None,
     shuffle: Callable[[list[Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Return ``content`` with any answer-bearing order rearranged.
 
     Guarantees, each one tested:
 
+    - the arrangement served is never the one recorded in ``answer``, whatever
+      order the manifest was authored in and whatever the shuffle proposes;
     - every entry survives exactly once — this is a permutation, never a filter;
-    - the result differs from the input whenever a different arrangement exists,
-      so a one-item list is returned as it came and a two-item list is genuinely
-      rearranged rather than left alone by an unlucky draw;
-    - identity travels with the opaque ``id``, so duplicate visible labels and
-      per-entry extras (a ``date_label``, coordinates) stay attached to the entry
-      they belong to;
-    - the input is not mutated, and neither is the evaluator-only answer.
+    - identity travels with the ``id``, so duplicate visible labels and per-entry
+      extras (a ``date_label``, coordinates) stay attached to their own entry;
+    - the input is not mutated, and neither is the answer.
     """
-    fields = ANSWER_BEARING_ORDER.get(component_type, ())
+    rules = ANSWER_BEARING_ORDER.get(component_type, ())
     gates = GATED_CONTENT.get(component_type, ())
-    if not fields and not gates:
+    if not rules and not gates:
         return content
 
     rearrange = shuffle or _unpredictable_shuffle
     projected = dict(content)
 
-    for field_name in fields:
-        entries = projected.get(field_name)
+    for rule in rules:
+        entries = projected.get(rule.field)
         if not isinstance(entries, list) or len(entries) < 2:
             # Nothing to hide: an empty or single-entry list has exactly one
             # arrangement, and returning it unchanged is the whole truth.
             continue
-        order = list(entries)
-        for _attempt in range(8):
-            rearrange(order)
-            if order != entries:
-                break
-        else:
-            # Astronomically unlikely, and a silent no-op here would be the one
-            # outcome that reveals the answer. Rotating by one is guaranteed to
-            # differ for any list of two or more.
-            order = order[1:] + order[:1]
-        projected[field_name] = order
+        projected[rule.field] = _rearranged(entries, rule.forbidden(answer or {}), rearrange)
 
     for list_field, entry_field, flag in gates:
         if projected.get(flag) is True:
@@ -1655,6 +1752,97 @@ def shuffled_content(
             ]
 
     return projected
+
+
+# ── Aliasing ──────────────────────────────────────────────────────────────
+#
+# Shuffling hides the *order*. It does not hide the *names*: a manifest whose
+# tokens are `t1, t2, t3, t4` still spells out its own answer, because sorting
+# four opaque-looking ids reconstructs the sequence the author typed them in.
+# Nothing in the registry can stop an author naming things that way, and a
+# comment asking them not to is not a control.
+#
+# So every identifier inside a component's visible content is replaced with a
+# random one before the content is stored for delivery. The learner sees names
+# with nothing to read into; the evaluator keeps the canonical ones; the mapping
+# lives with the evaluator's data and is translated back when a response arrives.
+
+
+def _content_identifiers(node: Any, found: set[str]) -> None:
+    """Every ``id`` declared anywhere in a content structure."""
+    if isinstance(node, dict):
+        value = node.get("id")
+        if isinstance(value, str) and value:
+            found.add(value)
+        for item in node.values():
+            _content_identifiers(item, found)
+    elif isinstance(node, list):
+        for item in node:
+            _content_identifiers(item, found)
+
+
+def _with_aliases(node: Any, mapping: dict[str, str]) -> Any:
+    """Rewrite declarations and references, and nothing else.
+
+    A key is rewritten when it is ``id`` or ends in ``_id`` — which covers a
+    declaration and every intra-component reference (``row_id``, ``column_id``)
+    without touching ``asset_ref``, which names a managed asset rather than
+    anything in this component.
+    """
+    if isinstance(node, dict):
+        projected: dict[str, Any] = {}
+        for key, value in node.items():
+            if (key == "id" or key.endswith("_id")) and isinstance(value, str):
+                projected[key] = mapping.get(value, value)
+            else:
+                projected[key] = _with_aliases(value, mapping)
+        return projected
+    if isinstance(node, list):
+        return [_with_aliases(item, mapping) for item in node]
+    return node
+
+
+def aliased_content(
+    component_type: str,
+    content: dict[str, Any],
+    *,
+    mint: Callable[[], str] | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Return ``(content with aliased ids, alias -> canonical)``.
+
+    The returned mapping is keyed by *alias* because that is the direction it is
+    read in: a response arrives naming aliases and has to be translated back.
+    """
+    declared: set[str] = set()
+    _content_identifiers(content, declared)
+    if not declared:
+        return content, {}
+
+    generate = mint or mint_alias
+    canonical_to_alias = {name: generate() for name in sorted(declared)}
+    projected = _with_aliases(content, canonical_to_alias)
+
+    if component_type == "fill_blank":
+        # The passage names its gaps inline, so the placeholders have to move with
+        # the blanks or the card renders a gap nothing can fill.
+        text = projected.get("text")
+        if isinstance(text, str):
+            projected["text"] = _PLACEHOLDER_RE.sub(
+                lambda match: "{{" + canonical_to_alias.get(match.group(1), match.group(1)) + "}}",
+                text,
+            )
+
+    return projected, {alias: name for name, alias in canonical_to_alias.items()}
+
+
+@dataclass(frozen=True)
+class LearnerProjection:
+    """What a learner is served, and the key to reading their answer back."""
+
+    payload: dict[str, Any]
+    #: ``alias -> canonical``. Evaluator-only: this is stored beside the answer
+    #: and is never part of anything sent to a client.
+    aliases: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -1683,35 +1871,52 @@ class Component:
             hidden["evaluation"] = self.evaluation
         return hidden
 
-    def learner_payload(
-        self, *, shuffle: Callable[[list[Any]], None] | None = None
-    ) -> dict[str, Any]:
-        """The safe projection, assembled from an allowlist.
+    def project(
+        self,
+        *,
+        shuffle: Callable[[list[Any]], None] | None = None,
+        mint: Callable[[], str] | None = None,
+    ) -> LearnerProjection:
+        """The safe projection, assembled from an allowlist, plus its alias key.
 
         Constructed rather than filtered. A field added to this class later is
-        hidden by default and stays hidden until someone deliberately adds it
-        to :data:`LEARNER_VISIBLE_KEYS`, which is the failure mode worth
-        having: the safe direction is the one you get for free.
+        hidden by default and stays hidden until someone deliberately adds it to
+        :data:`LEARNER_VISIBLE_KEYS`, which is the failure mode worth having: the
+        safe direction is the one you get for free.
 
-        **Omitting the answer is not the same as not showing it.** For the
-        ordering families the *order of the visible list is itself the answer*:
-        an author writes the steps of a titration in the right order and states
-        the same order under ``answer.order``, so a projection that copied the
-        list through displayed the correct sequence to a learner who had only to
-        press Submit. Every canonical fixture in this repository did exactly
-        that. :func:`shuffled_content` is therefore part of the projection, not a
-        nicety the frontend could be trusted to add — the client never receives
-        an answer-bearing order it would have to repair.
+        **Omitting the answer is not the same as not showing it.** Two things
+        happen here that no amount of care in a frontend could do instead:
 
-        ``shuffle`` exists so tests can make the permutation deterministic. It
-        defaults to an unpredictable one; there is no way to ask for "no shuffle".
+        - the order of an answer-bearing list is rearranged, and the candidate is
+          compared against the *answer* rather than against the source, so the
+          arrangement served is never the correct one — however the manifest was
+          authored;
+        - every identifier inside the content is replaced with a random alias, so
+          a manifest whose steps are named ``t1, t2, t3`` does not spell out its
+          own answer to anybody who sorts them.
+
+        The component's own ``id`` is deliberately *not* aliased: it is how the
+        session names the card, how branching refers to it, and how the stored row
+        is keyed — and it discloses nothing about any answer.
         """
         payload: dict[str, Any] = {"id": self.id, "type": self.type, "prompt": self.prompt}
+        aliases: dict[str, str] = {}
         if self.content:
-            payload["content"] = shuffled_content(self.type, self.content, shuffle=shuffle)
+            visible = shuffled_content(self.type, self.content, answer=self.answer, shuffle=shuffle)
+            visible, aliases = aliased_content(self.type, visible, mint=mint)
+            payload["content"] = visible
         if self.accessibility:
             payload["accessibility"] = self.accessibility
-        return payload
+        return LearnerProjection(payload=payload, aliases=aliases)
+
+    def learner_payload(
+        self,
+        *,
+        shuffle: Callable[[list[Any]], None] | None = None,
+        mint: Callable[[], str] | None = None,
+    ) -> dict[str, Any]:
+        """Just the payload, for callers that have no answer to read back."""
+        return self.project(shuffle=shuffle, mint=mint).payload
 
     def branch_targets(self) -> tuple[tuple[str, str], ...]:
         """``(condition, target_component_id)`` for every declared branch."""

@@ -31,7 +31,14 @@ const EXPERIENCE_ID = "exp-abc123";
 const INIT_DATA = `auth_date=1800000000&start_param=${EXPERIENCE_ID}&hash=deadbeef`;
 
 function telegramStub(overrides = {}) {
-  const calls = { ready: 0, expand: 0, close: 0, closingConfirmation: 0, events: [] };
+  const calls = {
+    ready: 0,
+    expand: 0,
+    close: 0,
+    closingConfirmation: 0,
+    events: [],
+    handlers: {},
+  };
   return Object.assign(
     {
       initData: INIT_DATA,
@@ -51,8 +58,9 @@ function telegramStub(overrides = {}) {
       enableClosingConfirmation() {
         calls.closingConfirmation += 1;
       },
-      onEvent(name) {
+      onEvent(name, handler) {
         calls.events.push(name);
+        calls.handlers[name] = handler;
       },
     },
     overrides
@@ -929,4 +937,118 @@ test("the size ceiling is counted in bytes, not characters", async () => {
 
   assert.equal(context.api.answers.length, 0, "a body over the byte ceiling was sent");
   assert.match(context.node("field-error").textContent, /too long to send/);
+});
+
+// ── A theme update replaces the palette; it does not add to it ────────────
+
+/** Apply a new palette the way Telegram's `themeChanged` event does. */
+async function changeTheme(context, params, colorScheme) {
+  context.telegram.themeParams = params;
+  if (colorScheme) {
+    context.telegram.colorScheme = colorScheme;
+  }
+  // `app.js` subscribed to this event at boot; fire what it subscribed with.
+  context.telegram.calls.handlers.themeChanged();
+  await settle(5);
+}
+
+function themeProperty(context, name) {
+  return context.win.document.documentElement.style.getPropertyValue(name);
+}
+
+test("a theme value that disappears from a later palette is removed", async () => {
+  const context = await boot({
+    types: ["true_false"],
+    telegram: { themeParams: { bg_color: "#101010", text_color: "#f0f0f0" } },
+  });
+  assert.equal(themeProperty(context, "--tg-bg-color"), "#101010");
+
+  await changeTheme(context, { text_color: "#f0f0f0" });
+
+  assert.equal(
+    themeProperty(context, "--tg-bg-color"),
+    "",
+    "a stale background survived a palette that no longer declares one"
+  );
+  assert.equal(themeProperty(context, "--tg-text-color"), "#f0f0f0");
+});
+
+test("a theme value that becomes invalid is removed rather than kept", async () => {
+  const context = await boot({
+    types: ["true_false"],
+    telegram: { themeParams: { bg_color: "#101010" } },
+  });
+
+  await changeTheme(context, { bg_color: "#12345" });
+
+  assert.equal(themeProperty(context, "--tg-bg-color"), "");
+});
+
+test("switching from light to dark does not leave the light palette behind", async () => {
+  // The case that matters visually: light background under dark text.
+  const context = await boot({
+    types: ["true_false"],
+    telegram: {
+      colorScheme: "light",
+      themeParams: { bg_color: "#ffffff", text_color: "#000000" },
+    },
+  });
+
+  await changeTheme(context, { bg_color: "#17212b", text_color: "#f2f5f8" }, "dark");
+
+  assert.equal(context.win.document.documentElement.getAttribute("data-theme"), "dark");
+  assert.equal(themeProperty(context, "--tg-bg-color"), "#17212b");
+  assert.equal(themeProperty(context, "--tg-text-color"), "#f2f5f8");
+});
+
+test("a partial palette leaves the rest to the stylesheet", async () => {
+  const context = await boot({
+    types: ["true_false"],
+    telegram: {
+      themeParams: {
+        bg_color: "#101010",
+        text_color: "#f0f0f0",
+        button_color: "#2470c0",
+        hint_color: "#9aa8b6",
+      },
+    },
+  });
+
+  await changeTheme(context, { button_color: "#2470c0" }, "dark");
+
+  assert.equal(themeProperty(context, "--tg-button-color"), "#2470c0");
+  for (const absent of ["--tg-bg-color", "--tg-text-color", "--tg-hint-color"]) {
+    assert.equal(themeProperty(context, absent), "", `${absent} was left stale`);
+  }
+});
+
+test("an empty palette clears every property it previously set", async () => {
+  const context = await boot({
+    types: ["true_false"],
+    telegram: {
+      themeParams: {
+        bg_color: "#101010",
+        text_color: "#f0f0f0",
+        hint_color: "#9aa8b6",
+        link_color: "#78b6ff",
+        button_color: "#2470c0",
+        button_text_color: "#ffffff",
+        secondary_bg_color: "#22303d",
+      },
+    },
+  });
+
+  await changeTheme(context, {});
+
+  for (const property of [
+    "--tg-bg-color",
+    "--tg-text-color",
+    "--tg-hint-color",
+    "--tg-link-color",
+    "--tg-button-color",
+    "--tg-button-text-color",
+    "--tg-secondary-bg-color",
+  ]) {
+    assert.equal(themeProperty(context, property), "", `${property} survived an empty palette`);
+  }
 });
