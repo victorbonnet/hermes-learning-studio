@@ -487,11 +487,11 @@ def test_the_client_message_is_fixed_and_carries_no_submitted_value():
 
 # ── Translation fails closed ──────────────────────────────────────────────
 #
-# `aliases.get(alias, alias)` reads as a harmless default and is not one. An
+# `aliases.get(alias, alias)` read as a harmless default and was not one. An
 # absent or incomplete mapping made a learner-facing alias look like a resolved
 # evaluator identifier, and it was stored as the learner's answer — a well-formed
 # identifier that names nothing in the answer key, which nothing downstream could
-# have noticed.
+# have noticed. Identity translation is now reachable from exactly one state.
 
 
 def resolver(aliases):
@@ -499,6 +499,24 @@ def resolver(aliases):
     from learning_studio.web.app import _identifier_resolver
 
     return _identifier_resolver(aliases)
+
+
+def aliased(mapping):
+    from learning_studio.service import AliasState, ComponentAliases
+
+    return ComponentAliases(AliasState.ALIASED, dict(mapping))
+
+
+def canonical_state():
+    from learning_studio.service import AliasState, ComponentAliases
+
+    return ComponentAliases(AliasState.CANONICAL)
+
+
+def unresolved():
+    from learning_studio.service import AliasState, ComponentAliases
+
+    return ComponentAliases(AliasState.UNRESOLVED)
 
 
 def test_an_identifier_with_no_mapping_is_refused_rather_than_passed_through():
@@ -511,7 +529,24 @@ def test_an_identifier_with_no_mapping_is_refused_rather_than_passed_through():
             "multiple_choice",
             projected.payload["content"],
             {"option_id": alias},
-            resolve=resolver({}),
+            resolve=resolver(aliased({})),
+        )
+
+    assert raised.value.reason == "identifier_unresolvable"
+
+
+def test_an_unresolved_state_refuses_every_identifier():
+    """A missing row, a malformed marker, an unknown scheme — all the same."""
+    component = build_component(example("multiple_choice"), "component")
+    projected = component.project()
+    alias = projected.payload["content"]["options"][0]["id"]
+
+    with pytest.raises(ResponseContractError) as raised:
+        validate_component_response(
+            "multiple_choice",
+            projected.payload["content"],
+            {"option_id": alias},
+            resolve=resolver(unresolved()),
         )
 
     assert raised.value.reason == "identifier_unresolvable"
@@ -531,7 +566,7 @@ def test_an_incomplete_mapping_is_refused_for_the_identifier_it_omits():
             "sequence_order",
             projected.payload["content"],
             {"order": shown},
-            resolve=resolver(partial),
+            resolve=resolver(aliased(partial)),
         )
 
     assert raised.value.reason == "identifier_unresolvable"
@@ -548,7 +583,7 @@ def test_a_complete_mapping_still_resolves_every_identifier():
         "matching",
         projected.payload["content"],
         {"pairs": [{"left_id": one, "right_id": right[0]} for one in left]},
-        resolve=resolver(projected.aliases),
+        resolve=resolver(aliased(projected.aliases)),
     )
 
     canonical_left = {entry["id"] for entry in component.content["left"]}
@@ -558,13 +593,8 @@ def test_a_complete_mapping_still_resolves_every_identifier():
         assert pair["right_id"] in canonical_right
 
 
-def test_a_component_prepared_before_aliasing_passes_identifiers_through():
-    """`None` means "no alias record", which is a different claim from "empty".
-
-    Collapsing the two is what let an untranslatable identifier through. A
-    component that predates aliasing served canonical identifiers, so there is
-    genuinely nothing to translate.
-    """
+def test_a_component_positively_identified_as_pre_alias_passes_identifiers_through():
+    """`CANONICAL` is a finding about an intact record, not an absence."""
     component = build_component(example("multiple_choice"), "component")
     canonical = component.content["options"][0]["id"]
 
@@ -572,13 +602,13 @@ def test_a_component_prepared_before_aliasing_passes_identifiers_through():
         "multiple_choice",
         component.content,
         {"option_id": canonical},
-        resolve=resolver(None),
+        resolve=resolver(canonical_state()),
     )
 
     assert accepted == {"option_id": canonical}
 
 
-def test_the_legacy_path_still_refuses_an_identifier_that_was_never_served():
+def test_the_canonical_path_still_refuses_an_identifier_that_was_never_served():
     """Passing identifiers through is not the same as accepting anything."""
     component = build_component(example("multiple_choice"), "component")
 
@@ -587,7 +617,7 @@ def test_the_legacy_path_still_refuses_an_identifier_that_was_never_served():
             "multiple_choice",
             component.content,
             {"option_id": "invented"},
-            resolve=resolver(None),
+            resolve=resolver(canonical_state()),
         )
 
     assert raised.value.reason == "identifier_unknown"
@@ -603,8 +633,23 @@ def test_the_refusal_names_no_identifier():
             "multiple_choice",
             projected.payload["content"],
             {"option_id": alias},
-            resolve=resolver({}),
+            resolve=resolver(aliased({})),
         )
 
     assert alias not in str(raised.value)
     assert alias not in raised.value.reason
+
+
+def test_only_one_state_permits_identity_translation():
+    """Stated as a property of the model, so a fourth state cannot default open."""
+    from learning_studio.service import AliasState, ComponentAliases
+
+    passes_through = []
+    for state in AliasState:
+        resolve = resolver(ComponentAliases(state, {"alias": "canonical"}))
+        try:
+            passes_through.append((state, resolve("something-unmapped") == "something-unmapped"))
+        except ResponseContractError:
+            passes_through.append((state, False))
+
+    assert [state for state, identity in passes_through if identity] == [AliasState.CANONICAL]

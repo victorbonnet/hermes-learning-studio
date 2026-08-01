@@ -1695,45 +1695,72 @@ def mint_alias() -> str:
     return "x" + secrets.token_hex(8)
 
 
+def _discloses(shown: list[str], forbidden: list[str]) -> bool:
+    """True when ``shown`` gives the answer away.
+
+    The comparison is on the **prefix**, not the whole list, and that is the whole
+    correction. An option bank may legitimately be longer than the number of rows
+    it answers — distractors are a normal part of a matching or labeling card —
+    and the renderer puts the *same* bank order behind every dropdown. So a bank
+    beginning ``[answer1, answer2, …]`` hands over the complete answer: pick the
+    first option for the first row, the second for the second, done. Comparing the
+    whole list called that safe, because a three-entry bank is never equal to a
+    two-entry answer.
+
+    An empty ``forbidden`` forbids nothing. That is the "the answer does not cover
+    every row" case, where a partial arrangement would be a guess, and excluding a
+    guess is how the original defect worked.
+    """
+    return bool(forbidden) and shown[: len(forbidden)] == forbidden
+
+
 def _rearranged(
     entries: list[Any],
     forbidden: list[str],
     rearrange: Callable[[list[Any]], None],
 ) -> list[Any]:
-    """A permutation of ``entries`` that is not the forbidden arrangement.
+    """A permutation of ``entries`` that does not disclose the answer.
 
-    ``forbidden`` is the *answer*. The loop also avoids returning the input
-    unchanged where it can, because an exercise that looks untouched invites the
-    learner to submit it untouched — but that is a preference, and not serving the
-    key is the rule. Where the two conflict (a two-entry list whose source order
-    is already the only alternative to the answer) the rule wins.
+    Two rules, in priority order:
+
+    1. the arrangement must not disclose the answer — see :func:`_discloses`;
+    2. preferably it should differ from the source order too, because an exercise
+       that looks untouched invites the learner to submit it untouched.
+
+    Where the two conflict — a two-entry list whose source order is the only
+    arrangement that is not the answer — the first wins. It is the rule; the
+    second is a preference.
+
+    Termination is guaranteed: after the random attempts, rotation is tried
+    exhaustively, and a list of two or more distinct ids always has a rotation
+    whose prefix differs from any fixed one. The final ``return`` is unreachable
+    for well-formed input and is there so that malformed input degrades to "served
+    as it came" rather than to an exception in the middle of a projection.
     """
-    ids = [entry.get("id") if isinstance(entry, dict) else entry for entry in entries]
-    if len(entries) < 2 or ids == forbidden and len(entries) < 2:
+    if len(entries) < 2:
         return list(entries)
-
-    source = list(ids)
-    order = list(entries)
 
     def arrangement(candidate: list[Any]) -> list[str]:
         return [item.get("id") if isinstance(item, dict) else item for item in candidate]
 
+    source = arrangement(entries)
+    order = list(entries)
+
     for _attempt in range(_SHUFFLE_ATTEMPTS):
         rearrange(order)
         shown = arrangement(order)
-        if shown != forbidden and shown != source:
+        if not _discloses(shown, forbidden) and shown != source:
             return order
 
     # Either the draws were unlucky or there is nothing else to pick. Rotation is
-    # exhaustive enough to guarantee an arrangement that is not the answer, since
-    # ids are unique and a list of two or more has at least two arrangements.
+    # deterministic and exhaustive, so this settles it.
     #
     # Offset 0 is tried *last*: it is the identity, and reaching for it first
-    # would satisfy "not the answer" by handing back exactly what came in, which
-    # is the outcome the loop above spent eight attempts avoiding.
+    # would satisfy "does not disclose" by handing back exactly what came in,
+    # which is the outcome the loop above spent eight attempts avoiding.
     for offset in [*range(1, len(order)), 0]:
         candidate = order[offset:] + order[:offset]
-        if arrangement(candidate) != forbidden:
+        if not _discloses(arrangement(candidate), forbidden):
             return candidate
     return order
 

@@ -17,6 +17,7 @@ would have caught it.
 
 from __future__ import annotations
 
+import copy
 import json
 
 import pytest
@@ -491,3 +492,223 @@ def test_a_rule_whose_answer_does_not_cover_every_row_forbids_nothing_rather_tha
 
     assert rule.forbidden({"pairs": [{"left_id": "a", "right_id": "one"}]}, content) == []
     assert rule.forbidden({}, content) == []
+
+
+# ── Distractors ───────────────────────────────────────────────────────────
+#
+# An option bank may hold more entries than there are rows: distractors are a
+# normal part of a matching or labeling card, and the contract permits them. The
+# renderer puts the *same* bank order behind every dropdown, so a bank beginning
+# `[answer1, answer2, …]` hands over the whole answer — pick the first option for
+# the first row, the second for the second.
+#
+# Comparing the whole bank against the answer called that safe, because a
+# three-entry bank is never equal to a two-entry answer. With production
+# randomness this exposed the answer prefix in roughly one projection in five.
+# The comparison is now on the prefix.
+
+
+def with_distractors(component_type: str, *, at: str, count: int = 1):
+    """A valid manifest whose option bank carries distractors.
+
+    ``at`` places them before, between, or after the answer options — the three
+    arrangements that make a prefix comparison behave differently.
+    """
+    bank_field, answer_field, row_field, row_key, value_key = PARALLEL_SHAPES[component_type]
+    source = copy.deepcopy(example(component_type))
+    bank = source["content"][bank_field]
+    extras = [
+        {"id": f"distractor-{index}", "text": f"Distractor {index}"} for index in range(count)
+    ]
+
+    if at == "before":
+        source["content"][bank_field] = [*extras, *bank]
+    elif at == "after":
+        source["content"][bank_field] = [*bank, *extras]
+    elif at == "between":
+        source["content"][bank_field] = [bank[0], *extras, *bank[1:]]
+    else:  # pragma: no cover - a typo in a parametrisation
+        raise ValueError(at)
+    return build_component(source, "component")
+
+
+def answer_vector(component, component_type: str) -> list[str]:
+    """The answer as the renderer lays it out, reconstructed independently.
+
+    Deliberately not the implementation under test: row by row, each row looked up
+    in the answer. If this agrees with `_parallel_order`, that is two readings
+    agreeing rather than one reading checking itself.
+    """
+    _bank, answer_field, row_field, row_key, value_key = PARALLEL_SHAPES[component_type]
+    chosen = {entry[row_key]: entry[value_key] for entry in component.answer[answer_field]}
+    return [chosen[row["id"]] for row in component.content[row_field]]
+
+
+def bank_of(component, component_type: str, **kwargs) -> list[str]:
+    bank_field = PARALLEL_SHAPES[component_type][0]
+    projected = shuffled_content(
+        component_type, component.content, answer=component.answer, **kwargs
+    )
+    return ids(projected[bank_field])
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+@pytest.mark.parametrize("at", ["before", "between", "after"])
+@pytest.mark.parametrize("count", [1, 2])
+def test_a_bank_with_distractors_never_opens_with_the_answer(
+    component_type: str, at: str, count: int
+):
+    """The reported defect, across every placement and both cardinalities."""
+    component = with_distractors(component_type, at=at, count=count)
+    forbidden = answer_vector(component, component_type)
+    bank_field = PARALLEL_SHAPES[component_type][0]
+
+    assert len(component.content[bank_field]) > len(forbidden), "no distractor was added"
+
+    for _attempt in range(300):
+        shown = bank_of(component, component_type)
+        assert shown[: len(forbidden)] != forbidden, (
+            f"{component_type} with {count} distractor(s) {at} the answer served the answer prefix"
+        )
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_a_pre_scrambled_distractor_bank_is_the_reported_reproduction(component_type: str):
+    """A bank authored distractor-first: the source-order guard cannot help.
+
+    This is the shape that reproduced at ~20%: the source order is not the answer
+    prefix, so "differs from the source" was satisfied while the prefix was not.
+    """
+    component = with_distractors(component_type, at="before")
+    forbidden = answer_vector(component, component_type)
+
+    exposures = sum(
+        bank_of(component, component_type)[: len(forbidden)] == forbidden for _ in range(1000)
+    )
+
+    assert exposures == 0, f"{component_type} exposed the answer prefix {exposures}/1000 times"
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+@pytest.mark.parametrize("reversed_records", [False, True])
+@pytest.mark.parametrize("reversed_rows", [False, True])
+def test_record_and_row_order_do_not_change_what_is_excluded(
+    component_type: str, reversed_records: bool, reversed_rows: bool
+):
+    """The answer is a set of statements; the rows decide the arrangement."""
+    bank_field, answer_field, row_field, _row_key, _value_key = PARALLEL_SHAPES[component_type]
+    source = copy.deepcopy(example(component_type))
+    source["content"][bank_field] = [
+        {"id": "distractor-0", "text": "Distractor"},
+        *source["content"][bank_field],
+    ]
+    if reversed_records:
+        source["answer"][answer_field] = list(reversed(source["answer"][answer_field]))
+    if reversed_rows:
+        source["content"][row_field] = list(reversed(source["content"][row_field]))
+    component = build_component(source, "component")
+    forbidden = answer_vector(component, component_type)
+
+    rule = ANSWER_BEARING_ORDER[component_type][0]
+    assert rule.forbidden(component.answer, component.content) == forbidden
+
+    for _attempt in range(200):
+        assert bank_of(component, component_type)[: len(forbidden)] != forbidden
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_an_injected_shuffle_that_proposes_the_answer_prefix_is_overruled(component_type: str):
+    component = with_distractors(component_type, at="after")
+    forbidden = answer_vector(component, component_type)
+
+    def propose_the_prefix(items):
+        rank = {name: index for index, name in enumerate(forbidden)}
+        items.sort(key=lambda entry: rank.get(entry["id"], len(rank)))
+
+    for _attempt in range(20):
+        shown = bank_of(component, component_type, shuffle=propose_the_prefix)
+        assert shown[: len(forbidden)] != forbidden
+        assert sorted(shown) == sorted(ids(component.content[PARALLEL_SHAPES[component_type][0]]))
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+@pytest.mark.parametrize(
+    ("name", "shuffle"),
+    [
+        ("no-op", lambda items: None),
+        ("reverse", lambda items: items.reverse()),
+    ],
+)
+def test_a_degenerate_injected_shuffle_still_cannot_disclose(
+    component_type: str, name: str, shuffle
+):
+    """Every random attempt is rejected, so the deterministic fallback decides."""
+    component = with_distractors(component_type, at="before")
+    forbidden = answer_vector(component, component_type)
+
+    shown = bank_of(component, component_type, shuffle=shuffle)
+
+    assert shown[: len(forbidden)] != forbidden
+    assert sorted(shown) == sorted(ids(component.content[PARALLEL_SHAPES[component_type][0]]))
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_the_fallback_terminates_when_every_random_draw_is_rejected(component_type: str):
+    """A shuffle that always proposes the forbidden prefix, forever."""
+    component = with_distractors(component_type, at="before", count=2)
+    forbidden = answer_vector(component, component_type)
+
+    def always_forbidden(items):
+        rank = {name: index for index, name in enumerate(forbidden)}
+        items.sort(key=lambda entry: rank.get(entry["id"], len(rank)))
+
+    shown = bank_of(component, component_type, shuffle=always_forbidden)
+
+    assert shown[: len(forbidden)] != forbidden
+    assert len(shown) == len(component.content[PARALLEL_SHAPES[component_type][0]])
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+@pytest.mark.parametrize("at", ["before", "between", "after"])
+def test_every_bank_entry_survives_exactly_once_with_distractors(component_type: str, at: str):
+    component = with_distractors(component_type, at=at, count=2)
+    bank_field = PARALLEL_SHAPES[component_type][0]
+    source = component.content[bank_field]
+
+    for _attempt in range(50):
+        projected = shuffled_content(component_type, component.content, answer=component.answer)[
+            bank_field
+        ]
+        assert sorted(ids(projected)) == sorted(ids(source))
+        assert len(projected) == len(source)
+        by_id = {entry["id"]: entry for entry in projected}
+        for entry in source:
+            assert by_id[entry["id"]] == entry, "an entry lost or swapped its own text"
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_projecting_a_distractor_bank_mutates_nothing(component_type: str):
+    component = with_distractors(component_type, at="between", count=2)
+    content_before = json.dumps(component.content, sort_keys=True)
+    answer_before = json.dumps(component.answer, sort_keys=True)
+
+    for _attempt in range(50):
+        component.project()
+
+    assert json.dumps(component.content, sort_keys=True) == content_before
+    assert json.dumps(component.answer, sort_keys=True) == answer_before
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_the_full_projection_also_hides_the_prefix_under_aliases(component_type: str):
+    """End to end: shuffled, aliased, and still not the answer."""
+    component = with_distractors(component_type, at="before")
+    forbidden = answer_vector(component, component_type)
+    bank_field = PARALLEL_SHAPES[component_type][0]
+
+    for _attempt in range(200):
+        projection = component.project()
+        shown = [
+            projection.aliases[entry["id"]] for entry in projection.payload["content"][bank_field]
+        ]
+        assert shown[: len(forbidden)] != forbidden

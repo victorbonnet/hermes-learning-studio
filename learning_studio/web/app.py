@@ -69,7 +69,13 @@ from ..responses import (
     ResponseContractError,
     validate_component_response,
 )
-from ..service import REVEALABLE_ANSWER_FIELDS, NotFoundError, ServiceError
+from ..service import (
+    REVEALABLE_ANSWER_FIELDS,
+    AliasState,
+    ComponentAliases,
+    NotFoundError,
+    ServiceError,
+)
 from ..sessions import SessionError, SessionScope
 from ..telegram_auth import InitDataError, verify_init_data
 from .dependencies import Dependencies, build_dependencies, user_log_reference
@@ -668,27 +674,39 @@ def create_app(dependencies: Dependencies | None = None):
     return app
 
 
-def _identifier_resolver(aliases: dict[str, str] | None):
+def _identifier_resolver(aliases: ComponentAliases):
     """Turn a served identifier into the one an evaluator knows, or refuse.
 
-    ``aliases is None`` is the only case in which an identifier passes through
-    unchanged, and it means something specific: the component has no alias record
-    because it was prepared before identifiers were aliased, so what it served
-    *is* canonical.
+    There is exactly one state in which an identifier passes through unchanged —
+    :data:`AliasState.CANONICAL`, meaning the stored evaluator record is intact
+    and simply predates aliasing, so the payload this learner was served names
+    canonical identifiers. That is a *positive* finding about the record, not an
+    inference from something being absent.
 
-    Anything else fails closed. The previous version was
-    ``aliases.get(alias, alias)``, which reads as a harmless default and is not
-    one: an absent or incomplete mapping made a learner-facing alias look like a
-    resolved evaluator identifier, and it was then stored as the learner's answer.
-    Nothing downstream could have noticed — the value is a well-formed identifier,
-    it is simply the wrong one, and it names nothing in the answer key.
+    Everything else refuses. The version before this returned the identifier
+    unchanged whenever the lookup came back empty, which reads as a harmless
+    default and is not one: a missing evaluator row, a malformed marker, an
+    unknown scheme, and a record written by the previous release all took that
+    path, and a learner-facing alias was stored as though it were an evaluator's
+    identifier — a well-formed value naming nothing in the answer key, which
+    nothing downstream could have caught.
     """
-    if aliases is None:
+    if aliases.state is AliasState.CANONICAL:
         return lambda value: value
+    if aliases.state is not AliasState.ALIASED:
+        # Nothing is resolvable, so nothing may be accepted. Raised per identifier
+        # rather than up front so that the refusal travels the same path as every
+        # other contract failure and produces the same generic message.
+        def refuse(_value: str) -> str:
+            raise ResponseContractError("identifier_unresolvable")
+
+        return refuse
+
+    mapping = aliases.mapping
 
     def resolve(value: str) -> str:
         try:
-            return aliases[value]
+            return mapping[value]
         except KeyError:
             raise ResponseContractError("identifier_unresolvable") from None
 

@@ -23,6 +23,7 @@ turn a track ID into an oracle for whether another learner exists.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -31,6 +32,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import Any
 
 from . import candidates as candidate_rules
@@ -2388,31 +2390,81 @@ ALIAS_SCHEME = 1
 NOT_REVEALABLE_MESSAGE = "There is nothing to turn over on this card."
 
 
+#: Alias schemes this code knows how to read. A record naming anything else was
+#: written by a newer version, and the only safe reading of "I do not know how
+#: these identifiers were made" is to refuse.
+SUPPORTED_ALIAS_SCHEMES = frozenset({ALIAS_SCHEME})
+
+
+class AliasState(Enum):
+    """How a stored component's identifiers relate to what the learner sees.
+
+    The previous version of this returned ``dict | None`` and could not tell four
+    situations apart, which is why it failed open. ``None`` meant, all at once:
+    a component that predates aliasing; a component whose evaluator row is
+    missing; a marker that is malformed; and — after the last release — a record
+    written by the *previous head*, which stored ``aliases`` but no scheme number
+    because that field did not exist yet. Identity translation is right for
+    exactly the first of those and wrong for the rest, so the caller was left
+    guessing and guessed generously.
+
+    The states are now named, and only :data:`CANONICAL` permits an identifier to
+    pass through untranslated.
+    """
+
+    #: The payload was aliased and the mapping is present. Every identifier a
+    #: response names must appear in it.
+    ALIASED = "aliased"
+    #: Positively identified as predating aliasing: the stored evaluator record is
+    #: well-formed and simply has no alias key, so the learner payload names
+    #: canonical identifiers. The one state in which identity translation is
+    #: correct, and it is proved rather than assumed.
+    CANONICAL = "canonical"
+    #: Missing, malformed, or written under a scheme this code does not know.
+    #: Nothing can be resolved and nothing may be assumed.
+    UNRESOLVED = "unresolved"
+
+
+@dataclass(frozen=True)
+class ComponentAliases:
+    """The alias state of one component, and its mapping when it has one."""
+
+    state: AliasState
+    #: ``alias -> canonical``. Only meaningful for :data:`AliasState.ALIASED`.
+    #:
+    #: Built per instance rather than shared: a mutable default on a frozen
+    #: dataclass is the kind of thing that goes wrong once, confusingly.
+    mapping: dict[str, str] = dataclasses.field(default_factory=dict)
+
+    @property
+    def resolvable(self) -> bool:
+        return self.state is not AliasState.UNRESOLVED
+
+
+#: What an evaluator record must contain to count as a component that predates
+#: aliasing rather than one whose record went missing. A row exists, it parsed,
+#: and it carries at least one of the keys the evaluator half is made of — so
+#: "no aliases here" is a statement about an intact record rather than about an
+#: absence nobody can explain.
+_EVALUATOR_KEYS = ("answer", "evaluation")
+
+
 def component_aliases(
     *,
     principal: Principal,
     experience_id: str,
     component_key: str,
     config: LearningStudioConfig | None = None,
-) -> dict[str, str] | None:
-    """The ``alias -> canonical`` map for one component, or ``None``.
+) -> ComponentAliases:
+    """How to read one component's learner-facing identifiers.
 
-    ``None`` means *this component has no alias record* — it was prepared before
-    identifiers were aliased, and the payload it serves names canonical ones. A
-    dictionary means the projection **was** aliased, and every identifier a
-    response names has to appear in it; an empty dictionary is therefore a
-    statement that no identifier is resolvable, not an invitation to skip
-    translation.
+    Scoped in SQL by profile, learner, experience, and component key, exactly like
+    every other learner-owned read — so a session for one experience cannot obtain
+    the mapping for another, and a component belonging to somebody else is
+    indistinguishable from one that does not exist.
 
-    Read to translate a submitted response back into the identifiers an evaluator
-    will eventually compare against. Scoped in SQL by profile, learner,
-    experience, and component key, exactly like every other learner-owned read —
-    so a session for one experience cannot obtain the mapping for another, and a
-    mapping for a component that does not exist is an empty map rather than an
-    error a caller could learn from.
-
-    Returns only the mapping. The row it comes from also holds the answer, the
-    rubric, the hints and the branching; none of those leaves this function.
+    Returns only the state and the mapping. The row it comes from also holds the
+    answer, the rubric, the hints and the branching; none of that leaves here.
     """
     config = config or load_config()
     profile = principal.profile
@@ -2421,12 +2473,7 @@ def component_aliases(
     with storage.connect(config) as conn:
         learner_id = _find_learner(conn, principal)
         if learner_id is None:
-            # No such learner in this profile, so no component and no record.
-            # `None` rather than `{}` for the same reason as an unknown component:
-            # an empty mapping is a claim that *this* aliased component resolves
-            # nothing, and saying that about a component nobody can see would make
-            # the caller's fail-closed check depend on which lookup missed.
-            return None
+            return ComponentAliases(AliasState.UNRESOLVED)
 
         row = conn.execute(
             "SELECT e.evaluation"
@@ -2446,18 +2493,55 @@ def component_aliases(
         ).fetchone()
 
     if row is None:
-        return None
-    stored = json.loads(str(row["evaluation"]))
-    if not isinstance(stored.get("alias_scheme"), int):
-        # Prepared before identifiers were aliased: the payload this learner was
-        # served names the canonical identifiers directly, so there is nothing to
-        # translate. Distinguished from "aliased, mapping empty" on purpose —
-        # collapsing the two is what let an untranslatable identifier through.
-        return None
+        # No evaluator row for this component. That may mean a component with
+        # nothing to hide, a row that was never written, or a component that is
+        # not this learner's. None of those is evidence that the payload names
+        # canonical identifiers, so none of them earns identity translation.
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    try:
+        stored = json.loads(str(row["evaluation"]))
+    except ValueError:
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if not isinstance(stored, dict):
+        return ComponentAliases(AliasState.UNRESOLVED)
+
     aliases = stored.get("aliases")
-    if not isinstance(aliases, dict):
-        return {}
-    return {str(alias): str(canonical) for alias, canonical in aliases.items()}
+    scheme = stored.get("alias_scheme")
+    claims_aliasing = "aliases" in stored or "alias_scheme" in stored
+
+    if isinstance(aliases, dict):
+        # A mapping is present, so the payload *was* aliased however it is
+        # labelled. A record from the previous head carries no scheme number
+        # because the field did not exist when it was written; reading it as
+        # "pre-alias" would hand a learner-facing alias straight through, which is
+        # the defect this replaces. An absent marker is therefore the previous
+        # format, and any marker that is not one we support is a refusal.
+        if scheme is not None and (
+            not isinstance(scheme, int)
+            or isinstance(scheme, bool)
+            or scheme not in SUPPORTED_ALIAS_SCHEMES
+        ):
+            return ComponentAliases(AliasState.UNRESOLVED)
+        return ComponentAliases(
+            AliasState.ALIASED,
+            {str(alias): str(canonical) for alias, canonical in aliases.items()},
+        )
+
+    if claims_aliasing:
+        # Either key present without a usable mapping: a component claiming to be
+        # aliased with nothing to alias with. Tested on key *presence* rather than
+        # on the value, because `"aliases": null` is a damaged record, not a
+        # record that predates aliasing — a pre-alias record has no such key at
+        # all. Both are refusals.
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    if any(key in stored for key in _EVALUATOR_KEYS):
+        # An intact evaluator record with no alias key at all: prepared before
+        # identifiers were aliased, so the payload it serves is canonical.
+        return ComponentAliases(AliasState.CANONICAL)
+
+    return ComponentAliases(AliasState.UNRESOLVED)
 
 
 def reveal_component_answer(
