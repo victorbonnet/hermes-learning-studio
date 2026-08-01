@@ -2212,7 +2212,14 @@ def _insert_experience(
             # the one an answer key names. Stored under its own key so that
             # `reveal_component_answer`, which reads `answer`, cannot reach it and
             # a future reader has to ask for it deliberately.
-            hidden = {**hidden, "aliases": projection.aliases}
+            #
+            # The scheme number is what makes translation able to fail *closed*.
+            # Without it, "no mapping" and "a mapping that does not cover this
+            # identifier" are indistinguishable from "this component predates
+            # aliasing", and the only safe reading of the third is the identity —
+            # which would silently store a learner-facing alias as an evaluator
+            # identifier. The marker says which world a component belongs to.
+            hidden = {**hidden, "aliases": projection.aliases, "alias_scheme": ALIAS_SCHEME}
         if hidden:
             conn.execute(
                 "INSERT INTO experience_component_evaluations"
@@ -2369,6 +2376,12 @@ def _experience_payload(row: sqlite3.Row, components: list[sqlite3.Row]) -> dict
 #: other type's answer key are not here and cannot be requested.
 REVEALABLE_ANSWER_FIELDS: dict[str, str] = {"flashcard": "back"}
 
+#: Version of the identifier-aliasing scheme a stored component was prepared
+#: under. Recorded per component rather than per database so that experiences
+#: prepared before aliasing keep working, and are *known* to be that rather than
+#: assumed to be.
+ALIAS_SCHEME = 1
+
 #: Said when a reveal is not available. The same message for "no such component",
 #: "not that type", and "nothing stored", for the usual reason: the difference
 #: would turn the route into a description of somebody's exercise.
@@ -2381,8 +2394,15 @@ def component_aliases(
     experience_id: str,
     component_key: str,
     config: LearningStudioConfig | None = None,
-) -> dict[str, str]:
-    """The ``alias -> canonical`` map for one component, or an empty map.
+) -> dict[str, str] | None:
+    """The ``alias -> canonical`` map for one component, or ``None``.
+
+    ``None`` means *this component has no alias record* — it was prepared before
+    identifiers were aliased, and the payload it serves names canonical ones. A
+    dictionary means the projection **was** aliased, and every identifier a
+    response names has to appear in it; an empty dictionary is therefore a
+    statement that no identifier is resolvable, not an invitation to skip
+    translation.
 
     Read to translate a submitted response back into the identifiers an evaluator
     will eventually compare against. Scoped in SQL by profile, learner,
@@ -2401,7 +2421,12 @@ def component_aliases(
     with storage.connect(config) as conn:
         learner_id = _find_learner(conn, principal)
         if learner_id is None:
-            return {}
+            # No such learner in this profile, so no component and no record.
+            # `None` rather than `{}` for the same reason as an unknown component:
+            # an empty mapping is a claim that *this* aliased component resolves
+            # nothing, and saying that about a component nobody can see would make
+            # the caller's fail-closed check depend on which lookup missed.
+            return None
 
         row = conn.execute(
             "SELECT e.evaluation"
@@ -2421,11 +2446,18 @@ def component_aliases(
         ).fetchone()
 
     if row is None:
+        return None
+    stored = json.loads(str(row["evaluation"]))
+    if not isinstance(stored.get("alias_scheme"), int):
+        # Prepared before identifiers were aliased: the payload this learner was
+        # served names the canonical identifiers directly, so there is nothing to
+        # translate. Distinguished from "aliased, mapping empty" on purpose —
+        # collapsing the two is what let an untranslatable identifier through.
+        return None
+    aliases = stored.get("aliases")
+    if not isinstance(aliases, dict):
         return {}
-    stored = json.loads(str(row["evaluation"])).get("aliases")
-    if not isinstance(stored, dict):
-        return {}
-    return {str(alias): str(canonical) for alias, canonical in stored.items()}
+    return {str(alias): str(canonical) for alias, canonical in aliases.items()}
 
 
 def reveal_component_answer(

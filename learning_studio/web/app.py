@@ -497,7 +497,7 @@ def create_app(dependencies: Dependencies | None = None):
                 current["type"],
                 current["payload"].get("content", {}),
                 submitted,
-                resolve=lambda alias: aliases.get(alias, alias),
+                resolve=_identifier_resolver(aliases),
             )
         except ResponseContractError as exc:
             raise ApiError(400, INVALID_RESPONSE_MESSAGE, reason=exc.reason) from exc
@@ -666,6 +666,33 @@ def create_app(dependencies: Dependencies | None = None):
         )
 
     return app
+
+
+def _identifier_resolver(aliases: dict[str, str] | None):
+    """Turn a served identifier into the one an evaluator knows, or refuse.
+
+    ``aliases is None`` is the only case in which an identifier passes through
+    unchanged, and it means something specific: the component has no alias record
+    because it was prepared before identifiers were aliased, so what it served
+    *is* canonical.
+
+    Anything else fails closed. The previous version was
+    ``aliases.get(alias, alias)``, which reads as a harmless default and is not
+    one: an absent or incomplete mapping made a learner-facing alias look like a
+    resolved evaluator identifier, and it was then stored as the learner's answer.
+    Nothing downstream could have noticed — the value is a well-formed identifier,
+    it is simply the wrong one, and it names nothing in the answer key.
+    """
+    if aliases is None:
+        return lambda value: value
+
+    def resolve(value: str) -> str:
+        try:
+            return aliases[value]
+        except KeyError:
+            raise ResponseContractError("identifier_unresolvable") from None
+
+    return resolve
 
 
 def _enforce_reveal_contract(session, component_id: str, response: Any) -> None:

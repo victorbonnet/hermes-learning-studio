@@ -1145,12 +1145,38 @@ than left alone by an unlucky draw. The same applies to `matching.right` and
 `labeling.label_bank`, whose option lists are naturally written parallel to the
 rows they answer.
 
-The shuffle is server-side, in `Component.learner_payload()`, and there is no way
-to ask for "no shuffle" — a frontend that received the correct order and was
-trusted to scramble it would be one bug away from displaying the answer, and the
-bug would be invisible. A `timeline` with `show_dates: false` is served without
-its `date_label` at all, for the same reason: a date is an ordering clue, and
+The shuffle is server-side, in `Component.project()`, and there is no way to ask
+for "no shuffle" — a frontend that received the correct order and was trusted to
+scramble it would be one bug away from displaying the answer, and the bug would be
+invisible. A `timeline` with `show_dates: false` is served without its
+`date_label` at all, for the same reason: a date is an ordering clue, and
 withholding it beats sending it and trusting the client not to render it.
+
+**The forbidden arrangement is reconstructed, never read off the answer.** For
+`matching` and `labeling` the answer is a *set of statements* — `pairs` and
+`labels` mean the same thing whatever order they are written in — so reading the
+arrangement out of their record order produced a list that was often not the
+answer at all. The guard then rejected candidates for matching a phantom and
+settled on the real one; with a two-row card, which has exactly two arrangements,
+that served the answer every single time. The order to exclude is now built the
+way the card is read: map `left_id → right_id`, then walk `content.left`.
+
+**Identifiers are aliased too.** Hiding the order does not hide the names: a
+manifest whose tokens are `t1, t2, t3, t4` spells out its own answer to anyone who
+sorts them, and no registry rule can stop an author writing that. Every identifier
+inside a component's content is replaced with a random one when the projection is
+built, so the card carries names with nothing to read into. The `alias → canonical`
+map is stored beside the evaluator's data, never served, and translated back when
+a response arrives.
+
+That translation **fails closed**. An identifier the mapping does not cover is
+refused and the exercise does not advance — it is not passed through unchanged,
+which would store a learner-facing alias as though it were an evaluator's
+identifier: a well-formed value naming nothing in the answer key, which nothing
+downstream could have caught. Components prepared before aliasing existed carry no
+alias record at all, which is a *different* state from "aliased, mapping empty",
+recorded explicitly as `alias_scheme` and the only case in which an identifier
+passes through.
 
 A component type this build does not know renders an *unsupported* card naming
 the type, and can be skipped — it submits `{"skipped": true}` — so the exercise

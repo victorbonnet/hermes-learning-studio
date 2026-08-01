@@ -1152,3 +1152,78 @@ def test_a_card_the_client_cannot_draw_may_still_be_skipped(client, experience_i
     )
 
     assert skipped.status_code == 200
+
+
+def test_an_untranslatable_identifier_is_refused_and_advances_nothing(client, deps, experience_id):
+    """The API's own fail-closed path, not just the resolver's.
+
+    Simulates the alias record going missing — a partially wired deployment, a
+    component from a store written by something else. The learner-facing alias is
+    well-formed and was genuinely served; it simply cannot be turned into anything
+    an evaluator would recognise, so it is refused rather than stored as itself.
+    """
+    token, _ = open_session(client, experience_id)
+    current = client.get("/api/session/component", headers=session_headers(token)).json()
+    served = current["component"]["payload"]["content"]["options"][0]["id"]
+
+    object.__setattr__(deps, "component_aliases", lambda *_: {})
+
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served}},
+        headers=session_headers(token),
+    )
+
+    assert refused.status_code == 400
+    assert served not in refused.text
+    after = client.get("/api/session/component", headers=session_headers(token)).json()
+    assert after["component"]["component_id"] == "q-one"
+    assert after["progress"]["answered"] == 0
+
+
+def test_a_component_with_no_alias_record_still_accepts_canonical_identifiers(
+    client, deps, experience_id
+):
+    """Experiences prepared before aliasing keep working, explicitly.
+
+    `None` is the marker for "this component has no alias record", which is a
+    different statement from "aliased, and the mapping is empty" — the identity
+    fallback that conflated them is the defect this replaced.
+    """
+    from tests.component_examples import example
+
+    token, _ = open_session(client, experience_id)
+    canonical = example("multiple_choice")["content"]["options"][0]["id"]
+
+    object.__setattr__(deps, "component_aliases", lambda *_: None)
+    # A legacy component would also have served canonical content, so the
+    # contract is checked against that rather than against the aliased payload.
+    object.__setattr__(
+        deps,
+        "load_experience",
+        lambda principal, experience_id_arg: _legacy_bundle(deps, principal, experience_id_arg),
+    )
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": canonical}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+
+
+def _legacy_bundle(deps, principal, experience_id):
+    """A delivery bundle whose components carry canonical identifiers.
+
+    What a stored experience looked like before identifiers were aliased.
+    """
+    from tests.component_examples import example
+
+    bundle = service.delivery_bundle(
+        principal=principal, experience_id=experience_id, config=deps.config
+    )
+    for component in bundle.experience["components"]:
+        if component["type"] == "multiple_choice":
+            component["payload"]["content"] = example("multiple_choice")["content"]
+    return bundle

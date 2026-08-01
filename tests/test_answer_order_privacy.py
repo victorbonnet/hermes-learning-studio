@@ -267,7 +267,7 @@ def test_a_pre_scrambled_manifest_is_still_never_served_in_answer_order(componen
     """Source order and answer order genuinely differ, and only one is forbidden."""
     component = build(component_type)
     field = ANSWER_BEARING_ORDER[component_type][0]
-    forbidden = field.forbidden(component.answer)
+    forbidden = field.forbidden(component.answer, component.content)
 
     # Author the source in an order that is not the answer.
     scrambled = list(reversed(component.content[field.field]))
@@ -359,9 +359,10 @@ def test_the_order_table_names_only_real_fields():
         content_fields = {field.name for field in SPEC_BY_TYPE[component_type].content}
         for rule in rules:
             assert rule.field in content_fields, f"{component_type}.{rule.field}"
-            # And the rule really reads an arrangement out of the answer, rather
-            # than silently returning nothing and forbidding nothing.
-            assert rule.forbidden(build(component_type).answer)
+            # And the rule really reconstructs an arrangement, rather than
+            # silently returning nothing and forbidding nothing.
+            component = build(component_type)
+            assert rule.forbidden(component.answer, component.content)
 
 
 # ── Nothing else leaks along the way ─────────────────────────────────────
@@ -377,3 +378,116 @@ def test_shuffling_introduces_no_canary_and_loses_no_field(component_type: str):
     assert CANARY not in json.dumps(payload)
     if component.content:
         assert set(payload["content"]) == set(component.content)
+
+
+# ── An answer record is a set of statements, not a sequence ───────────────
+#
+# `pairs` and `labels` mean the same thing whatever order they are written in.
+# The first version of the guard read the forbidden arrangement straight off
+# those records, so an author who happened to list them in a different order
+# from the rows produced a "forbidden" list that was not the answer — the guard
+# rejected candidates for matching a phantom, and settled on the real one.
+
+
+PARALLEL_SHAPES = {
+    # component -> (option bank, answer field, row field, row key, value key)
+    "matching": ("right", "pairs", "left", "left_id", "right_id"),
+    "labeling": ("label_bank", "labels", "markers", "marker_id", "label_id"),
+}
+
+
+def real_answer_arrangement(component, component_type: str) -> list[str]:
+    """The order the bank must never be served in, read the way a card is read.
+
+    Built here independently of the implementation — row by row, looking each row
+    up in the answer — so this agrees with `_parallel_order` only if both are
+    right.
+    """
+    _bank, answer_field, row_field, row_key, value_key = PARALLEL_SHAPES[component_type]
+    chosen = {entry[row_key]: entry[value_key] for entry in component.answer[answer_field]}
+    return [chosen[row["id"]] for row in component.content[row_field]]
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+@pytest.mark.parametrize("reversed_records", [False, True])
+def test_an_option_bank_is_never_served_in_answer_order(
+    component_type: str, reversed_records: bool
+):
+    """Both record orders, because the exercise is identical either way."""
+    bank, answer_field, _row_field, _row_key, _value_key = PARALLEL_SHAPES[component_type]
+    source = example(component_type)
+    if reversed_records:
+        source["answer"][answer_field] = list(reversed(source["answer"][answer_field]))
+    component = build_component(source, "component")
+    forbidden = real_answer_arrangement(component, component_type)
+
+    for _attempt in range(100):
+        shown = ids(
+            shuffled_content(component_type, component.content, answer=component.answer)[bank]
+        )
+        assert shown != forbidden, (
+            f"{component_type} served the real answer with the answer records "
+            f"{'reversed' if reversed_records else 'as authored'}"
+        )
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_reordering_the_answer_records_does_not_change_what_is_forbidden(component_type: str):
+    """The rule reads the rows, so record order cannot move the target."""
+    bank, answer_field, *_ = PARALLEL_SHAPES[component_type]
+    rule = ANSWER_BEARING_ORDER[component_type][0]
+    assert rule.field == bank
+
+    as_authored = build_component(example(component_type), "component")
+    source = example(component_type)
+    source["answer"][answer_field] = list(reversed(source["answer"][answer_field]))
+    reordered = build_component(source, "component")
+
+    assert rule.forbidden(as_authored.answer, as_authored.content) == rule.forbidden(
+        reordered.answer, reordered.content
+    )
+    assert rule.forbidden(as_authored.answer, as_authored.content) == real_answer_arrangement(
+        as_authored, component_type
+    )
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_a_two_row_card_is_the_case_the_old_guard_got_exactly_backwards(component_type: str):
+    """With two entries there are two arrangements, so a wrong exclusion picks
+    the answer every single time rather than half of them."""
+    bank, answer_field, row_field, row_key, value_key = PARALLEL_SHAPES[component_type]
+    source = example(component_type)
+    source["answer"][answer_field] = list(reversed(source["answer"][answer_field]))
+    component = build_component(source, "component")
+
+    assert len(component.content[bank]) == 2, "this fixture is no longer the two-entry case"
+    forbidden = real_answer_arrangement(component, component_type)
+
+    served = {
+        tuple(
+            ids(shuffled_content(component_type, component.content, answer=component.answer)[bank])
+        )
+        for _attempt in range(100)
+    }
+
+    assert tuple(forbidden) not in served
+    assert len(served) == 1, "with two entries there is exactly one other arrangement"
+
+
+def test_a_rule_whose_answer_does_not_cover_every_row_forbids_nothing_rather_than_guessing():
+    """Validation makes this unreachable; the fallback is still stated.
+
+    A partial arrangement would be a guess, and excluding a guess is how the
+    defect above worked. Forbidding nothing leaves the "not the source order"
+    half of the guard doing the work.
+    """
+    from learning_studio.components import ANSWER_BEARING_ORDER as RULES
+
+    rule = RULES["matching"][0]
+    content = {
+        "left": [{"id": "a", "text": "A"}, {"id": "b", "text": "B"}],
+        "right": [{"id": "one", "text": "One"}, {"id": "two", "text": "Two"}],
+    }
+
+    assert rule.forbidden({"pairs": [{"left_id": "a", "right_id": "one"}]}, content) == []
+    assert rule.forbidden({}, content) == []

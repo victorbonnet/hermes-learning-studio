@@ -1568,35 +1568,66 @@ def _content_required(spec: ComponentSpec) -> bool:
 class OrderRule:
     """One visible list whose *order* would otherwise disclose the answer.
 
-    ``forbidden`` reads the arrangement out of the *hidden* answer. Comparing
-    against the source list is not enough and was the first version's mistake: a
-    manifest may legitimately be authored pre-scrambled, and then "different from
-    what the author typed" and "different from the correct answer" are two
-    different tests — with the shuffle free to land on the second one.
+    ``forbidden`` builds the arrangement that must never be served, from the
+    hidden answer *and* the content it refers to. Both arguments are needed, and
+    the first version of this took only the answer — which was wrong for the
+    option-bank cases in a way that served the key every time.
+
+    An ``answer`` record is a **set of statements**, not a sequence: ``pairs`` and
+    ``labels`` mean the same thing whatever order they are written in, and an
+    author reordering them changes nothing about the exercise. Reading the
+    arrangement straight off those records therefore produced a list that was
+    frequently *not* the answer, the guard rejected candidates for matching a
+    phantom, and the arrangement it settled on was the real one. The forbidden
+    order has to be reconstructed the way the card is read: row by row, in the
+    order the rows appear.
     """
 
     field: str
-    forbidden: Callable[[dict[str, Any]], list[str]]
+    forbidden: Callable[[dict[str, Any], dict[str, Any]], list[str]]
 
 
-def _answer_order(answer: dict[str, Any]) -> list[str]:
+def _answer_order(answer: dict[str, Any], _content: dict[str, Any]) -> list[str]:
+    """The ordering families state their arrangement directly."""
     order = answer.get("order")
     return [str(entry) for entry in order] if isinstance(order, list) else []
 
 
-def _pair_order(answer: dict[str, Any]) -> list[str]:
-    """The right-hand ids in row order — what a parallel option list would be."""
-    pairs = answer.get("pairs")
-    if not isinstance(pairs, list):
-        return []
-    return [str(pair.get("right_id")) for pair in pairs if isinstance(pair, dict)]
+def _parallel_order(
+    answer_field: str, row_key: str, value_key: str, row_field: str
+) -> Callable[[dict[str, Any], dict[str, Any]], list[str]]:
+    """The arrangement an option bank must not be served in.
 
+    The card shows one row per entry in ``row_field`` and one dropdown beside
+    each. Serving the bank in the order those rows are answered means "the first
+    option of the first dropdown" is the key, so *that* is the arrangement to
+    exclude — reconstructed by looking each row up in the answer, never by
+    reading the answer's own record order.
+    """
 
-def _label_order(answer: dict[str, Any]) -> list[str]:
-    labels = answer.get("labels")
-    if not isinstance(labels, list):
-        return []
-    return [str(entry.get("label_id")) for entry in labels if isinstance(entry, dict)]
+    def forbidden(answer: dict[str, Any], content: dict[str, Any]) -> list[str]:
+        records = answer.get(answer_field)
+        rows = content.get(row_field)
+        if not isinstance(records, list) or not isinstance(rows, list):
+            return []
+        chosen = {
+            str(record.get(row_key)): str(record.get(value_key))
+            for record in records
+            if isinstance(record, dict)
+        }
+        arrangement = []
+        for row in rows:
+            if not isinstance(row, dict) or row.get("id") not in chosen:
+                # A row the answer does not cover. Validation makes this
+                # impossible — `left_id` and `marker_id` are declared as
+                # permutations of their rows — so rather than guess at a partial
+                # arrangement, forbid nothing and let the "not the source order"
+                # half of the guard do the work.
+                return []
+            arrangement.append(chosen[row["id"]])
+        return arrangement
+
+    return forbidden
 
 
 #: Two different leaks, both mechanical:
@@ -1617,8 +1648,10 @@ ANSWER_BEARING_ORDER: dict[str, tuple[OrderRule, ...]] = {
     "sequence_order": (OrderRule("steps", _answer_order),),
     "timeline": (OrderRule("events", _answer_order),),
     "process_flow": (OrderRule("stages", _answer_order),),
-    "matching": (OrderRule("right", _pair_order),),
-    "labeling": (OrderRule("label_bank", _label_order),),
+    "matching": (OrderRule("right", _parallel_order("pairs", "left_id", "right_id", "left")),),
+    "labeling": (
+        OrderRule("label_bank", _parallel_order("labels", "marker_id", "label_id", "markers")),
+    ),
 }
 
 #: Content fields that are only meant to be shown when a sibling flag says so.
@@ -1737,7 +1770,9 @@ def shuffled_content(
             # Nothing to hide: an empty or single-entry list has exactly one
             # arrangement, and returning it unchanged is the whole truth.
             continue
-        projected[rule.field] = _rearranged(entries, rule.forbidden(answer or {}), rearrange)
+        projected[rule.field] = _rearranged(
+            entries, rule.forbidden(answer or {}, content), rearrange
+        )
 
     for list_field, entry_field, flag in gates:
         if projected.get(flag) is True:

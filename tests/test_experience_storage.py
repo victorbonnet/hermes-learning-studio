@@ -679,3 +679,121 @@ def test_deleting_an_experience_cascades_to_both_child_tables(hermes_home: Path)
 
     assert rows("SELECT * FROM experience_components") == []
     assert rows("SELECT * FROM experience_component_evaluations") == []
+
+
+# ── The alias record is versioned ─────────────────────────────────────────
+
+
+def test_a_prepared_component_records_which_alias_scheme_it_used(hermes_home, principal):
+    """The marker is what lets translation fail closed.
+
+    Without it, "no mapping", "an incomplete mapping" and "prepared before
+    aliasing existed" are indistinguishable, and the only reading that does not
+    break the third is the identity — which is exactly the fallback that stored a
+    learner-facing alias as an evaluator identifier.
+    """
+    from learning_studio import service
+    from learning_studio.service import ALIAS_SCHEME
+    from tests.component_examples import example, manifest
+
+    result = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("multiple_choice", id="q-one")]),
+    )
+
+    aliases = service.component_aliases(
+        principal=principal,
+        experience_id=result["experience_id"],
+        component_key="q-one",
+    )
+
+    assert isinstance(aliases, dict)
+    assert aliases, "an aliased component reported no mapping"
+    assert ALIAS_SCHEME == 1
+
+    stored = json.loads(_evaluation_row(result["experience_id"], "q-one")["evaluation"])
+    assert stored["alias_scheme"] == ALIAS_SCHEME
+    assert set(stored["aliases"]) == set(aliases)
+
+
+def test_a_component_without_the_marker_reports_no_alias_record(hermes_home, principal):
+    """A row written before aliasing reads as `None`, not as an empty mapping."""
+    from learning_studio import service, storage
+    from learning_studio.config import load_config
+    from tests.component_examples import example, manifest
+
+    result = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("multiple_choice", id="q-one")]),
+    )
+    row = _evaluation_row(result["experience_id"], "q-one")
+    legacy = json.loads(row["evaluation"])
+    legacy.pop("alias_scheme")
+    legacy.pop("aliases")
+    with storage.connect(load_config()) as conn:
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(legacy), row["component_id"]),
+        )
+
+    assert (
+        service.component_aliases(
+            principal=principal,
+            experience_id=result["experience_id"],
+            component_key="q-one",
+        )
+        is None
+    )
+
+
+def test_an_unknown_component_reports_no_alias_record(hermes_home, principal):
+    from learning_studio import service
+    from tests.component_examples import example, manifest
+
+    result = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("multiple_choice", id="q-one")]),
+    )
+
+    assert (
+        service.component_aliases(
+            principal=principal,
+            experience_id=result["experience_id"],
+            component_key="no-such-card",
+        )
+        is None
+    )
+
+
+def test_another_learner_cannot_read_an_alias_mapping(hermes_home, principal, other_principal):
+    """The mapping is scoped in SQL like every other learner-owned read."""
+    from learning_studio import service
+    from tests.component_examples import example, manifest
+
+    result = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("multiple_choice", id="q-one")]),
+    )
+
+    assert (
+        service.component_aliases(
+            principal=other_principal,
+            experience_id=result["experience_id"],
+            component_key="q-one",
+        )
+        is None
+    )
+
+
+def _evaluation_row(experience_id: str, component_key: str):
+    from learning_studio import storage
+    from learning_studio.config import load_config
+
+    with storage.connect(load_config()) as conn:
+        return conn.execute(
+            "SELECT e.component_id, e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ? AND c.component_key = ?",
+            (experience_id, component_key),
+        ).fetchone()

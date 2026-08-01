@@ -483,3 +483,128 @@ def test_the_client_message_is_fixed_and_carries_no_submitted_value():
     assert "distinctive" not in str(raised.value)
     assert "distinctive" not in raised.value.reason
     assert "smuggled" not in raised.value.reason
+
+
+# ── Translation fails closed ──────────────────────────────────────────────
+#
+# `aliases.get(alias, alias)` reads as a harmless default and is not one. An
+# absent or incomplete mapping made a learner-facing alias look like a resolved
+# evaluator identifier, and it was stored as the learner's answer — a well-formed
+# identifier that names nothing in the answer key, which nothing downstream could
+# have noticed.
+
+
+def resolver(aliases):
+    """The API's own resolver, so this tests the shipped behaviour."""
+    from learning_studio.web.app import _identifier_resolver
+
+    return _identifier_resolver(aliases)
+
+
+def test_an_identifier_with_no_mapping_is_refused_rather_than_passed_through():
+    component = build_component(example("multiple_choice"), "component")
+    projected = component.project()
+    alias = projected.payload["content"]["options"][0]["id"]
+
+    with pytest.raises(ResponseContractError) as raised:
+        validate_component_response(
+            "multiple_choice",
+            projected.payload["content"],
+            {"option_id": alias},
+            resolve=resolver({}),
+        )
+
+    assert raised.value.reason == "identifier_unresolvable"
+
+
+def test_an_incomplete_mapping_is_refused_for_the_identifier_it_omits():
+    """One missing entry is enough; the rest resolving is not a defence."""
+    component = build_component(example("sequence_order"), "component")
+    projected = component.project()
+    shown = [entry["id"] for entry in projected.payload["content"]["steps"]]
+    partial = {
+        alias: canonical for alias, canonical in projected.aliases.items() if alias != shown[0]
+    }
+
+    with pytest.raises(ResponseContractError) as raised:
+        validate_component_response(
+            "sequence_order",
+            projected.payload["content"],
+            {"order": shown},
+            resolve=resolver(partial),
+        )
+
+    assert raised.value.reason == "identifier_unresolvable"
+
+
+def test_a_complete_mapping_still_resolves_every_identifier():
+    """The mirror: failing closed must not fail on the ordinary case."""
+    component = build_component(example("matching"), "component")
+    projected = component.project()
+    left = [entry["id"] for entry in projected.payload["content"]["left"]]
+    right = [entry["id"] for entry in projected.payload["content"]["right"]]
+
+    accepted = validate_component_response(
+        "matching",
+        projected.payload["content"],
+        {"pairs": [{"left_id": one, "right_id": right[0]} for one in left]},
+        resolve=resolver(projected.aliases),
+    )
+
+    canonical_left = {entry["id"] for entry in component.content["left"]}
+    canonical_right = {entry["id"] for entry in component.content["right"]}
+    for pair in accepted["pairs"]:
+        assert pair["left_id"] in canonical_left
+        assert pair["right_id"] in canonical_right
+
+
+def test_a_component_prepared_before_aliasing_passes_identifiers_through():
+    """`None` means "no alias record", which is a different claim from "empty".
+
+    Collapsing the two is what let an untranslatable identifier through. A
+    component that predates aliasing served canonical identifiers, so there is
+    genuinely nothing to translate.
+    """
+    component = build_component(example("multiple_choice"), "component")
+    canonical = component.content["options"][0]["id"]
+
+    accepted = validate_component_response(
+        "multiple_choice",
+        component.content,
+        {"option_id": canonical},
+        resolve=resolver(None),
+    )
+
+    assert accepted == {"option_id": canonical}
+
+
+def test_the_legacy_path_still_refuses_an_identifier_that_was_never_served():
+    """Passing identifiers through is not the same as accepting anything."""
+    component = build_component(example("multiple_choice"), "component")
+
+    with pytest.raises(ResponseContractError) as raised:
+        validate_component_response(
+            "multiple_choice",
+            component.content,
+            {"option_id": "invented"},
+            resolve=resolver(None),
+        )
+
+    assert raised.value.reason == "identifier_unknown"
+
+
+def test_the_refusal_names_no_identifier():
+    component = build_component(example("multiple_choice"), "component")
+    projected = component.project()
+    alias = projected.payload["content"]["options"][0]["id"]
+
+    with pytest.raises(ResponseContractError) as raised:
+        validate_component_response(
+            "multiple_choice",
+            projected.payload["content"],
+            {"option_id": alias},
+            resolve=resolver({}),
+        )
+
+    assert alias not in str(raised.value)
+    assert alias not in raised.value.reason
