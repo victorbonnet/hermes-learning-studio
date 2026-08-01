@@ -712,3 +712,160 @@ def test_the_full_projection_also_hides_the_prefix_under_aliases(component_type:
             projection.aliases[entry["id"]] for entry in projection.payload["content"][bank_field]
         ]
         assert shown[: len(forbidden)] != forbidden
+
+
+# ── A recognisable distractor must not be a step around the guard ─────────
+#
+# Excluding the exact prefix fixed `[answer1, answer2, distractor]` and left
+# `[distractor, answer1, answer2]` and `[answer1, distractor, answer2]` — the same
+# disclosure with a step in front of it. A learner who recognises the distractor
+# and discounts it is reading the answer in order, and recognising a distractor is
+# exactly what a distractor invites. Production randomness exposed this in roughly
+# one projection in four.
+
+
+def answer_subsequence(shown: list[str], answer: list[str]) -> list[str]:
+    """What is left of the bank once anything not in the answer is discounted."""
+    answer_entries = set(answer)
+    return [entry for entry in shown if entry in answer_entries]
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+@pytest.mark.parametrize("at", ["before", "between", "after"])
+@pytest.mark.parametrize("count", [1, 2])
+def test_discounting_the_distractors_does_not_reveal_the_answer(
+    component_type: str, at: str, count: int
+):
+    """The reported defect, across every placement and both cardinalities."""
+    component = with_distractors(component_type, at=at, count=count)
+    forbidden = answer_vector(component, component_type)
+
+    for _attempt in range(500):
+        shown = bank_of(component, component_type)
+        assert answer_subsequence(shown, forbidden) != forbidden, (
+            f"{component_type} with {count} distractor(s) {at} the answer left the answer "
+            "in order once the distractors were discounted"
+        )
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_the_reported_reproduction_is_closed(component_type: str):
+    """One distractor, ten thousand production projections, zero exposures.
+
+    The count is the one from the review: ~2,450/10,000 before, and the assertion
+    is on every single draw rather than on a rate.
+    """
+    component = with_distractors(component_type, at="before")
+    forbidden = answer_vector(component, component_type)
+
+    exposures = sum(
+        answer_subsequence(bank_of(component, component_type), forbidden) == forbidden
+        for _attempt in range(10_000)
+    )
+
+    assert exposures == 0, f"{component_type} exposed the answer {exposures}/10000 times"
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_more_distractors_than_answers_is_still_safe(component_type: str):
+    """A bank mostly made of distractors is the easiest place to hide a leak."""
+    component = with_distractors(component_type, at="between", count=5)
+    forbidden = answer_vector(component, component_type)
+    bank_field = PARALLEL_SHAPES[component_type][0]
+
+    assert len(component.content[bank_field]) >= 2 * len(forbidden) + 1
+
+    for _attempt in range(500):
+        assert answer_subsequence(bank_of(component, component_type), forbidden) != forbidden
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+@pytest.mark.parametrize(
+    ("name", "shuffle"),
+    [
+        ("no-op", lambda items: None),
+        ("reverse", lambda items: items.reverse()),
+    ],
+)
+def test_a_degenerate_shuffle_cannot_leave_a_readable_subsequence(
+    component_type: str, name: str, shuffle
+):
+    """Every random attempt rejected, so the deterministic fallback decides."""
+    component = with_distractors(component_type, at="before", count=2)
+    forbidden = answer_vector(component, component_type)
+
+    shown = bank_of(component, component_type, shuffle=shuffle)
+
+    assert answer_subsequence(shown, forbidden) != forbidden
+    assert sorted(shown) == sorted(ids(component.content[PARALLEL_SHAPES[component_type][0]]))
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_an_injected_shuffle_that_hides_the_answer_behind_a_distractor_is_overruled(
+    component_type: str,
+):
+    """The exact arrangement the prefix check let through."""
+    component = with_distractors(component_type, at="before", count=1)
+    forbidden = answer_vector(component, component_type)
+    bank_field = PARALLEL_SHAPES[component_type][0]
+
+    def distractor_then_answer(items):
+        rank = {name: index for index, name in enumerate(forbidden)}
+        # Distractors first, then the answer in order: not the prefix, but the
+        # answer all the same.
+        items.sort(key=lambda entry: (entry["id"] in rank, rank.get(entry["id"], 0)))
+
+    for _attempt in range(50):
+        shown = bank_of(component, component_type, shuffle=distractor_then_answer)
+        assert answer_subsequence(shown, forbidden) != forbidden
+        assert sorted(shown) == sorted(ids(component.content[bank_field]))
+
+
+@pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
+def test_the_ordering_families_are_unaffected_by_the_subsequence_rule(component_type: str):
+    """A bank with no distractors has no subsequence to discount.
+
+    Stated so that the stricter rule is known not to have changed the equal-
+    cardinality case, which is every ordering card and every bank without extras.
+    """
+    component = build(component_type)
+    forbidden = answer_vector(component, component_type)
+    bank_field = PARALLEL_SHAPES[component_type][0]
+
+    assert len(component.content[bank_field]) == len(forbidden)
+
+    for _attempt in range(200):
+        shown = bank_of(component, component_type)
+        assert shown != forbidden
+        assert answer_subsequence(shown, forbidden) == shown
+
+
+def test_an_answer_bearing_entry_repeated_in_the_bank_is_still_handled():
+    """Two rows answered by the same option: the answer has a repeat in it.
+
+    `matching` permits that — two left items can share a right item — so the
+    subsequence of a three-entry bank can be longer than the bank itself. The
+    comparison must not assume otherwise.
+    """
+    content = {
+        "left": [
+            {"id": "one", "text": "One"},
+            {"id": "two", "text": "Two"},
+        ],
+        "right": [
+            {"id": "shared", "text": "Shared"},
+            {"id": "other", "text": "Other"},
+        ],
+    }
+    answer = {
+        "pairs": [
+            {"left_id": "one", "right_id": "shared"},
+            {"left_id": "two", "right_id": "shared"},
+        ]
+    }
+    forbidden = ["shared", "shared"]
+
+    for _attempt in range(200):
+        shown = ids(shuffled_content("matching", content, answer=answer)["right"])
+        assert sorted(shown) == ["other", "shared"]
+        assert answer_subsequence(shown, forbidden) != forbidden

@@ -1698,20 +1698,31 @@ def mint_alias() -> str:
 def _discloses(shown: list[str], forbidden: list[str]) -> bool:
     """True when ``shown`` gives the answer away.
 
-    The comparison is on the **prefix**, not the whole list, and that is the whole
-    correction. An option bank may legitimately be longer than the number of rows
-    it answers — distractors are a normal part of a matching or labeling card —
-    and the renderer puts the *same* bank order behind every dropdown. So a bank
-    beginning ``[answer1, answer2, …]`` hands over the complete answer: pick the
-    first option for the first row, the second for the second, done. Comparing the
-    whole list called that safe, because a three-entry bank is never equal to a
-    two-entry answer.
+    The comparison ignores anything that is not part of the answer. That is the
+    correction, and it took two goes to get right.
+
+    An option bank may legitimately be longer than the number of rows it answers
+    — distractors are a normal part of a matching or labeling card — and the
+    renderer puts the *same* bank order behind every dropdown. Comparing the whole
+    list called ``[answer1, answer2, distractor]`` safe, because three entries are
+    never equal to two. Comparing the prefix fixed that one arrangement and left
+    ``[distractor, answer1, answer2]`` and ``[answer1, distractor, answer2]``,
+    which are the same disclosure with a step in front of it: a learner who
+    recognises the distractor and discounts it is looking at the answer in order.
+
+    So the answer-bearing entries are pulled out in the order they appear and
+    compared against the answer. Whatever sits between them does not make the
+    sequence safe, because a distractor is exactly the thing a learner can be
+    expected to spot.
 
     An empty ``forbidden`` forbids nothing. That is the "the answer does not cover
     every row" case, where a partial arrangement would be a guess, and excluding a
     guess is how the original defect worked.
     """
-    return bool(forbidden) and shown[: len(forbidden)] == forbidden
+    if not forbidden:
+        return False
+    answer_entries = set(forbidden)
+    return [entry for entry in shown if entry in answer_entries] == forbidden
 
 
 def _rearranged(

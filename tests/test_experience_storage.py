@@ -786,6 +786,7 @@ def test_a_record_with_no_alias_key_at_all_is_positively_canonical(hermes_home):
         pytest.param({"alias_scheme": None, "aliases": None}, id="mapping-not-an-object"),
         pytest.param({"aliases": ["a", "b"]}, id="mapping-is-a-list"),
         pytest.param({"aliases": "x"}, id="mapping-is-a-string"),
+        pytest.param({"alias_scheme": None}, id="scheme-explicitly-null"),
     ],
 )
 def test_a_malformed_alias_record_is_unresolved(hermes_home, damage: dict):
@@ -920,3 +921,132 @@ def test_the_mapping_never_carries_evaluator_data(hermes_home):
     assert CANARY not in rendered
     for forbidden in ("answer", "rubric", "hints", "feedback", "branching"):
         assert forbidden not in rendered
+
+
+# ── Mapping entries are validated, never coerced ──────────────────────────
+#
+# `str(canonical)` accepted anything a JSON document could hold and made it
+# identifier-shaped: `None` became `"None"`, `42` became `"42"`, a nested object
+# became its `repr`. Each was then stored as a learner's answer — a plausible
+# value naming nothing in the answer key, which is the identity fallback's failure
+# arriving by another route.
+
+
+def _corrupt_first_alias_value(value):
+    def change(stored: dict) -> None:
+        alias = next(iter(stored["aliases"]))
+        stored["aliases"][alias] = value
+
+    return change
+
+
+def _with_damaged_record(change) -> str:
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    stored = json.loads(row["evaluation"])
+    change(stored)
+    _rewrite_evaluation(row["component_id"], stored)
+    return experience_id
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(None, id="null"),
+        pytest.param(42, id="integer"),
+        pytest.param(True, id="boolean"),
+        pytest.param({"nested": "bad"}, id="object"),
+        pytest.param(["a"], id="list"),
+        pytest.param("", id="empty-string"),
+        pytest.param("   ", id="whitespace"),
+        pytest.param("has spaces", id="not-an-identifier"),
+        pytest.param("UPPERCASE", id="wrong-case"),
+        pytest.param("x" * 200, id="too-long"),
+    ],
+)
+def test_a_malformed_canonical_value_makes_the_record_unresolved(hermes_home, value):
+    from learning_studio.service import AliasState
+
+    experience_id = _with_damaged_record(_corrupt_first_alias_value(value))
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("", id="empty-key"),
+        pytest.param("has spaces", id="key-not-an-identifier"),
+        pytest.param("UPPER", id="key-wrong-case"),
+        pytest.param("x" * 200, id="key-too-long"),
+    ],
+)
+def test_a_malformed_alias_key_makes_the_record_unresolved(hermes_home, key):
+    """A key that could never have been minted as an alias."""
+    from learning_studio.service import AliasState
+
+    def change(stored: dict) -> None:
+        canonical = next(iter(stored["aliases"].values()))
+        stored["aliases"] = {key: canonical}
+
+    experience_id = _with_damaged_record(change)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_a_key_that_is_merely_wrong_is_not_malformed(hermes_home):
+    """`"null"` is a legal identifier: JSON has no non-string keys to reject.
+
+    It is refused later and elsewhere — by the response contract, which only
+    accepts identifiers this learner was actually served — rather than here, where
+    the question is whether the record can be read at all. Worth stating, because
+    the obvious test to write asserts the opposite and passes for the wrong reason.
+    """
+    from learning_studio.service import AliasState
+
+    experience_id = _with_damaged_record(
+        lambda stored: stored.__setitem__("aliases", {"null": "matrix"})
+    )
+    aliases = _state(experience_id)
+
+    assert aliases.state is AliasState.ALIASED
+    assert aliases.mapping == {"null": "matrix"}
+
+
+def test_one_bad_entry_condemns_the_whole_mapping(hermes_home):
+    """A partially readable mapping is not partially usable."""
+    from learning_studio.service import AliasState
+
+    def change(stored: dict) -> None:
+        stored["aliases"]["xdeadbeefdeadbeef"] = 42
+
+    experience_id = _with_damaged_record(change)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_a_well_formed_mapping_is_returned_unchanged(hermes_home):
+    """The mirror: validation must not reject what this system itself minted."""
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    stored = json.loads(_evaluation_row(experience_id, "q-one")["evaluation"])
+
+    aliases = _state(experience_id)
+
+    assert aliases.state is AliasState.ALIASED
+    assert aliases.mapping == stored["aliases"]
+    assert all(
+        isinstance(key, str) and isinstance(value, str) for key, value in aliases.mapping.items()
+    )
+
+
+def test_an_absent_scheme_is_compatible_but_a_null_one_is_not(hermes_home):
+    """Presence and value are different questions, and only one is compatible."""
+    from learning_studio.service import AliasState
+
+    absent = _with_damaged_record(lambda stored: stored.pop("alias_scheme"))
+    assert _state(absent).state is AliasState.ALIASED
+
+    explicit_null = _with_damaged_record(lambda stored: stored.__setitem__("alias_scheme", None))
+    assert _state(explicit_null).state is AliasState.UNRESOLVED

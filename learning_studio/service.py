@@ -2449,6 +2449,58 @@ class ComponentAliases:
 _EVALUATOR_KEYS = ("answer", "evaluation")
 
 
+def _scheme_is_readable(stored: dict[str, Any]) -> bool:
+    """Whether this record's alias scheme is one this code can act on.
+
+    Three cases, and the middle one is the compatibility path:
+
+    - the key is **absent** — the previous release wrote records this way, before
+      the field existed. A mapping is present, so the payload was aliased, and
+      reading it as pre-alias would hand a learner-facing alias straight through.
+      Compatible.
+    - the key is **present and supported** — the current format.
+    - anything else, ``null`` included — refused. An explicitly null scheme is a
+      damaged record, not the previous format: the previous format has no key.
+      Distinguishing presence from value is the whole point of the ``in`` test.
+    """
+    if "alias_scheme" not in stored:
+        return True
+    scheme = stored["alias_scheme"]
+    if isinstance(scheme, bool) or not isinstance(scheme, int):
+        return False
+    return scheme in SUPPORTED_ALIAS_SCHEMES
+
+
+def _validated_mapping(aliases: dict[Any, Any]) -> dict[str, str] | None:
+    """The mapping if every entry is already a pair of identifiers, else ``None``.
+
+    Validated rather than coerced. ``str()`` accepted anything a JSON document
+    could hold and turned it into something identifier-shaped: ``None`` became
+    ``"None"``, ``42`` became ``"42"``, and a nested object became its ``repr``.
+    Each of those was then stored as a learner's answer — a plausible-looking
+    value naming nothing in the answer key, which is the same class of failure as
+    the identity fallback it replaced, arriving by a different route.
+
+    The check is the registry's own identifier rule, so a mapping that survives it
+    holds identifiers this system could actually have minted.
+    """
+    from .safety import UnsafeContent, safe_identifier
+
+    validated: dict[str, str] = {}
+    for alias, canonical in aliases.items():
+        if not isinstance(alias, str) or not isinstance(canonical, str):
+            return None
+        try:
+            safe_identifier(alias, "alias")
+            safe_identifier(canonical, "canonical identifier")
+        except UnsafeContent:
+            return None
+        if alias in validated:  # pragma: no cover - JSON objects cannot repeat keys
+            return None
+        validated[alias] = canonical
+    return validated
+
+
 def component_aliases(
     *,
     principal: Principal,
@@ -2507,33 +2559,21 @@ def component_aliases(
         return ComponentAliases(AliasState.UNRESOLVED)
 
     aliases = stored.get("aliases")
-    scheme = stored.get("alias_scheme")
     claims_aliasing = "aliases" in stored or "alias_scheme" in stored
 
-    if isinstance(aliases, dict):
-        # A mapping is present, so the payload *was* aliased however it is
-        # labelled. A record from the previous head carries no scheme number
-        # because the field did not exist when it was written; reading it as
-        # "pre-alias" would hand a learner-facing alias straight through, which is
-        # the defect this replaces. An absent marker is therefore the previous
-        # format, and any marker that is not one we support is a refusal.
-        if scheme is not None and (
-            not isinstance(scheme, int)
-            or isinstance(scheme, bool)
-            or scheme not in SUPPORTED_ALIAS_SCHEMES
-        ):
+    if isinstance(aliases, dict) and _scheme_is_readable(stored):
+        mapping = _validated_mapping(aliases)
+        if mapping is None:
             return ComponentAliases(AliasState.UNRESOLVED)
-        return ComponentAliases(
-            AliasState.ALIASED,
-            {str(alias): str(canonical) for alias, canonical in aliases.items()},
-        )
+        return ComponentAliases(AliasState.ALIASED, mapping)
 
     if claims_aliasing:
-        # Either key present without a usable mapping: a component claiming to be
-        # aliased with nothing to alias with. Tested on key *presence* rather than
-        # on the value, because `"aliases": null` is a damaged record, not a
-        # record that predates aliasing — a pre-alias record has no such key at
-        # all. Both are refusals.
+        # Either key present, but the record cannot be read: a mapping that is not
+        # an object, a scheme this code does not understand, or entries that are
+        # not identifiers. Tested on key *presence* rather than on the value,
+        # because `"aliases": null` and `"alias_scheme": null` are damaged records,
+        # not records that predate aliasing — a pre-alias record has neither key
+        # at all. All of them are refusals.
         return ComponentAliases(AliasState.UNRESOLVED)
 
     if any(key in stored for key in _EVALUATOR_KEYS):

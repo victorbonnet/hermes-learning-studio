@@ -1435,3 +1435,98 @@ def _legacy_bundle(deps, principal, experience_id):
         if component["type"] == "multiple_choice":
             component["payload"]["content"] = example("multiple_choice")["content"]
     return bundle
+
+
+@pytest.mark.parametrize(
+    "corrupt_value",
+    [
+        pytest.param(None, id="null"),
+        pytest.param(42, id="integer"),
+        pytest.param(True, id="boolean"),
+        pytest.param({"nested": "bad"}, id="object"),
+    ],
+)
+def test_a_malformed_alias_value_is_refused_and_changes_nothing(
+    client, deps, hermes_home, principal, config, corrupt_value
+):
+    """The reported probe: these returned 200 and recorded the coerced value.
+
+    `str(canonical)` made each of them identifier-shaped — `"None"`, `"42"`,
+    `"True"`, a `repr` — and the session advanced with a stored answer naming
+    nothing in the answer key.
+    """
+    from learning_studio import storage
+
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+
+    with storage.connect(config) as conn:
+        row = conn.execute(
+            "SELECT component_id, evaluation FROM experience_component_evaluations"
+        ).fetchone()
+        stored = json.loads(row["evaluation"])
+        stored["aliases"][next(iter(stored["aliases"]))] = corrupt_value
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(stored), row["component_id"]),
+        )
+
+    before = session_state(deps)
+    refused = assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+    # And nothing about the damage is described to the caller.
+    for leaked in ("None", "42", "True", "nested"):
+        assert leaked not in refused.json()["error"]
+
+
+def test_an_explicitly_null_scheme_is_refused_while_an_absent_one_still_works(
+    client, deps, hermes_home, principal, config
+):
+    """Presence and value are different questions.
+
+    An absent `alias_scheme` is the previous release's format and must keep
+    working; an explicit `null` is a damaged record and must not.
+    """
+    from learning_studio import storage
+
+    def rewrite(experience_id: str, change) -> None:
+        with storage.connect(config) as conn:
+            row = conn.execute(
+                "SELECT e.component_id, e.evaluation"
+                "  FROM experience_components AS c"
+                "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+                " WHERE c.experience_id = ?",
+                (experience_id,),
+            ).fetchone()
+            stored = json.loads(row["evaluation"])
+            change(stored)
+            conn.execute(
+                "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+                (json.dumps(stored), row["component_id"]),
+            )
+
+    canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+
+    absent = _prepared(principal, config)
+    rewrite(absent, lambda stored: stored.pop("alias_scheme"))
+    token, _ = open_session(client, absent)
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served_option(client, token)}},
+        headers=session_headers(token),
+    )
+    assert accepted.status_code == 200
+    assert next(iter(deps.sessions._sessions.values())).answers["q-one"]["option_id"] in canonical
+
+    explicit_null = _prepared(principal, config)
+    rewrite(explicit_null, lambda stored: stored.__setitem__("alias_scheme", None))
+    other_token, _ = open_session(client, explicit_null)
+    served = served_option(client, other_token)
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served}},
+        headers=session_headers(other_token),
+    )
+    assert refused.status_code == 400
+    assert refused.json()["error"] == INVALID_RESPONSE_MESSAGE
