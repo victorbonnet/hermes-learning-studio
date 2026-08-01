@@ -71,6 +71,12 @@ def canonical_order(projection, field: str) -> list[str]:
     return [projection.aliases[entry["id"]] for entry in projection.payload["content"][field]]
 
 
+def answer_subsequence(shown: list[str], answer: list[str]) -> list[str]:
+    """What is left of the bank once anything not in the answer is discounted."""
+    answer_entries = set(answer)
+    return [entry for entry in shown if entry in answer_entries]
+
+
 # ── The leak itself ───────────────────────────────────────────────────────
 
 
@@ -613,7 +619,11 @@ def test_record_and_row_order_do_not_change_what_is_excluded(
     assert rule.forbidden(component.answer, component.content) == forbidden
 
     for _attempt in range(200):
-        assert bank_of(component, component_type)[: len(forbidden)] != forbidden
+        shown = bank_of(component, component_type)
+        # The filtered subsequence, not merely the prefix: a distractor sitting in
+        # front of the answer would satisfy the weaker check while leaving the
+        # answer readable to anyone who discounts it.
+        assert answer_subsequence(shown, forbidden) != forbidden
 
 
 @pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))
@@ -711,7 +721,7 @@ def test_the_full_projection_also_hides_the_prefix_under_aliases(component_type:
         shown = [
             projection.aliases[entry["id"]] for entry in projection.payload["content"][bank_field]
         ]
-        assert shown[: len(forbidden)] != forbidden
+        assert answer_subsequence(shown, forbidden) != forbidden
 
 
 # ── A recognisable distractor must not be a step around the guard ─────────
@@ -722,12 +732,6 @@ def test_the_full_projection_also_hides_the_prefix_under_aliases(component_type:
 # and discounts it is reading the answer in order, and recognising a distractor is
 # exactly what a distractor invites. Production randomness exposed this in roughly
 # one projection in four.
-
-
-def answer_subsequence(shown: list[str], answer: list[str]) -> list[str]:
-    """What is left of the bank once anything not in the answer is discounted."""
-    answer_entries = set(answer)
-    return [entry for entry in shown if entry in answer_entries]
 
 
 @pytest.mark.parametrize("component_type", tuple(PARALLEL_SHAPES))

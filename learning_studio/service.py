@@ -37,6 +37,7 @@ from typing import Any
 
 from . import candidates as candidate_rules
 from . import storage
+from .components import content_identifiers
 from .config import LearningStudioConfig, load_config
 from .context import Candidate, candidates_from_config, candidates_from_request, resolve
 from .identity import Principal
@@ -2221,7 +2222,16 @@ def _insert_experience(
             # aliasing", and the only safe reading of the third is the identity —
             # which would silently store a learner-facing alias as an evaluator
             # identifier. The marker says which world a component belongs to.
-            hidden = {**hidden, "aliases": projection.aliases, "alias_scheme": ALIAS_SCHEME}
+            hidden = {
+                **hidden,
+                "aliases": projection.aliases,
+                "alias_scheme": ALIAS_SCHEME,
+                # The independent half of the proof. Written from the canonical
+                # component before any identifier was renamed, so a mapping that
+                # invents a target — or points two aliases at one — contradicts
+                # something it did not author.
+                "canonical_identifiers": sorted(projection.canonical_identifiers),
+            }
         if hidden:
             conn.execute(
                 "INSERT INTO experience_component_evaluations"
@@ -2380,9 +2390,19 @@ REVEALABLE_ANSWER_FIELDS: dict[str, str] = {"flashcard": "back"}
 
 #: Version of the identifier-aliasing scheme a stored component was prepared
 #: under. Recorded per component rather than per database so that experiences
-#: prepared before aliasing keep working, and are *known* to be that rather than
-#: assumed to be.
-ALIAS_SCHEME = 1
+#: prepared under an older scheme keep working, and are *known* to be that rather
+#: than assumed to be.
+#:
+#: - **2** — the current format. Stores the mapping *and* an independent
+#:   inventory of the canonical identifiers, captured before renaming, so the
+#:   mapping can be proved a bijection onto the component's real identifiers.
+#: - **1** — mapping only. Syntactically checkable and coverage-checkable against
+#:   the served payload, but there is no stored record of what the canonical
+#:   identifiers were, so "this alias points at a real target" cannot be proved.
+ALIAS_SCHEME = 2
+
+#: The scheme that stored a mapping with no canonical inventory beside it.
+_MAPPING_ONLY_SCHEME = 1
 
 #: Said when a reveal is not available. The same message for "no such component",
 #: "not that type", and "nothing stored", for the usual reason: the difference
@@ -2393,7 +2413,7 @@ NOT_REVEALABLE_MESSAGE = "There is nothing to turn over on this card."
 #: Alias schemes this code knows how to read. A record naming anything else was
 #: written by a newer version, and the only safe reading of "I do not know how
 #: these identifiers were made" is to refuse.
-SUPPORTED_ALIAS_SCHEMES = frozenset({ALIAS_SCHEME})
+SUPPORTED_ALIAS_SCHEMES = frozenset({ALIAS_SCHEME, _MAPPING_ONLY_SCHEME})
 
 
 class AliasState(Enum):
@@ -2412,9 +2432,23 @@ class AliasState(Enum):
     pass through untranslated.
     """
 
-    #: The payload was aliased and the mapping is present. Every identifier a
-    #: response names must appear in it.
+    #: The payload was aliased, and the mapping has been **proved** against the
+    #: component: it covers exactly the aliases actually served, its targets are
+    #: exactly the canonical identifiers recorded when the component was prepared,
+    #: and it is a bijection between the two.
     ALIASED = "aliased"
+    #: The payload was aliased under a scheme that stored no canonical inventory —
+    #: scheme 1, or the previous head's unversioned records. Everything that can
+    #: be proved about such a record *is* proved: syntax, exact coverage of the
+    #: served aliases, cardinality, and injectivity. What cannot be proved is that
+    #: each target is a real identifier of the original component, because nothing
+    #: recorded what those were.
+    #:
+    #: Kept as its own state rather than folded into :data:`ALIASED`, because a
+    #: weaker guarantee wearing the stronger name is how the last three defects
+    #: happened. It resolves identifiers — an experience prepared last week should
+    #: not stop working — and a reader can see exactly what it is worth.
+    ALIASED_UNVERIFIED = "aliased_unverified"
     #: Positively identified as predating aliasing: the stored evaluator record is
     #: well-formed and simply has no alias key, so the learner payload names
     #: canonical identifiers. The one state in which identity translation is
@@ -2439,6 +2473,11 @@ class ComponentAliases:
     @property
     def resolvable(self) -> bool:
         return self.state is not AliasState.UNRESOLVED
+
+    @property
+    def translates(self) -> bool:
+        """True when a response's identifiers go through :attr:`mapping`."""
+        return self.state in {AliasState.ALIASED, AliasState.ALIASED_UNVERIFIED}
 
 
 #: What an evaluator record must contain to count as a component that predates
@@ -2501,6 +2540,68 @@ def _validated_mapping(aliases: dict[Any, Any]) -> dict[str, str] | None:
     return validated
 
 
+def _proved(mapping: dict[str, str], served: set[str], stored: dict[str, Any]) -> ComponentAliases:
+    """Decide what a syntactically valid mapping is actually worth.
+
+    Two invariants are checkable for every aliased record, whatever scheme it was
+    written under, because both sides are stored independently of the mapping:
+
+    - **exact coverage** — the mapping's keys are precisely the aliases the stored
+      learner payload declares. A missing key means an identifier the learner can
+      legitimately name and nothing can translate; an extra one is a key for a
+      card that was never served.
+    - **injectivity** — no two aliases point at the same target. A mapping that
+      collapsed two options onto one would silently reinterpret which one the
+      learner chose, and the submission would look perfectly ordinary.
+
+    The third invariant needs evidence the mapping cannot supply about itself:
+
+    - **the targets are the component's real identifiers**, compared against the
+      inventory captured from the canonical content at preparation. Deriving that
+      set from ``mapping.values()`` would let a damaged mapping declare its own
+      expected answer and pass — which is exactly how a mapping pointing every
+      alias at ``"unknown"`` was accepted.
+
+    A record with no inventory cannot supply that third proof, so it does not get
+    the name of one: it resolves as
+    :data:`AliasState.ALIASED_UNVERIFIED`.
+    """
+    if set(mapping) != served:
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if len(set(mapping.values())) != len(mapping):
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    # The declared scheme decides which shape the record must have, rather than
+    # the reader trusting whatever happens to be present. A scheme-1 record
+    # carrying an inventory, or a scheme-2 record missing one, is internally
+    # inconsistent — it cannot have been written by either version of this code —
+    # and an inconsistent record is a damaged one.
+    declared = stored.get("alias_scheme")
+    carries_inventory = "canonical_identifiers" in stored
+    if declared == ALIAS_SCHEME:
+        if not carries_inventory:
+            return ComponentAliases(AliasState.UNRESOLVED)
+    elif carries_inventory:
+        return ComponentAliases(AliasState.UNRESOLVED)
+    else:
+        # Scheme 1, or the previous head's unversioned records: everything
+        # provable has been proved, and the unprovable part is named rather than
+        # assumed.
+        return ComponentAliases(AliasState.ALIASED_UNVERIFIED, mapping)
+
+    inventory = stored.get("canonical_identifiers")
+    if not isinstance(inventory, list):
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if not all(isinstance(entry, str) for entry in inventory):
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if len(set(inventory)) != len(inventory):
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if set(mapping.values()) != set(inventory):
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    return ComponentAliases(AliasState.ALIASED, mapping)
+
+
 def component_aliases(
     *,
     principal: Principal,
@@ -2528,7 +2629,11 @@ def component_aliases(
             return ComponentAliases(AliasState.UNRESOLVED)
 
         row = conn.execute(
-            "SELECT e.evaluation"
+            # The learner payload comes back too: the aliases a response may name
+            # are the ones *served*, and reading them from the payload rather than
+            # from the mapping is what makes coverage a real check instead of the
+            # mapping agreeing with itself.
+            "SELECT e.evaluation, c.learner_payload"
             "  FROM experience_components AS c"
             "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
             " WHERE c.experience_id = ? AND c.component_key = ?"
@@ -2565,7 +2670,13 @@ def component_aliases(
         mapping = _validated_mapping(aliases)
         if mapping is None:
             return ComponentAliases(AliasState.UNRESOLVED)
-        return ComponentAliases(AliasState.ALIASED, mapping)
+
+        try:
+            payload = json.loads(str(row["learner_payload"]))
+        except ValueError:
+            return ComponentAliases(AliasState.UNRESOLVED)
+        served = content_identifiers(payload.get("content")) if isinstance(payload, dict) else set()
+        return _proved(mapping, served, stored)
 
     if claims_aliasing:
         # Either key present, but the record cannot be read: a mapping that is not

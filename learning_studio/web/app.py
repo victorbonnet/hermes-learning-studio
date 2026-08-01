@@ -683,6 +683,13 @@ def _identifier_resolver(aliases: ComponentAliases):
     canonical identifiers. That is a *positive* finding about the record, not an
     inference from something being absent.
 
+    Two states translate through the mapping: :data:`AliasState.ALIASED`, whose
+    mapping has been proved a bijection onto the component's stored canonical
+    identifiers, and :data:`AliasState.ALIASED_UNVERIFIED`, written under a scheme
+    that recorded no inventory to prove it against. Both resolve the same way —
+    the difference is what the service could establish, not what the caller does
+    with it — and neither passes an identifier through untranslated.
+
     Everything else refuses. The version before this returned the identifier
     unchanged whenever the lookup came back empty, which reads as a harmless
     default and is not one: a missing evaluator row, a malformed marker, an
@@ -693,7 +700,7 @@ def _identifier_resolver(aliases: ComponentAliases):
     """
     if aliases.state is AliasState.CANONICAL:
         return lambda value: value
-    if aliases.state is not AliasState.ALIASED:
+    if not aliases.translates:
         # Nothing is resolvable, so nothing may be accepted. Raised per identifier
         # rather than up front so that the refusal travels the same path as every
         # other contract failure and produces the same generic message.

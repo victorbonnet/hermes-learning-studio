@@ -1841,6 +1841,20 @@ def shuffled_content(
 # lives with the evaluator's data and is translated back when a response arrives.
 
 
+def content_identifiers(content: Any) -> set[str]:
+    """Every identifier declared anywhere in a content structure.
+
+    The single definition of "an identifier this component declares". Preparation
+    captures the canonical inventory with it, aliasing decides what to rename with
+    it, and validation checks coverage with it — so the three cannot disagree
+    about what counts, which is the sort of drift that turns a check into a
+    formality.
+    """
+    found: set[str] = set()
+    _content_identifiers(content, found)
+    return found
+
+
 def _content_identifiers(node: Any, found: set[str]) -> None:
     """Every ``id`` declared anywhere in a content structure."""
     if isinstance(node, dict):
@@ -1886,8 +1900,7 @@ def aliased_content(
     The returned mapping is keyed by *alias* because that is the direction it is
     read in: a response arrives naming aliases and has to be translated back.
     """
-    declared: set[str] = set()
-    _content_identifiers(content, declared)
+    declared = content_identifiers(content)
     if not declared:
         return content, {}
 
@@ -1916,6 +1929,16 @@ class LearnerProjection:
     #: ``alias -> canonical``. Evaluator-only: this is stored beside the answer
     #: and is never part of anything sent to a client.
     aliases: dict[str, str]
+    #: Every identifier the *canonical* component declared, taken before any of
+    #: them were renamed.
+    #:
+    #: Stored separately from the mapping, and that separation is the point. A
+    #: mapping cannot be checked against itself: ``set(mapping.values())`` is
+    #: whatever the mapping happens to say, so a damaged one defines its own
+    #: expected answer and passes. Recording the inventory independently means a
+    #: mapping that invents a target, or points two aliases at one target,
+    #: disagrees with something it did not write.
+    canonical_identifiers: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1974,13 +1997,16 @@ class Component:
         """
         payload: dict[str, Any] = {"id": self.id, "type": self.type, "prompt": self.prompt}
         aliases: dict[str, str] = {}
+        # Taken from the canonical content *before* anything is renamed, so it is
+        # evidence about the component rather than a restatement of the mapping.
+        canonical = frozenset(content_identifiers(self.content)) if self.content else frozenset()
         if self.content:
             visible = shuffled_content(self.type, self.content, answer=self.answer, shuffle=shuffle)
             visible, aliases = aliased_content(self.type, visible, mint=mint)
             payload["content"] = visible
         if self.accessibility:
             payload["accessibility"] = self.accessibility
-        return LearnerProjection(payload=payload, aliases=aliases)
+        return LearnerProjection(payload=payload, aliases=aliases, canonical_identifiers=canonical)
 
     def learner_payload(
         self,

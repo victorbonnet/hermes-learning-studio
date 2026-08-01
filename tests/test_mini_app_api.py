@@ -1247,7 +1247,10 @@ def test_a_previous_head_record_still_resolves_through_the_route(
             (experience_id, "q-one"),
         ).fetchone()
         stored = json.loads(row["evaluation"])
-        del stored["alias_scheme"]  # exactly what c71466f wrote
+        # Exactly what c71466f wrote: a mapping, no scheme number, and no
+        # canonical inventory — that field did not exist yet either.
+        del stored["alias_scheme"]
+        del stored["canonical_identifiers"]
         conn.execute(
             "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
             (json.dumps(stored), row["component_id"]),
@@ -1508,8 +1511,12 @@ def test_an_explicitly_null_scheme_is_refused_while_an_absent_one_still_works(
 
     canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
 
+    def previous_head(stored: dict) -> None:
+        stored.pop("alias_scheme")
+        stored.pop("canonical_identifiers")
+
     absent = _prepared(principal, config)
-    rewrite(absent, lambda stored: stored.pop("alias_scheme"))
+    rewrite(absent, previous_head)
     token, _ = open_session(client, absent)
     accepted = client.post(
         "/api/session/answer",
@@ -1530,3 +1537,258 @@ def test_an_explicitly_null_scheme_is_refused_while_an_absent_one_still_works(
     )
     assert refused.status_code == 400
     assert refused.json()["error"] == INVALID_RESPONSE_MESSAGE
+
+
+# ── Alias integrity, through the real route with real stored damage ───────
+#
+# Nothing here mocks `component_aliases`. Each test corrupts the stored evaluator
+# record the way a bug or a tampered database would, then drives the real API —
+# because the defect being closed was precisely that a syntactically valid record
+# sailed through every layer.
+
+
+def _damage_stored_component(config, experience_id: str, change, component_key: str = "q-one"):
+    from learning_studio import storage
+
+    with storage.connect(config) as conn:
+        row = conn.execute(
+            "SELECT e.component_id, e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ? AND c.component_key = ?",
+            (experience_id, component_key),
+        ).fetchone()
+        stored = json.loads(row["evaluation"])
+        change(stored)
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(stored), row["component_id"]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "change"),
+    [
+        pytest.param(
+            "unknown-target",
+            lambda stored: stored.__setitem__(
+                "aliases", {alias: "unknown" for alias in stored["aliases"]}
+            ),
+            id="every-target-unknown",
+        ),
+        pytest.param(
+            "one-unknown-target",
+            lambda stored: stored["aliases"].__setitem__(next(iter(stored["aliases"])), "unknown"),
+            id="one-target-unknown",
+        ),
+        pytest.param(
+            "duplicate-target",
+            lambda stored: stored.__setitem__(
+                "aliases",
+                {alias: next(iter(stored["aliases"].values())) for alias in stored["aliases"]},
+            ),
+            id="every-alias-one-target",
+        ),
+        pytest.param(
+            "missing-key",
+            lambda stored: stored["aliases"].pop(next(iter(stored["aliases"]))),
+            id="mapping-missing-a-served-alias",
+        ),
+        pytest.param(
+            "extra-key",
+            lambda stored: stored["aliases"].__setitem__("xdeadbeefdeadbeef", "matrix"),
+            id="mapping-has-an-unserved-alias",
+        ),
+        pytest.param(
+            "mismatched-inventory",
+            lambda stored: stored["canonical_identifiers"].append("extra"),
+            id="inventory-does-not-match",
+        ),
+        pytest.param(
+            "inventory-removed",
+            lambda stored: stored.pop("canonical_identifiers"),
+            id="scheme-2-without-an-inventory",
+        ),
+    ],
+)
+def test_a_corrupt_alias_record_is_refused_through_the_real_route(
+    client, deps, hermes_home, principal, config, name: str, change
+):
+    """The reported reproductions, and every neighbouring shape.
+
+    Both reported probes returned HTTP 200, recorded the value, and advanced the
+    session. Each must now be a state-neutral 400.
+    """
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+
+    _damage_stored_component(config, experience_id, change)
+    before = session_state(deps)
+
+    refused = assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+    # Nothing about the component or the damage is described to the caller.
+    for leaked in ("unknown", "canonical", "alias", "matrix", "cytosol", served):
+        assert leaked not in refused.json()["error"]
+
+
+def test_a_cross_component_mapping_is_refused_through_the_real_route(
+    client, deps, hermes_home, principal, config
+):
+    """A mapping that is valid — for the other card in the same experience."""
+    from learning_studio import storage
+
+    experience_id = service.prepare_experience(
+        principal=principal,
+        manifest=manifest(
+            [example("multiple_choice", id="q-one"), example("multi_select", id="q-two")]
+        ),
+        config=config,
+    )["experience_id"]
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+
+    with storage.connect(config) as conn:
+        other = json.loads(
+            conn.execute(
+                "SELECT e.evaluation FROM experience_components AS c"
+                "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+                " WHERE c.experience_id = ? AND c.component_key = ?",
+                (experience_id, "q-two"),
+            ).fetchone()["evaluation"]
+        )
+
+    _damage_stored_component(
+        config,
+        experience_id,
+        lambda stored: stored.update(
+            aliases=other["aliases"], canonical_identifiers=other["canonical_identifiers"]
+        ),
+    )
+    before = session_state(deps)
+
+    assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+
+def test_a_valid_current_mapping_still_resolves_through_the_real_route(
+    client, deps, hermes_home, principal, config
+):
+    """The mirror. Proving integrity must not make the ordinary case fail."""
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+    canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+    assert next(iter(deps.sessions._sessions.values())).answers["q-one"]["option_id"] in canonical
+
+
+def test_a_scheme_one_record_still_resolves_through_the_real_route(
+    client, deps, hermes_home, principal, config
+):
+    """An experience prepared under the mapping-only scheme keeps working."""
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+    canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+
+    def to_scheme_one(stored: dict) -> None:
+        stored["alias_scheme"] = 1
+        del stored["canonical_identifiers"]
+
+    _damage_stored_component(config, experience_id, to_scheme_one)
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+    assert next(iter(deps.sessions._sessions.values())).answers["q-one"]["option_id"] in canonical
+
+
+def test_a_corrupt_record_does_not_block_an_identifier_free_response(
+    client, deps, hermes_home, principal, config
+):
+    """A response naming no identifier needs no mapping, and never did.
+
+    `true_false` submits a bare boolean and `{"skipped": true}` names nothing, so
+    failing closed on alias resolution must not make those unanswerable — the
+    resolver is only ever reached for an identifier that needs translating.
+    """
+    experience_id = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("true_false", id="q-one")]),
+        config=config,
+    )["experience_id"]
+    token, _ = open_session(client, experience_id)
+
+    _damage_stored_component(
+        config, experience_id, lambda stored: stored.__setitem__("aliases", {"bogus": "x"})
+    )
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"value": True}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+
+
+def test_a_skip_is_accepted_whatever_the_alias_record_says(
+    client, deps, hermes_home, principal, config
+):
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+
+    _damage_stored_component(
+        config, experience_id, lambda stored: stored.__setitem__("aliases", {"bogus": "x"})
+    )
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"skipped": True}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+
+
+def test_every_corrupt_state_produces_one_indistinguishable_refusal(
+    client, deps, hermes_home, principal, config
+):
+    """A learner must not be able to tell which invariant failed."""
+    bodies = set()
+    statuses = set()
+
+    for change in (
+        lambda stored: stored.__setitem__(
+            "aliases", {alias: "unknown" for alias in stored["aliases"]}
+        ),
+        lambda stored: stored["aliases"].pop(next(iter(stored["aliases"]))),
+        lambda stored: stored.pop("canonical_identifiers"),
+        lambda stored: stored.pop("aliases"),
+    ):
+        experience_id = _prepared(principal, config)
+        token, _ = open_session(client, experience_id)
+        served = served_option(client, token)
+        _damage_stored_component(config, experience_id, change)
+        refused = client.post(
+            "/api/session/answer",
+            json={"component_id": "q-one", "response": {"option_id": served}},
+            headers=session_headers(token),
+        )
+        statuses.add(refused.status_code)
+        bodies.add(refused.text)
+
+    assert statuses == {400}
+    assert len(bodies) == 1, "the refusal distinguishes one damaged state from another"
