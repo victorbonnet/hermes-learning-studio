@@ -179,6 +179,12 @@ class RuntimeState:
             "server_state": self.server_state,
             "tunnel_state": getattr(tunnel, "state", "absent"),
             "tunnel_ready": bool(getattr(tunnel, "url", "")),
+            # The public address, over a loopback channel that already required
+            # this process's secret. It travels here because the Telegram button
+            # is built in the Hermes process and there is nowhere else for it to
+            # come from — and it stops here: no tool result, status payload, log
+            # line, or memory candidate carries it onward.
+            "tunnel_url": getattr(tunnel, "url", "") or "",
             "sessions": len(self.sessions) if self.sessions is not None else 0,
             "idle_timeout_seconds": self.settings.idle_timeout_seconds,
             "max_lifetime_seconds": self.settings.max_lifetime_seconds,
@@ -460,14 +466,28 @@ async def _after_ready(state: RuntimeState, settings: RuntimeSettings, *, clock)
 
 
 async def _start_tunnel(state: RuntimeState, settings: RuntimeSettings, *, clock) -> None:
-    """Bring up the public entrance, if this runtime was given one to bring up.
+    """Bring up the public entrance for the server that is already listening.
 
-    A no-op in this commit: the tunnel manager arrives with the change that
-    knows how to validate what ``cloudflared`` prints. The seam is here rather
-    than later so that the ordering above — listening, then tunnel, then
-    handshake — is settled before there is anything to get wrong about it.
+    The tunnel is pointed at this runtime's *own* bound port, so a tunnel can
+    only ever front the generation that started it. A failure here is recorded
+    rather than raised: the supervisor reads the tunnel state from the control
+    plane and decides whether a launch may proceed, which keeps that decision
+    in one place instead of two.
     """
-    return None
+    from ..config import load_config
+    from .tunnel import child_environment, loopback_target, open_tunnel
+
+    config = load_config()
+    state.tunnel = await open_tunnel(
+        executable=settings.cloudflared_path,
+        target=loopback_target(config.runtime_host, state.port),
+        environment=child_environment(dict(os.environ)),
+        timeout_seconds=config.tunnel_readiness_timeout_seconds,
+    )
+    if state.tunnel.ready:
+        logger.info("the tunnel is open")
+    else:
+        logger.warning("the tunnel did not open: %s", state.tunnel.reason or "unknown")
 
 
 async def _await_started(server, serving, *, timeout: float = 60.0) -> None:

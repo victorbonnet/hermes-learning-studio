@@ -107,10 +107,22 @@ class ControlReply:
     server_state: str
     #: ``pending`` | ``ready`` | ``failed``
     tunnel_state: str
-    #: True once the tunnel has published a URL this plugin accepted. The URL
-    #: itself deliberately does not travel in the shape used for status.
+    #: True once the tunnel has published a URL this plugin accepted.
     tunnel_ready: bool
+    #: The public address, or ``""``. Re-validated on the way in — the runtime
+    #: already checked it, and checking it again here costs nothing and means
+    #: the rule lives in one module rather than in one module *and* a promise
+    #: about another process. It is never included in :meth:`describe`.
+    tunnel_url: str
     payload: dict[str, Any]
+
+    def describe(self) -> dict[str, Any]:
+        """Lifecycle state safe to show an agent. No address, no URL."""
+        return {
+            "server_state": self.server_state,
+            "tunnel_state": self.tunnel_state,
+            "tunnel_ready": self.tunnel_ready,
+        }
 
     def matches(self, record: RuntimeRecord) -> bool:
         """Every identifying field agrees with the record, or this is not ours."""
@@ -198,6 +210,19 @@ def _reply_from(payload: dict[str, Any]) -> ControlReply:
     if isinstance(started_at, bool) or not isinstance(started_at, (int, float)):
         raise ControlError("control_field_started_at")
 
+    raw_url = payload.get("tunnel_url") or ""
+    tunnel_url = ""
+    if raw_url:
+        from .tunnel import TunnelError, validate_quick_tunnel_url
+
+        try:
+            tunnel_url = validate_quick_tunnel_url(raw_url)
+        except TunnelError as exc:
+            # A runtime reporting a URL this side will not accept is a runtime
+            # whose tunnel is not usable. Refused rather than passed along, and
+            # the offending string is not quoted.
+            raise ControlError(f"control_{exc.reason}") from exc
+
     return ControlReply(
         runtime_id=text("runtime_id"),
         generation=whole("generation"),
@@ -208,6 +233,7 @@ def _reply_from(payload: dict[str, Any]) -> ControlReply:
         server_state=text("server_state"),
         tunnel_state=text("tunnel_state"),
         tunnel_ready=bool(payload.get("tunnel_ready")),
+        tunnel_url=tunnel_url,
         payload=payload,
     )
 

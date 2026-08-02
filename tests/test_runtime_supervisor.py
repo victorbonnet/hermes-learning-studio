@@ -662,3 +662,73 @@ def test_the_real_runtime_starts_answers_and_stops(hermes_home: Path, monkeypatc
     assert outcome["state"] == "stopped"
     assert state.read_record() is None
     assert ownership.owned(handle.record, timeout=1.0) is False
+
+
+def test_the_real_runtime_opens_a_tunnel_from_the_operator_binary(hermes_home: Path, tmp_path):
+    """A live runtime and a stand-in for cloudflared. Still no network.
+
+    The fake prints what cloudflared prints and then waits, which is the whole
+    contract this plugin depends on. What is being tested is the seam: the
+    supervisor resolves an operator-approved executable, the runtime starts it
+    pointed at its own loopback port, and the URL it published survives
+    validation on both sides.
+    """
+    pytest.importorskip("fastapi")
+    pytest.importorskip("uvicorn")
+
+    binary = tmp_path / "cloudflared"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'echo "INF Requesting new quick Tunnel on trycloudflare.com..."\n'
+        'echo "|  https://fake-tunnel-abc.trycloudflare.com   |"\n'
+        "sleep 300\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+
+    settings = config(
+        runtime_readiness_timeout_seconds=60,
+        tunnel_readiness_timeout_seconds=20,
+        runtime_graceful_stop_seconds=10,
+        cloudflared_path=str(binary),
+    )
+
+    handle = supervisor.ensure_running(settings, python=Path(sys.executable))
+    try:
+        assert handle.reply.tunnel_state == "ready"
+        assert handle.public_url == "https://fake-tunnel-abc.trycloudflare.com"
+        # The address never appears in anything an agent is shown.
+        assert "trycloudflare" not in json.dumps(handle.describe())
+    finally:
+        outcome = supervisor.stop(settings)
+
+    assert outcome["state"] == "stopped"
+
+
+def test_a_runtime_whose_tunnel_prints_nothing_usable_stays_without_one(
+    hermes_home: Path, tmp_path
+):
+    """A failed tunnel is a runtime without a public entrance, not a crash."""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("uvicorn")
+
+    binary = tmp_path / "cloudflared"
+    binary.write_text(
+        '#!/bin/sh\necho "ERR failed to connect to the edge"\nexit 1\n', encoding="utf-8"
+    )
+    binary.chmod(0o755)
+
+    settings = config(
+        runtime_readiness_timeout_seconds=60,
+        tunnel_readiness_timeout_seconds=10,
+        runtime_graceful_stop_seconds=10,
+        cloudflared_path=str(binary),
+    )
+
+    handle = supervisor.ensure_running(settings, python=Path(sys.executable))
+    try:
+        assert handle.reply.tunnel_state == "failed"
+        assert handle.public_url == ""
+        assert handle.reply.server_state == "ready"
+    finally:
+        supervisor.stop(settings)

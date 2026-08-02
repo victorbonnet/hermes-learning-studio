@@ -274,6 +274,7 @@ def reply_for(rec: state.RuntimeRecord, **overrides) -> dict:
         "server_state": "ready",
         "tunnel_state": "ready",
         "tunnel_ready": True,
+        "tunnel_url": "",
     }
     payload.update(overrides)
     return payload
@@ -490,3 +491,58 @@ def test_the_control_plane_speaks_http_from_the_standard_library():
     assert "import http.client" in source
     for forbidden in ("httpx", "requests", "aiohttp", "urllib3"):
         assert forbidden not in source, forbidden
+
+
+# ── The tunnel address, as it crosses the control plane ───────────────────
+
+
+def test_a_reported_tunnel_url_is_revalidated_on_the_way_in(monkeypatch):
+    """The runtime already checked it. The rule still lives in one module."""
+    rec = record()
+    monkeypatch.setattr(
+        ownership,
+        "_request",
+        FakeControl(reply_for(rec, tunnel_url="https://calm-forest.trycloudflare.com")),
+    )
+
+    reply = ownership.query(rec)
+
+    assert reply.tunnel_url == "https://calm-forest.trycloudflare.com"
+
+
+@pytest.mark.parametrize(
+    "reported",
+    [
+        "https://calm-forest.trycloudflare.com.evil.test",
+        "http://calm-forest.trycloudflare.com",
+        "https://calm.trycloudflare.com@evil.test",
+        "https://evil.test",
+        12345,
+    ],
+)
+def test_a_runtime_reporting_an_unusable_url_is_not_believed(monkeypatch, reported):
+    rec = record()
+    monkeypatch.setattr(ownership, "_request", FakeControl(reply_for(rec, tunnel_url=reported)))
+
+    with pytest.raises(ownership.ControlError):
+        ownership.query(rec)
+
+
+def test_a_runtime_without_a_tunnel_reports_an_empty_address(monkeypatch):
+    rec = record()
+    monkeypatch.setattr(ownership, "_request", FakeControl(reply_for(rec, tunnel_url="")))
+
+    assert ownership.query(rec).tunnel_url == ""
+
+
+def test_the_safe_description_of_a_reply_never_carries_the_address(monkeypatch):
+    rec = record()
+    monkeypatch.setattr(
+        ownership,
+        "_request",
+        FakeControl(reply_for(rec, tunnel_url="https://calm-forest.trycloudflare.com")),
+    )
+
+    described = json.dumps(ownership.query(rec).describe())
+
+    assert "trycloudflare" not in described

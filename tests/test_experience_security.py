@@ -280,10 +280,14 @@ OPTIONAL_MODULES = ("fastapi", "starlette", "uvicorn", "PIL", "telegram", "telet
 #: Each list is grown by the change that needs it and never in advance, so the
 #: diff that adds a module able to start a process is also the diff that adds
 #: it here.
-_URLLIB_PARSE_ONLY = ("telegram_auth.py",)
+_URLLIB_PARSE_ONLY = ("telegram_auth.py", "runtime/tunnel.py")
 _TELEGRAM_SENDER: tuple[str, ...] = ()
 _LOOPBACK_HTTP = ("runtime/ownership.py",)
-_PROCESS_STARTERS = ("runtime/bootstrap.py", "runtime/supervisor.py")
+_PROCESS_STARTERS = (
+    "runtime/bootstrap.py",
+    "runtime/supervisor.py",
+    "runtime/tunnel.py",
+)
 _WEB_PACKAGE = "web"
 _WEB_RUNTIME = ("runtime/server.py",)
 
@@ -437,13 +441,31 @@ def test_only_the_web_surface_may_import_fastapi_or_uvicorn():
     assert offenders == []
 
 
+#: Ways to start a process. ``asyncio.create_subprocess_exec`` is here because
+#: it starts one without importing ``subprocess`` at all — a scan that looked
+#: only for the import would have called the tunnel manager clean.
+PROCESS_CALLS = ("Popen", "create_subprocess_exec", "create_subprocess_shell", "forkpty")
+
+
+def starts_a_process(path: Path) -> bool:
+    if "subprocess" in imported_names(path):
+        return True
+    return any(name.rsplit(".", 1)[-1] in PROCESS_CALLS for name in called_names(path))
+
+
 def test_only_the_named_modules_may_start_a_process():
     """The content path still executes nothing at all."""
-    starters = sorted(
-        relative_name(path) for path in sources() if "subprocess" in imported_names(path)
-    )
+    starters = sorted(relative_name(path) for path in sources() if starts_a_process(path))
 
     assert starters == sorted(_PROCESS_STARTERS), starters
+
+
+def test_the_process_scan_would_catch_an_asyncio_spawn(tmp_path: Path):
+    """Proves the scan above is not just an import check wearing a new name."""
+    offender = tmp_path / "offender.py"
+    offender.write_text("import asyncio\nasyncio.create_subprocess_exec('x')\n", encoding="utf-8")
+
+    assert starts_a_process(offender) is True
 
 
 def test_no_module_in_this_package_opens_a_raw_socket():

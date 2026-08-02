@@ -51,7 +51,11 @@ ESCAPE_CALLS = ("system", "popen", "execv", "execve", "execvp", "spawnv", "fork"
 #: Their *own* source is scanned by every other test in this module, so a memory
 #: import inside the supervisor would still fail ``test_no_source_imports_a_
 #: memory_module``. What is exempted here is only "imports subprocess at all".
-PROCESS_STARTERS = ("runtime/bootstrap.py", "runtime/supervisor.py")
+PROCESS_STARTERS = (
+    "runtime/bootstrap.py",
+    "runtime/supervisor.py",
+    "runtime/tunnel.py",
+)
 
 
 def _sources() -> list[Path]:

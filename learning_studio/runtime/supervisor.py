@@ -93,14 +93,19 @@ class RuntimeHandle:
     #: True when this call started it, False when it found one already running.
     started: bool
 
+    @property
+    def public_url(self) -> str:
+        """The tunnel address, for the one caller that builds a button with it.
+
+        A property rather than a field of :meth:`describe` so that the two
+        audiences are visibly different: this is read by the launch
+        orchestration and by nothing that renders a tool result.
+        """
+        return self.reply.tunnel_url
+
     def describe(self) -> dict[str, object]:
         """Safe lifecycle state. No address, no port, no secret, no URL."""
-        return {
-            **self.record.describe(),
-            "server_state": self.reply.server_state,
-            "tunnel_state": self.reply.tunnel_state,
-            "tunnel_ready": self.reply.tunnel_ready,
-        }
+        return {**self.record.describe(), **self.reply.describe()}
 
 
 def _unavailable(message: str, reason: str) -> RuntimeUnavailable:
