@@ -1165,18 +1165,22 @@ way the card is read: map `left_id → right_id`, then walk `content.left`.
 manifest whose tokens are `t1, t2, t3, t4` spells out its own answer to anyone who
 sorts them, and no registry rule can stop an author writing that. Every identifier
 inside a component's content is replaced with a random one when the projection is
-built, so the card carries names with nothing to read into. The `alias → canonical`
-map is stored beside the evaluator's data, never served, and translated back when
-a response arrives.
+built, so the card carries names with nothing to read into. The evaluator record
+stores the `alias → canonical` map and canonical inventory, while a separate hidden
+table stores a provenance marker for every evaluator row. Current scheme-3 markers
+also carry a digest binding the exact mapping to the component, owner, experience,
+and learner payload. None of that evidence is served to the learner.
 
-That translation **fails closed**. An identifier the mapping does not cover is
-refused and the exercise does not advance — it is not passed through unchanged,
-which would store a learner-facing alias as though it were an evaluator's
-identifier: a well-formed value naming nothing in the answer key, which nothing
-downstream could have caught. Components prepared before aliasing existed carry no
-alias record at all, which is a *different* state from "aliased, mapping empty",
-recorded explicitly as `alias_scheme` and the only case in which an identifier
-passes through.
+Current scheme-3 translation **fails closed** unless all three records agree. A
+swapped target, a coordinated mapping/inventory rewrite, a missing or altered
+binding, or an identifier the mapping does not cover is refused without advancing
+the exercise. Scheme-2 records predate the exact binding and are also refused for
+identifier-bearing responses; migration cannot invent correspondence evidence that
+was never recorded. Mapping-only scheme 1 and the previous unversioned shape remain
+an explicitly named `ALIASED_UNVERIFIED` compatibility path and never claim the
+scheme-3 guarantee. Components prepared before aliasing existed are identified by
+an intact evaluator record carrying neither alias marker; that is the only state in
+which an identifier passes through unchanged.
 
 A component type this build does not know renders an *unsupported* card naming
 the type, and can be skipped — it submits `{"skipped": true}` — so the exercise

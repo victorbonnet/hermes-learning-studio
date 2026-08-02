@@ -683,12 +683,12 @@ def _identifier_resolver(aliases: ComponentAliases):
     canonical identifiers. That is a *positive* finding about the record, not an
     inference from something being absent.
 
-    Two states translate through the mapping: :data:`AliasState.ALIASED`, whose
-    mapping has been proved a bijection onto the component's stored canonical
-    identifiers, and :data:`AliasState.ALIASED_UNVERIFIED`, written under a scheme
-    that recorded no inventory to prove it against. Both resolve the same way —
-    the difference is what the service could establish, not what the caller does
-    with it — and neither passes an identifier through untranslated.
+    :data:`AliasState.ALIASED` translates only after its exact correspondence is
+    checked against producer evidence outside the evaluator JSON. The explicit
+    legacy state :data:`AliasState.ALIASED_UNVERIFIED` also translates so existing
+    mapping-only experiences keep working, but it never earns the verified name.
+    Scheme 2 is not placed in that compatibility state: its stored inventory made
+    a stronger claim that target permutations can violate, so it fails closed.
 
     Everything else refuses. The version before this returned the identifier
     unchanged whenever the lookup came back empty, which reads as a harmless
