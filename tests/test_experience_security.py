@@ -253,19 +253,44 @@ NETWORK_MODULES = ("httpx", "requests", "urllib", "http", "socket", "aiohttp", "
 OPTIONAL_MODULES = ("fastapi", "starlette", "uvicorn", "PIL", "telegram", "telethon", "cloudflare")
 
 
-#: The two exemptions this policy grants, each narrow and each paired with a
-#: test below that keeps it from widening.
+#: Every exemption this policy grants, named one file at a time, each paired
+#: with a test below that keeps it from widening.
+#:
+#: The shape to notice is that the *content path* — manifests, components,
+#: safety, storage, the service, the tool handlers — is exempted from nothing.
+#: Preparing an exercise still executes nothing and reaches nothing. What the
+#: launch feature added is a small, separately audited set of files that start
+#: processes and speak to a loopback port, and the list below is how it stays
+#: small.
 #:
 #: - ``urllib.parse`` is string handling: it splits a percent-encoded query
-#:   string and decodes it. It opens no socket. ``urllib.request`` — the half
-#:   that *is* network — remains banned everywhere, including here.
-#: - The ``web`` package is the FastAPI Mini App API. It genuinely needs
-#:   FastAPI, which is why FastAPI is an optional extra and why nothing
-#:   outside ``web/`` may import it. Registration never reaches this package;
-#:   ``tests/test_import_isolation.py`` proves that at runtime rather than
-#:   trusting this list.
+#:   string and decodes it. It opens no socket.
+#: - ``telegram_launch.py`` is the *only* module that reaches a remote host,
+#:   and it reaches exactly one: Telegram's Bot API, to deliver one button.
+#: - ``runtime/ownership.py`` speaks HTTP to a loopback port this plugin
+#:   started, which is what proves it owns the process there.
+#: - The process-starting modules are the runtime supervisor, the tunnel
+#:   manager, the bootstrap script, and the runtime's own entry point.
+#:   ``tests/test_runtime_security.py`` proves each of them builds an argument
+#:   array and never a shell command.
+#: - The ``web`` package and ``runtime/server.py`` need FastAPI and Uvicorn.
+#:   Both live behind the optional ``web`` extra; ``register(ctx)`` reaches
+#:   neither, which ``tests/test_import_isolation.py`` proves at runtime.
+#:
+#: Each list is grown by the change that needs it and never in advance, so the
+#: diff that adds a module able to start a process is also the diff that adds
+#: it here.
 _URLLIB_PARSE_ONLY = ("telegram_auth.py",)
+_TELEGRAM_SENDER: tuple[str, ...] = ()
+_LOOPBACK_HTTP = ("runtime/ownership.py",)
+_PROCESS_STARTERS: tuple[str, ...] = ()
 _WEB_PACKAGE = "web"
+_WEB_RUNTIME: tuple[str, ...] = ()
+
+
+def relative_name(path: Path) -> str:
+    """``runtime/server.py`` — the form every exemption list is written in."""
+    return path.relative_to(PACKAGE).as_posix()
 
 
 def imported_names(path: Path, *, dotted: bool = False) -> set[str]:
@@ -294,14 +319,22 @@ def imported_names(path: Path, *, dotted: bool = False) -> set[str]:
 
 def _exempt(forbidden: str, path: Path) -> bool:
     """The exemptions above, applied to one file."""
-    relative = path.relative_to(PACKAGE)
-    if forbidden == "PIL" and path.name == "assets.py":
+    relative = relative_name(path)
+    if forbidden == "PIL" and relative == "assets.py":
         # PR 05: a function-local Pillow import in one narrow module.
         return True
-    if forbidden == "urllib" and path.name in _URLLIB_PARSE_ONLY:
+    if forbidden == "urllib" and relative in _URLLIB_PARSE_ONLY:
         networked = {"urllib", "urllib.request", "urllib.error"}
         return not (imported_names(path, dotted=True) & networked)
-    return forbidden in ("fastapi", "starlette") and relative.parts[0] == _WEB_PACKAGE
+    if forbidden == "urllib" and relative in _TELEGRAM_SENDER:
+        return True
+    if forbidden == "http" and relative in _LOOPBACK_HTTP:
+        return True
+    if forbidden == "subprocess" and relative in _PROCESS_STARTERS:
+        return True
+    if forbidden in ("fastapi", "starlette", "uvicorn"):
+        return relative.split("/")[0] == _WEB_PACKAGE or relative in _WEB_RUNTIME
+    return False
 
 
 def called_names(path: Path) -> set[str]:
@@ -352,23 +385,70 @@ def test_the_package_imports_no_execution_network_or_optional_module(forbidden: 
     assert offenders == [], f"{forbidden} is imported by {offenders}"
 
 
+def test_every_exempted_file_actually_exists():
+    """An exemption naming a file that is not there hides a real offender.
+
+    Rename ``runtime/tunnel.py`` and the entry that exempted it silently stops
+    matching anything — while the module under its new name is scanned with no
+    exemption at all. That fails loudly, which is right. What must not happen
+    is the reverse: a stale entry sitting in the list looking like policy.
+    """
+    named = {
+        *_URLLIB_PARSE_ONLY,
+        *_TELEGRAM_SENDER,
+        *_LOOPBACK_HTTP,
+        *_PROCESS_STARTERS,
+        *_WEB_RUNTIME,
+        "assets.py",
+    }
+
+    missing = sorted(name for name in named if not (PACKAGE / name).is_file())
+
+    assert missing == [], missing
+
+
 def test_the_urllib_exemption_covers_string_parsing_only():
-    """``urllib.parse`` is allowed in one module; ``urllib.request`` nowhere."""
-    for path in sources():
-        dotted = imported_names(path, dotted=True)
-        assert "urllib.request" not in dotted, f"{path.name} imports urllib.request"
-        assert "urllib.error" not in dotted, f"{path.name} imports urllib.error"
-        assert "urllib" not in dotted, f"{path.name} imports urllib as a whole"
+    """``urllib.parse`` is string handling; ``urllib.request`` reaches out.
 
-
-def test_only_the_web_package_may_import_fastapi():
-    """The Mini App API is the one place an optional web dependency belongs."""
-    offenders = [
-        str(path.relative_to(PACKAGE))
+    Exactly one module in this package may do the second, and it is the one
+    that delivers the Telegram button. Everything else — including the
+    ``initData`` verifier, which needs only the query-string parser — is held
+    to parsing.
+    """
+    reaching_out = sorted(
+        relative_name(path)
         for path in sources()
-        if imported_names(path) & {"fastapi", "starlette"}
-        and path.relative_to(PACKAGE).parts[0] != _WEB_PACKAGE
+        if imported_names(path, dotted=True) & {"urllib", "urllib.request", "urllib.error"}
+    )
+
+    assert reaching_out == sorted(_TELEGRAM_SENDER), reaching_out
+
+
+def test_only_the_web_surface_may_import_fastapi_or_uvicorn():
+    """The optional web extra belongs to the API and the process that serves it."""
+    offenders = [
+        relative_name(path)
+        for path in sources()
+        if imported_names(path) & {"fastapi", "starlette", "uvicorn"}
+        and relative_name(path).split("/")[0] != _WEB_PACKAGE
+        and relative_name(path) not in _WEB_RUNTIME
     ]
+
+    assert offenders == []
+
+
+def test_only_the_named_modules_may_start_a_process():
+    """The content path still executes nothing at all."""
+    starters = sorted(
+        relative_name(path) for path in sources() if "subprocess" in imported_names(path)
+    )
+
+    assert starters == sorted(_PROCESS_STARTERS), starters
+
+
+def test_no_module_in_this_package_opens_a_raw_socket():
+    """Even the runtime speaks through ``http.client``, not a socket it made."""
+    offenders = [relative_name(path) for path in sources() if "socket" in imported_names(path)]
 
     assert offenders == []
 
