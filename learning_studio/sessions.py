@@ -129,9 +129,31 @@ class SessionStore:
         self._max = int(max_sessions)
         self._clock = clock
         self._sessions: dict[str, MiniAppSession] = {}
+        self._last_activity: float | None = None
 
     def __len__(self) -> int:
         return len(self._sessions)
+
+    @property
+    def last_activity_at(self) -> float | None:
+        """When an authenticated learner was last served, or ``None``.
+
+        Recorded on the store rather than on a session because it outlives
+        every individual one. A learner who works for an hour holds several
+        sessions in succession, and the runtime's idle timer must see that as
+        continuous use rather than as a series of sessions that each went quiet.
+
+        Deliberately *not* updated by unauthenticated traffic. Once the runtime
+        is reachable through a public tunnel, anything on the internet can
+        knock on the door; treating a scanner as a learner would keep a public
+        entrance to somebody's learning record open for as long as the scanning
+        continued.
+        """
+        return self._last_activity
+
+    def note_activity(self) -> None:
+        """Record that an authenticated learner request was just served."""
+        self._last_activity = float(self._clock())
 
     def create(
         self, scope: SessionScope, *, component_count: int, auth_date: int = 0

@@ -1,0 +1,20 @@
+# The Learning Studio runtime's own dependencies, installed into a virtual
+# environment that belongs to this plugin and to nothing else.
+#
+# Why a separate environment at all: these are the packages the Mini App API
+# needs in order to serve, and Hermes' environment is not this plugin's to
+# change. Installing FastAPI into it — or upgrading the one already there —
+# would be a plugin altering the host's dependency graph on a learner's behalf,
+# which is exactly the kind of thing an operator should have to ask for.
+#
+# The two direct dependencies are pinned. Their transitive dependencies are
+# resolved by pip at bootstrap time and are deliberately not pinned here: a
+# hand-maintained transitive list drifts silently and is worse than none, and a
+# hash-pinned lock file for a second environment is a maintenance burden this
+# plugin has not earned. Bootstrap is an explicit, operator-run step, so the
+# resolution happens where somebody is watching it.
+#
+# Changing this file changes the bootstrap stamp, so the next bootstrap
+# rebuilds rather than reporting the old environment as current.
+fastapi==0.141.1
+uvicorn==0.52.0

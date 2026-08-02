@@ -72,6 +72,7 @@ def wheel_names() -> set[str]:
     [
         "tools/run_frontend_tests.py",
         "tools/preview_gallery.py",
+        "tools/bootstrap_runtime.py",
         "tests/js/dom.mjs",
         "tests/js/harness.mjs",
         "tests/js/renderers.test.mjs",
@@ -159,6 +160,17 @@ def test_the_wheel_ships_every_static_asset(wheel_names: set[str]):
 
     for asset in STATIC_ASSETS:
         assert f"learning_studio/web/static/{asset.filename}" in wheel_names
+
+
+def test_the_wheel_ships_what_the_runtime_needs_to_start(wheel_names: set[str]):
+    """The launcher and the pinned requirements are data, not code, and are
+    easy to leave behind. An installed plugin that cannot find either can
+    neither bootstrap nor start."""
+    for required in (
+        "learning_studio/runtime/launch_server.py",
+        "learning_studio/runtime/requirements.txt",
+    ):
+        assert required in wheel_names
 
 
 def test_the_wheel_ships_the_skill_and_its_references(wheel_names: set[str]):

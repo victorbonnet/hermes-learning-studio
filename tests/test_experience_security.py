@@ -283,9 +283,9 @@ OPTIONAL_MODULES = ("fastapi", "starlette", "uvicorn", "PIL", "telegram", "telet
 _URLLIB_PARSE_ONLY = ("telegram_auth.py",)
 _TELEGRAM_SENDER: tuple[str, ...] = ()
 _LOOPBACK_HTTP = ("runtime/ownership.py",)
-_PROCESS_STARTERS: tuple[str, ...] = ()
+_PROCESS_STARTERS = ("runtime/bootstrap.py", "runtime/supervisor.py")
 _WEB_PACKAGE = "web"
-_WEB_RUNTIME: tuple[str, ...] = ()
+_WEB_RUNTIME = ("runtime/server.py",)
 
 
 def relative_name(path: Path) -> str:

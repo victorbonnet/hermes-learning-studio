@@ -42,6 +42,17 @@ ESCAPE_MODULES = ("subprocess", "multiprocessing", "pty", "popen2", "commands")
 #: Call targets that spawn a process without importing one of the above.
 ESCAPE_CALLS = ("system", "popen", "execv", "execve", "execvp", "spawnv", "fork")
 
+#: The runtime feature starts processes, so "nothing here can start one" stopped
+#: being true and is not the property to assert any more. The property that
+#: still holds — and that these two files are held to below, one test each — is
+#: that what they start is a closed set of programs, run without a shell, in an
+#: environment that names no memory store.
+#:
+#: Their *own* source is scanned by every other test in this module, so a memory
+#: import inside the supervisor would still fail ``test_no_source_imports_a_
+#: memory_module``. What is exempted here is only "imports subprocess at all".
+PROCESS_STARTERS = ("runtime/bootstrap.py", "runtime/supervisor.py")
+
 
 def _sources() -> list[Path]:
     return sorted(PACKAGE.rglob("*.py"))
@@ -85,14 +96,20 @@ def test_no_source_names_a_memory_file():
 
 
 def test_no_source_can_shell_out():
-    """No subprocess means no indirect route to the memory tool.
+    """No ad-hoc process escape, and none at all outside the two supervisors.
 
     Parsed rather than grepped: a substring search for ``pty`` matches the
     word "empty", and one for ``subprocess`` matches a comment promising not
     to use it. Only real imports and real calls count.
+
+    ``os.system``, ``os.popen`` and the ``exec``/``fork`` family are refused
+    everywhere, including in the two files that are allowed to start a process:
+    those interfaces take a command *string* or replace this process, and
+    neither is a thing this plugin ever needs.
     """
     offenders: list[str] = []
     for path in _sources():
+        relative = path.relative_to(PACKAGE).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -105,12 +122,60 @@ def test_no_source_can_shell_out():
                     if isinstance(func, ast.Attribute) and func.attr in ESCAPE_CALLS:
                         base = func.value
                         if isinstance(base, ast.Name) and base.id == "os":
-                            offenders.append(f"{path.name}:{node.lineno} calls os.{func.attr}")
+                            offenders.append(f"{relative}:{node.lineno} calls os.{func.attr}")
+                continue
+            if relative in PROCESS_STARTERS:
                 continue
             for name in names:
                 if name.split(".")[0] in ESCAPE_MODULES:
-                    offenders.append(f"{path.name}:{node.lineno} imports {name}")
+                    offenders.append(f"{relative}:{node.lineno} imports {name}")
     assert offenders == [], f"plugin has a process-escape hatch: {offenders}"
+
+
+def test_the_process_starters_run_a_closed_set_of_programs():
+    """Whatever the runtime starts, it is not a route to the host's memory tool.
+
+    The programs are: the interpreter that is running, the plugin's own
+    virtual environment interpreter, the launcher file this package ships, and
+    the operator's ``cloudflared``. None of them is Hermes, none of them is a
+    shell, and none is named by anything a model can write.
+    """
+    from learning_studio.runtime import bootstrap, supervisor
+
+    assert supervisor.LAUNCHER.name == "launch_server.py"
+    assert supervisor.LAUNCHER.is_relative_to(PACKAGE)
+    assert bootstrap.runtime_python().name == "python"
+
+    source = (PACKAGE / "runtime" / "supervisor.py").read_text(encoding="utf-8")
+    for host_program in ("hermes", "memory_tool", "sh", "bash", "zsh"):
+        assert f'"{host_program}"' not in source
+
+
+def test_nothing_this_plugin_starts_runs_through_a_shell():
+    for name in PROCESS_STARTERS:
+        source = (PACKAGE / name).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=name)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "shell":
+                    continue
+                assert isinstance(keyword.value, ast.Constant), name
+                assert keyword.value.value is False, f"{name} passes shell=True"
+
+
+def test_the_runtime_environment_names_no_memory_store():
+    """A child process cannot be pointed at a memory file it is never told about."""
+    from learning_studio.runtime import environment
+
+    declared = set(environment.OWN_VARIABLES) | set(environment.INHERITED)
+    declared |= set(environment.TUNNEL_INHERITED)
+
+    for name in declared:
+        assert "MEMORY" not in name.upper(), name
+    for needle in MEMORY_FILES:
+        assert needle not in " ".join(sorted(declared))
 
 
 def test_no_source_dispatches_another_tool():

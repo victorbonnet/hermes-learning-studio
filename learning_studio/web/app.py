@@ -302,6 +302,13 @@ def create_app(dependencies: Dependencies | None = None):
                 headers={"Retry-After": str(exc.retry_after)},
             ) from exc
 
+        # The runtime's idle timer is driven from exactly here, and from the
+        # bootstrap below. By this point the request has produced a verified
+        # Telegram signature, an account on the allowlist, and a session token
+        # minted for that account — so "somebody is studying" is a fact rather
+        # than an inference from traffic arriving at a public URL.
+        deps.sessions.note_activity()
+
         log_request(
             level=logging.DEBUG,
             event="session_request",
@@ -421,6 +428,7 @@ def create_app(dependencies: Dependencies | None = None):
             component_count=len(experience["components"]),
             auth_date=verified.auth_date,
         )
+        deps.sessions.note_activity()
         log_request(
             event="session_opened",
             route="/api/session",

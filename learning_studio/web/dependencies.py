@@ -124,11 +124,22 @@ def build_dependencies(
     *,
     config: LearningStudioConfig | None = None,
     clock: Callable[[], float] = time.time,
+    profile: Callable[[], str] | None = None,
 ) -> Dependencies:
-    """Wire the real implementations. Used by anything that actually serves."""
+    """Wire the real implementations. Used by anything that actually serves.
+
+    ``profile`` exists for one caller: the on-demand runtime, which runs in its
+    own virtual environment with no Hermes to ask. :func:`..paths.profile_id`
+    resolves the active profile by importing the host, so in that process it
+    would answer ``"default"`` — and every stored row is scoped by the profile
+    name, so a runtime serving the ``family`` profile would find none of its
+    exercises and report them all as missing. The supervisor therefore resolves
+    the name where the host *is* available and hands it over.
+    """
     from .. import service
 
     resolved = config or load_config()
+    profile_name = profile or profile_id
 
     def allowed_users() -> frozenset[str]:
         return effective_allowed_users(
@@ -145,7 +156,7 @@ def build_dependencies(
         ),
         bot_token=bot_token_from_env,
         allowed_users=allowed_users,
-        profile=profile_id,
+        profile=profile_name,
         clock=clock,
         load_experience=lambda principal, experience_id: service.delivery_bundle(
             principal=principal, experience_id=experience_id, config=resolved
