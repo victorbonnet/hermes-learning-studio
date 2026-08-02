@@ -631,6 +631,23 @@ has already been spent is refused, and a spent message stays spent — expiry
 leaves a tombstone that outlives the evidence, so "stale" is a terminal state
 rather than a step back to "new".
 
+The claim is taken **before** anything is created, not after the button is
+sent. Two calls racing on one sentence used to both validate it, both create a
+grant, and both deliver a button; the loser of the eventual spend was discarded
+in silence, and the learner had two messages. Now the first call to claim the
+message is the only one that proceeds, and the second is refused with
+`confirmation_already_used`.
+
+**A failed launch hands the message back only when it can prove nothing was
+sent.** No bot token, a malformed selector, a tunnel address that did not
+validate, a request Telegram received and declined — all of those mean no
+message exists, so the same words may authorise another attempt. A connection
+that dropped mid-request proves nothing: a button may be sitting in the
+learner's chat, and a retry would put a second one beside it. There the claim
+is kept and the agent has to go back and ask. The same rule covers an
+interruption after delivery but before the commit finishes — the claim stays
+held, which is what stops a retry from launching again.
+
 What this does not do is read minds. It establishes that a specific person
 wrote specific words in the turn being answered; whether they meant "open an
 exercise" is the agent's reading, and the response says so in those terms
@@ -747,10 +764,16 @@ id, generation, process id and interpreter path must all match the record.
 **Escalation needs more than a proof.** A userspace check followed by a signal
 to a *number* is a race: the runtime can exit between the two and the operating
 system can hand that number to something else. So a signal is only ever sent
-through a pid file descriptor, which pins the identity — while it is open the
-pid cannot be recycled, and neither can the process group id, because the
-runtime leads its own session. The sequence is pin, re-prove against the pinned
-identity, then signal the group.
+through a pid file descriptor, which pins the identity. The sequence is pin,
+re-prove against the pinned identity, signal the **leader through the
+descriptor** with `pidfd_send_signal`, and only then reach its descendants with
+`killpg`.
+
+That order is the whole argument, and holding a pidfd without it is not enough:
+`killpg` takes a number, so what makes the number safe is having just proved,
+by signalling the descriptor, that the leader still exists — the kernel does
+not reuse a pid while the process it names is still there. If the descriptor
+refuses the signal, the number is never used at all.
 
 **Where an identity cannot be pinned, escalation refuses.** `pidfd_open` is
 Linux. On macOS and anything else without it, a wedged runtime is left to the
@@ -828,6 +851,24 @@ Custom domains and permanent named tunnels are deliberately out of scope.
 | "the words you quoted are not in the learner's current message" | The quotation has to be the learner's own words from the message being answered. |
 | "there is no current learner message to launch from" | The turn carries no incoming message — a scheduled job, a background task. Offer the exercise next time they write. |
 | A stop reports it could not confirm | Escalation needs a pinned process identity, which is Linux-only. The runtime stops itself at its own deadline. |
+| "the exercise could not be sent" and the same words are refused afterwards | The send failed in a way that cannot prove nothing arrived. A message may be in the chat, so the claim on that sentence is kept. Ask the learner, and quote their reply. |
+| The runtime exits with status 4 | The server stopped but `cloudflared` could not be confirmed gone, so the public address may still be open. Distinct from exit 0 on purpose: a clean stop and an unconfirmed one are not the same event. |
+
+### What is written under the profile, and how
+
+The record, the lock, the handshake and the bootstrap stamp all live in the
+profile's own `runtime` directory, and every one of them is created, opened,
+mode-changed, renamed and removed **relative to a descriptor for that
+directory** — never by pathname.
+
+A pathname check followed by a pathname write is two lookups, and anything at
+all can happen between them. The directory is opened `O_NOFOLLOW`, so a
+symbolic link substituted for it is refused by the kernel rather than silently
+redirecting a write; individual files are opened the same way, and modes are
+set with `fchmod` on the descriptor rather than `chmod` on a name, because
+`chmod` follows links and would otherwise loosen the permissions of whatever
+the link pointed at. The record holds a control secret, which is why this is
+worth the syscalls.
 
 ## Exercise manifests
 

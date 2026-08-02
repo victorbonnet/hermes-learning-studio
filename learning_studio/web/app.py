@@ -467,7 +467,13 @@ def create_app(dependencies: Dependencies | None = None):
             # Minted under the grant's lock, so two simultaneous opens cannot
             # both produce a live token — and a reload resumes where the
             # learner was instead of starting again.
-            token, session = deps.grants.admit_session(grant, mint)
+            admitted = deps.grants.admit_session(grant, mint)
+            if admitted is None:
+                # Revoked, expired, or superseded while this request was doing
+                # its ownership check. Indistinguishable from every other way a
+                # launch can fail to admit somebody, deliberately.
+                raise ApiError(404, NOT_FOUND, reason="no_launch_grant")
+            token, session = admitted
         else:
             token, session = mint()
 

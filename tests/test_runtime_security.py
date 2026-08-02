@@ -12,6 +12,7 @@ import ast
 import inspect
 import json
 import os
+import signal
 from pathlib import Path
 
 import pytest
@@ -230,7 +231,7 @@ def test_a_signal_is_only_ever_sent_through_a_pinned_identity():
     import ast
 
     tree = ast.parse(Path(ownership.__file__).read_text(encoding="utf-8"))
-    signallers = []
+    calls: dict[str, list[str]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
             continue
@@ -240,9 +241,16 @@ def test_a_signal_is_only_ever_sent_through_a_pinned_identity():
                 and isinstance(inner.func, ast.Attribute)
                 and inner.func.attr in ("killpg", "kill", "pidfd_send_signal")
             ):
-                signallers.append(node.name)
+                calls.setdefault(node.name, []).append(inner.func.attr)
 
-    assert signallers == ["signal_group"], signallers
+    assert list(calls) == ["signal_group"], calls
+
+    # And within it: the descriptor first, the number second. `killpg` takes a
+    # pid, so the only thing that makes it safe is having just proved — by
+    # signalling the pidfd — that the leader still exists and its number is
+    # therefore not available for reuse. Reverse the order and the race is back.
+    sent = calls["signal_group"]
+    assert sent == ["pidfd_send_signal", "killpg"], sent
 
 
 def test_escalation_fails_closed_where_no_identity_can_be_pinned(monkeypatch):
@@ -673,3 +681,56 @@ def test_registration_is_still_free_of_side_effects(ctx, tmp_path, monkeypatch):
 
     assert not (tmp_path / "fresh").exists(), "registration created state on disk"
     assert len(ctx.tools) == 8
+
+
+def test_the_group_is_never_signalled_when_the_leader_could_not_be(monkeypatch):
+    """If the pinned identity refuses the signal, the number is not used instead.
+
+    ``pidfd_send_signal`` failing means the leader is gone or unreachable — and
+    a gone leader is exactly when its pid becomes available to somebody else.
+    Falling through to ``killpg`` there would send the signal to whoever
+    inherited the number, which is the failure this whole module exists to
+    prevent.
+    """
+    handle = ownership.ProcessHandle(4242, 99)
+    monkeypatch.setattr(ownership, "_request", _answering(record()))
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(
+        os,
+        "pidfd_send_signal",
+        lambda fd, sig: (_ for _ in ()).throw(ProcessLookupError(fd)),
+        raising=False,
+    )
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+
+    assert handle.signal_group(signal.SIGTERM, record()) is False
+    assert killed == [], "a signal went to a number after the identity refused it"
+
+
+def test_the_leader_is_signalled_by_descriptor_and_the_group_by_number(monkeypatch):
+    """The successful path, in order: descriptor first, then the descendants."""
+    handle = ownership.ProcessHandle(4242, 99)
+    monkeypatch.setattr(ownership, "_request", _answering(record()))
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    order: list[str] = []
+    monkeypatch.setattr(
+        os, "pidfd_send_signal", lambda fd, sig: order.append(f"pidfd:{fd}:{sig}"), raising=False
+    )
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: order.append(f"group:{pid}:{sig}"))
+
+    assert handle.signal_group(signal.SIGTERM, record()) is True
+    assert order == [f"pidfd:99:{int(signal.SIGTERM)}", f"group:4242:{int(signal.SIGTERM)}"]
+
+
+def test_a_group_that_cannot_be_reached_does_not_undo_a_delivered_signal(monkeypatch):
+    """The leader has the signal. An empty group is not a failure to stop it."""
+    handle = ownership.ProcessHandle(4242, 99)
+    monkeypatch.setattr(ownership, "_request", _answering(record()))
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, "pidfd_send_signal", lambda fd, sig: None, raising=False)
+    monkeypatch.setattr(
+        os, "killpg", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError(pid))
+    )
+
+    assert handle.signal_group(signal.SIGTERM, record()) is True

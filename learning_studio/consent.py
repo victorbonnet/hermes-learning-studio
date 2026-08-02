@@ -193,12 +193,30 @@ _BASIS = {
 }
 
 
-def spend(decision: Decision, *, store: EvidenceStore | None = None) -> bool:
-    """Consume the message's authority. Returns True for the caller that won.
+def reserve(decision: Decision, *, store: EvidenceStore | None = None) -> bool:
+    """Claim the message before acting on it. Returns True for the winner.
 
-    Atomic, so two launches racing on one message do not both commit. Called
-    only after delivery has succeeded — see
-    :func:`learning_studio.launch.launch_experience`.
+    Called *before* anything is created or sent, which is the whole point: two
+    launches racing on one sentence must not both get as far as delivering a
+    button and then discover, too late, that only one of them may spend it.
     """
+    evidence = STORE if store is None else store
+    return evidence.reserve(decision.key)
+
+
+def commit(decision: Decision, *, store: EvidenceStore | None = None) -> bool:
+    """Turn the reservation into a spend, once the launch has happened."""
+    evidence = STORE if store is None else store
+    return evidence.commit(decision.key)
+
+
+def release(decision: Decision, *, store: EvidenceStore | None = None) -> bool:
+    """Hand the message back, on a path that proved nothing was delivered."""
+    evidence = STORE if store is None else store
+    return evidence.release(decision.key)
+
+
+def spend(decision: Decision, *, store: EvidenceStore | None = None) -> bool:
+    """Reserve and commit together. Kept for callers with nothing to undo."""
     evidence = STORE if store is None else store
     return evidence.spend(decision.key)

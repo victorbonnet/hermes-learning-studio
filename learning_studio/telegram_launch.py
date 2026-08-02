@@ -72,6 +72,29 @@ SEND_MESSAGE_METHOD = "sendMessage"
 #: by the sender and by ``app.js``, so the two cannot drift apart.
 LAUNCH_FRAGMENT_KEY = "launch"
 
+#: Failure reasons that *prove* nothing reached Telegram.
+#:
+#: The distinction matters to the caller and to the learner. A failure in this
+#: set means no message exists, so the learner's sentence may safely authorise
+#: another attempt. Anything else — a connection that dropped mid-request, a
+#: response that could not be read — means a message may be sitting in their
+#: chat, and a retry would put a second one beside it.
+NOTHING_WAS_SENT = frozenset(
+    {
+        "bot_token_absent",
+        "launch_selector_malformed",
+        "telegram_endpoint_unexpected",
+        # Telegram received the request and declined it, so there is no message.
+        "telegram_refused",
+    }
+)
+
+
+def proves_nothing_was_sent(reason: str) -> bool:
+    """True when this failure is evidence that no message exists."""
+    return reason in NOTHING_WAS_SENT or reason.startswith("delivery_tunnel_url_")
+
+
 #: A send either works quickly or is not worth waiting for: the learner is
 #: watching a conversation, and a tool call that hangs is worse than one that
 #: says it could not send.
@@ -221,6 +244,25 @@ def _post(token: str, payload: dict[str, Any], *, opener=None) -> None:
         # wraps whatever the transport said, which may include the request.
         logger.warning("the Learning Studio button could not be sent (%s)", type(exc).__name__)
         failure = f"telegram_unreachable_{type(exc).__name__}"
+    except Exception as exc:
+        # The arm that closes the hole. The three above name the failures the
+        # standard library documents; anything else — an `http.client`
+        # exception, something raised by an injected opener, a bug in this
+        # module — used to propagate out of here untouched and land in the tool
+        # layer's `logger.exception`, which renders an exception's own text and
+        # every `__context__` behind it. The text of a transport exception
+        # routinely quotes the request, and the request is a URL with the bot
+        # token in its path, so "unexpected" was a way for the credential to
+        # reach the log.
+        #
+        # `Exception` and not `BaseException`: a cancellation or a Ctrl-C is
+        # not a delivery failure and must keep unwinding. And, like the others,
+        # only the class name is logged — the message is the thing that might
+        # be quoting the request.
+        logger.warning(
+            "the Learning Studio button could not be sent (unexpected %s)", type(exc).__name__
+        )
+        failure = "telegram_endpoint_unexpected"
 
     if failure is not None:
         raise LaunchRefused(DELIVERY_FAILED, reason=failure)

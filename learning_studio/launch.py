@@ -123,27 +123,79 @@ def launch_experience(
 
     manager.require_prerequisites(settings)
 
-    with ProfileLock():
-        handle = supervisor.ensure_running(settings)
-        started_here = handle.started
-        try:
-            return _launch_within(
-                settings=settings,
-                handle=handle,
-                destination=destination,
-                bundle=bundle,
-                experience=experience,
-                principal=principal,
-                decision=decision,
-                evidence=evidence,
-                send=send,
-            )
-        except BaseException:
-            if started_here:
-                # Only what this call created. A reused runtime is somebody
-                # else's session as far as this function knows.
-                supervisor.stop(settings)
-            raise
+    # (5) Claim the learner's message *now*, before anything exists and before
+    # anything is sent. Two calls racing on one sentence used to get this far
+    # together, both create a grant, and both deliver a button — the loser of
+    # the eventual spend was simply ignored, and the learner got two messages.
+    #
+    # A repeat that is only allowed to report an existing launch does not
+    # reserve: it is not going to create anything, and taking the claim would
+    # stop the launch it is reporting on from ever committing.
+    reserved = decision.may_create and consent_policy.reserve(decision, store=evidence)
+    if decision.may_create and not reserved:
+        raise consent_policy.ConsentRequired(
+            consent_policy.ALREADY_USED, reason="confirmation_already_used"
+        )
+
+    try:
+        with ProfileLock():
+            handle = supervisor.ensure_running(settings)
+            started_here = handle.started
+            try:
+                return _launch_within(
+                    settings=settings,
+                    handle=handle,
+                    destination=destination,
+                    bundle=bundle,
+                    experience=experience,
+                    principal=principal,
+                    decision=decision,
+                    evidence=evidence,
+                    send=send,
+                )
+            except BaseException:
+                if started_here:
+                    # Only what this call created. A reused runtime is somebody
+                    # else's session as far as this function knows.
+                    supervisor.stop(settings)
+                raise
+    except _MayHaveBeenSent as marker:
+        # A message may exist in the learner's chat. The claim is *kept*, so a
+        # retry cannot put a second button beside a first one nobody can see.
+        # The marker is plumbing; what an agent sees is the original failure.
+        raise marker.original from None
+    except BaseException:
+        # Everything else failed before the sender was ever called, or failed
+        # in a way that proves no request reached Telegram. Hand the claim back
+        # so the learner is not made to repeat themselves for nothing.
+        #
+        # Only ours. A reuse-only call took no reservation, and releasing on its
+        # way out would hand back the claim held by the launch it was reporting
+        # on — which is how a "no second button" rule turns into two buttons.
+        if reserved:
+            consent_policy.release(decision, store=evidence)
+        raise
+
+
+def _proves_nothing_was_sent(exc: BaseException) -> bool:
+    """Whether this delivery failure is evidence that no message exists."""
+    from .telegram_launch import proves_nothing_was_sent
+
+    reason = getattr(exc, "reason", "")
+    return bool(reason) and proves_nothing_was_sent(reason)
+
+
+class _MayHaveBeenSent(Exception):
+    """Marker: this failure happened where a message could already exist.
+
+    The default is the safe one — a failure is undelivered unless it is wrapped
+    in this — so a new early-exit added to the launch path releases the claim by
+    omission rather than silently authorising a second button.
+    """
+
+    def __init__(self, original: BaseException) -> None:
+        super().__init__(str(original))
+        self.original = original
 
 
 def _launch_within(
@@ -224,31 +276,40 @@ def _launch_within(
             # is what made the first version of this launch nothing at all.
             launch_id=launch_id,
         )
-    except BaseException:
-        # Nothing reached the learner, so the pending grant must go. If it will
-        # not go, that is reported as *indeterminate* rather than swallowed:
-        # the original failure is still what the agent needs, but "nothing was
-        # saved" would be a claim this call cannot make.
-        if not _revoke(handle, launch_id):
-            raise RuntimeUnavailable(
-                CLEANUP_INDETERMINATE, reason="rollback_indeterminate"
-            ) from None
-        raise
+    except BaseException as exc:
+        # Whether the learner's sentence may be used again turns on whether a
+        # message could exist, and the sender is what knows: an absent token or
+        # a refused request proves none does, while a connection that dropped
+        # mid-request proves nothing at all.
+        provable = _proves_nothing_was_sent(exc)
 
-    # Delivered. Commit: the grant starts admitting its learner and the message
-    # that authorised it is spent, in that order, so a failure between them
-    # leaves an entrance nobody was told about rather than a spent message with
-    # no entrance.
+        # The pending grant must go either way. If it will not go, that is
+        # reported as *indeterminate* rather than swallowed: the original
+        # failure is still what the agent needs, but "nothing was saved" would
+        # be a claim this call cannot make.
+        if not _revoke(handle, launch_id):
+            failure = RuntimeUnavailable(CLEANUP_INDETERMINATE, reason="rollback_indeterminate")
+            raise (failure if provable else _MayHaveBeenSent(failure)) from None
+        if provable:
+            raise exc
+        raise _MayHaveBeenSent(exc) from None
+
+    # Delivered. Commit: the grant starts admitting its learner, and then the
+    # reservation on the learner's message becomes a spend.
+    #
+    # An interruption between the two leaves an active launch and a message
+    # that is still *reserved* — which is the safe residue, because a
+    # reservation blocks a second launch exactly as a spend does. It is
+    # released only on a path that proved nothing was sent, and this is not
+    # one.
     if not _activate(handle, launch_id):
         with _suppressed("revoking a grant that could not be committed"):
             _revoke(handle, launch_id)
-        raise RuntimeUnavailable(DELIVERY_INDETERMINATE, reason="commit_indeterminate")
+        raise _MayHaveBeenSent(
+            RuntimeUnavailable(DELIVERY_INDETERMINATE, reason="commit_indeterminate")
+        )
 
-    # Spent only now, and only once. A failure anywhere above leaves the
-    # learner's words intact so the next attempt does not need a second ask;
-    # two calls racing on one message do not both get here, because the spend
-    # itself is the arbitration.
-    consent_policy.spend(decision, store=evidence)
+    consent_policy.commit(decision, store=evidence)
 
     return _result(
         experience=experience, granted=granted, decision=decision, delivered=True, reused=False

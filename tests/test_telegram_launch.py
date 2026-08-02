@@ -8,7 +8,9 @@ wrong — because the token lives in the request path, and an exception from
 
 from __future__ import annotations
 
+import http.client
 import json
+import logging
 import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
@@ -353,3 +355,60 @@ def test_the_request_is_a_post_that_does_not_become_a_get_on_redirect():
     source = Path(telegram_launch.__file__).read_text(encoding="utf-8")
 
     assert 'method="POST"' in source
+
+
+# ── Nothing unexpected carries the endpoint out ───────────────────────────
+
+
+class _Exotic(Exception):
+    """Not a URLError, not an OSError, not a ValueError — and it quotes the URL."""
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        _Exotic("failed to reach https://api.telegram.org/bot{token}/sendMessage"),
+        http.client.HTTPException("bad status line from bot{token}"),
+        RecursionError("maximum depth while building bot{token}"),
+    ],
+)
+def test_an_unexpected_transport_failure_never_carries_the_token_out(raised, caplog):
+    """The arm that closes the hole.
+
+    Only three exception classes were caught. Anything else propagated out of
+    the sender untouched and reached the tool layer's ``logger.exception``,
+    which renders an exception's text and every ``__context__`` behind it — and
+    a transport exception's text routinely quotes the request, whose path is
+    the bot token.
+    """
+    token = "123456:AAHsecret-token-value"
+    failure = type(raised)(str(raised).replace("{token}", token))
+
+    def opener(url, body, timeout):
+        raise failure
+
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(LaunchRefused) as caught:
+        telegram_launch.deliver_web_app_button(
+            destination=Destination(),
+            url=URL,
+            label="Open",
+            title="A drill",
+            launch_id="L" * 24,
+            bot_token=token,
+            opener=opener,
+        )
+
+    assert caught.value.reason == "telegram_endpoint_unexpected"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None, "the original is reachable and quotes the request"
+
+    rendered = " ".join(record.getMessage() for record in caplog.records)
+    assert token not in rendered
+    assert "api.telegram.org" not in rendered
+    assert "secret" not in rendered
+
+
+def test_an_unexpected_failure_is_treated_as_having_sent_nothing():
+    """It never reached a request, so the learner's words are not spent on it."""
+    assert telegram_launch.proves_nothing_was_sent("telegram_endpoint_unexpected") is True

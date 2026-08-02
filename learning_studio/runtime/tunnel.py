@@ -314,9 +314,19 @@ class QuickTunnel:
     def stop(self) -> None:
         """Synchronous best effort, for a caller with no event loop.
 
-        Prefer :meth:`aclose`, which waits. This exists because a teardown path
-        that cannot await still has to try, and terminating without waiting is
-        better than not terminating.
+        Prefer :meth:`aclose`, which waits and can tell you it failed. This
+        exists for the one path that cannot await at all: a cancelled task,
+        where every suspension point raises ``CancelledError`` again before it
+        reaches the process.
+
+        **Terminate and then kill, without a grace period in between.** The
+        grace period in :meth:`aclose` buys an orderly exit, and it is only
+        worth having because that method can wait to see whether it worked.
+        Here nothing can be observed, so a ``SIGTERM`` alone would be a request
+        that a ``cloudflared`` ignoring it — or wedged — is free to decline,
+        leaving a public address served by a process whose runtime has gone.
+        ``SIGKILL`` cannot be declined, and a Quick Tunnel has no state to
+        flush, so the trade is a plainly good one.
         """
         process = self.process
         self.process = None
@@ -327,6 +337,9 @@ class QuickTunnel:
         with contextlib.suppress(ProcessLookupError, OSError):
             if getattr(process, "returncode", None) is None:
                 process.terminate()
+        with contextlib.suppress(ProcessLookupError, OSError):
+            if getattr(process, "returncode", None) is None:
+                process.kill()
 
 
 async def _reaped(process, timeout: float) -> bool:

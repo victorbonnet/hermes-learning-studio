@@ -38,10 +38,10 @@ one.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import secrets
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -67,6 +67,9 @@ _CONTROL_TOKEN_BYTES = 32
 #: A record any larger than this is not one this plugin wrote.
 MAX_RECORD_BYTES = 8192
 
+#: A handshake is four small fields. Same reasoning, smaller bound.
+MAX_HANDSHAKE_BYTES = 4096
+
 
 class ContainmentError(RuntimeError):
     """A managed path is not where this profile's storage says it should be."""
@@ -90,15 +93,194 @@ def runtime_dir() -> Path:
     root = ensure_storage_root()
     target = root / RUNTIME_SUBDIR
 
-    if target.is_symlink():
-        raise ContainmentError(
-            "the Learning Studio runtime directory is a symbolic link and was refused"
-        )
-    target.mkdir(mode=DIRECTORY_MODE, parents=True, exist_ok=True)
-    _require_contained(root, target)
-    with contextlib.suppress(OSError, NotImplementedError):
-        target.chmod(DIRECTORY_MODE)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(str(target), DIRECTORY_MODE)
+
+    # The check *is* the open. `O_NOFOLLOW` makes the kernel refuse a symbolic
+    # link at the final component, so there is no window between "it is not a
+    # link" and "use it" for one to be planted in — which a preceding
+    # `is_symlink()` call, however careful, always left open.
+    fd = _open_directory(target)
+    try:
+        _require_contained(root, target)
+        _require_same_file(fd, target)
+        # Through the descriptor, so this cannot be the moment somebody
+        # substitutes a link and has another file's mode changed for them.
+        with contextlib.suppress(OSError, NotImplementedError):
+            os.fchmod(fd, DIRECTORY_MODE)
+    finally:
+        os.close(fd)
     return target
+
+
+def _open_directory(target: Path) -> int:
+    """A descriptor for ``target``, refusing a symbolic link at that name."""
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(str(target), flags)
+    except OSError as exc:
+        # ELOOP is what `O_NOFOLLOW` reports for a link; ENOTDIR is what
+        # `O_DIRECTORY` reports for a file. Both mean the same thing here.
+        raise ContainmentError(
+            "the Learning Studio runtime directory is not a directory this "
+            "plugin can use and was refused"
+        ) from exc
+
+
+def _require_same_file(fd: int, target: Path) -> None:
+    """The descriptor and the verified pathname must be the same object.
+
+    ``_require_contained`` resolves names; this compares inodes. Together they
+    close the gap between "the path checks out" and "the descriptor I am about
+    to write through is that path", which a rename between the two would
+    otherwise open.
+    """
+    try:
+        opened = os.fstat(fd)
+        named = os.stat(str(target))
+    except OSError as exc:  # pragma: no cover - unreadable path
+        raise ContainmentError(
+            "the Learning Studio runtime directory could not be verified"
+        ) from exc
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise ContainmentError(
+            "the Learning Studio runtime directory changed while it was being opened"
+        )
+
+
+@contextlib.contextmanager
+def managed_dir():
+    """A descriptor for the runtime directory, for the length of one operation.
+
+    Every sensitive file this package writes is created, opened, chmod-ed,
+    renamed and removed **relative to this descriptor**, never by pathname.
+
+    That is the whole fix for a class of bug this module had throughout: a
+    pathname check followed by a pathname operation is two lookups, and
+    anything at all may happen between them. A link planted in that window
+    redirected a write, or made ``chmod`` loosen the mode of a file belonging
+    to somebody else. Relative operations resolve once, against a directory
+    that has already been proved to be the right one.
+    """
+    fd = _open_directory(runtime_dir())
+    try:
+        yield fd
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+#: Flags for opening a managed file: never follow a link, never leak to a child.
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def open_managed(name: str, flags: int, mode: int = FILE_MODE, *, dir_fd: int | None = None) -> int:
+    """Open one file in the runtime directory, refusing a link at its name.
+
+    A link is refused by the *kernel*, through ``O_NOFOLLOW``, rather than by
+    an ``is_symlink()`` call a moment beforehand — so there is no window
+    between the check and the open for one to appear in.
+
+    The kernel reports that refusal as ``ELOOP``, which is translated back to
+    :class:`ContainmentError` here. The distinction is worth keeping: "somebody
+    put a link where this plugin's file goes" is a different event from "the
+    file is not there", and only one of them is worth a person's attention.
+    """
+    _require_plain_name(name)
+    opened = flags | _NOFOLLOW | os.O_CLOEXEC
+    try:
+        if dir_fd is not None:
+            return os.open(name, opened, mode, dir_fd=dir_fd)
+        with managed_dir() as directory:
+            return os.open(name, opened, mode, dir_fd=directory)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise ContainmentError(
+                f"the Learning Studio {name} is a symbolic link and was refused"
+            ) from exc
+        raise
+
+
+def read_managed(name: str, *, max_bytes: int) -> str | None:
+    """The contents of a managed file, or ``None`` if there is nothing usable.
+
+    Oversized is ``None`` rather than an error, and so is missing, unreadable,
+    and "a symbolic link is sitting there": every one of them means the same
+    thing to every caller here — there is no value to be had — and they are
+    deliberately not distinguished, because a caller that branched on the
+    difference would be branching on something an attacker chooses.
+    """
+    try:
+        fd = open_managed(name, os.O_RDONLY)
+    except (OSError, ContainmentError):
+        return None
+    try:
+        if os.fstat(fd).st_size > max_bytes:
+            return None
+        return os.read(fd, max_bytes).decode("utf-8")
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def write_managed(name: str, text: str) -> None:
+    """Replace a managed file atomically, owner-only from the moment it exists.
+
+    The temporary is created in the same directory — a rename is only atomic
+    within one filesystem — and its mode is set through its own descriptor
+    before the rename, so the file never exists at its final name with default
+    permissions, not even for the width of one syscall.
+    """
+    _require_plain_name(name)
+    payload = text.encode("utf-8")
+    with managed_dir() as directory:
+        temporary = f".{name}.{os.getpid()}.{secrets.token_hex(8)}"
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            FILE_MODE,
+            dir_fd=directory,
+        )
+        try:
+            with contextlib.suppress(OSError, NotImplementedError):
+                os.fchmod(fd, FILE_MODE)
+            os.write(fd, payload)
+            os.fsync(fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary, dir_fd=directory)
+            raise
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        try:
+            os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary, dir_fd=directory)
+            raise
+
+
+def remove_managed(name: str) -> None:
+    """Delete a managed file. Idempotent."""
+    _require_plain_name(name)
+    with contextlib.suppress(OSError, ContainmentError), managed_dir() as directory:
+        os.unlink(name, dir_fd=directory)
+
+
+def _require_plain_name(name: str) -> None:
+    """One path component, and not a traversal.
+
+    Nothing here takes a name from a request — every caller passes a constant
+    or a runtime id this package generated — so this is a guard against a
+    future caller, not against today's input.
+    """
+    if not name or "/" in name or name in (".", ".."):
+        raise ContainmentError("the Learning Studio was asked for a managed file by a bad name")
 
 
 def _require_contained(root: Path, path: Path) -> None:
@@ -280,12 +462,8 @@ def read_record() -> RuntimeRecord | None:
     must never be half-believed, since the half a reader might keep is a
     process id.
     """
-    path = record_path()
-    try:
-        if path.stat().st_size > MAX_RECORD_BYTES:
-            return None
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, ValueError):
+    raw = read_managed(RECORD_FILENAME, max_bytes=MAX_RECORD_BYTES)
+    if raw is None:
         return None
 
     try:
@@ -297,34 +475,18 @@ def read_record() -> RuntimeRecord | None:
 def write_record(record: RuntimeRecord) -> None:
     """Replace the record atomically, owner-only from the moment it exists.
 
-    The temporary file is created in the same directory — a rename is only
-    atomic within one filesystem — and its mode is set *before* the rename, so
-    the record never exists at its final name with default permissions, not
-    even for the width of one syscall. That matters more here than in most
-    places: for that instant the file would be a world-readable control token.
+    Written through a descriptor for the runtime directory rather than by
+    pathname — see :func:`write_managed`. That matters more here than anywhere
+    else in this package: the record holds a control secret, so a link that
+    redirected this write, or a ``chmod`` that landed on the wrong file, would
+    be handing that secret away.
     """
-    directory = runtime_dir()
-    payload = json.dumps(record.to_json(), ensure_ascii=False, sort_keys=True)
-
-    handle, temporary = tempfile.mkstemp(dir=str(directory), prefix=".runtime-", suffix=".json")
-    try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        with contextlib.suppress(OSError, NotImplementedError):
-            os.chmod(temporary, FILE_MODE)
-        os.replace(temporary, record_path())
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(temporary)
-        raise
+    write_managed(RECORD_FILENAME, json.dumps(record.to_json(), ensure_ascii=False, sort_keys=True))
 
 
 def clear_record() -> None:
     """Forget the runtime record. Idempotent, and signals nothing."""
-    with contextlib.suppress(OSError):
-        record_path().unlink()
+    remove_managed(RECORD_FILENAME)
 
 
 def next_generation(previous: RuntimeRecord | None) -> int:
@@ -374,12 +536,17 @@ class ProfileLock:
         """
         import fcntl
 
-        path = self._path or lock_path()
-        # `O_NOFOLLOW` so a link planted at the lock path is refused by the
-        # kernel rather than opened. The check in `managed_path` catches the
-        # same thing a moment earlier; this one cannot be raced.
-        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(str(path), flags, FILE_MODE)
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | _NOFOLLOW
+        if self._path is not None:
+            # A caller-supplied path, used only by tests that want a lock of
+            # their own. Still no-follow; there is no directory descriptor to
+            # be had for an arbitrary location.
+            fd = os.open(str(self._path), flags, FILE_MODE)
+        else:
+            # Relative to a descriptor for the runtime directory, so a link
+            # planted at the lock's name is refused by the kernel rather than
+            # opened — and there is no pathname lookup left to race with.
+            fd = open_managed(LOCK_FILENAME, os.O_RDWR | os.O_CREAT)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:

@@ -77,7 +77,14 @@ Three things follow, and all are enforced rather than advised:
   somebody's behalf.
 - **A spent message stays spent.** Waiting does not make it usable again.
 - **Concurrency is arbitrated.** Two launches racing on one message do not both
-  succeed.
+  succeed — the claim is taken before anything is created, so the second is
+  refused rather than delivering a second button.
+- **A failed send does not always free the message.** If the failure proves
+  nothing was sent, the same words may be used again. If it cannot — a
+  connection that dropped mid-request — a button may already be in their chat,
+  so the words stay spent and you must ask again. The refusal says
+  `confirmation_already_used`; treat it as "go back and ask", never as a reason
+  to retry.
 
 What this does *not* establish is what the learner meant. You are the one
 reading "go on then" as agreement, and the response says so in those terms — it

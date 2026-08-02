@@ -300,3 +300,65 @@ def test_a_pending_grant_admits_nobody(clock):
 
     assert store.admit(launch_id=created["launch_id"], telegram_user_id="1001") is None
     assert created["state"] == "pending"
+
+
+# ── Revocation cannot be lost in the admission window ─────────────────────
+
+
+def test_a_revocation_between_admit_and_admit_session_is_not_lost(store, sessions):
+    """The window the request path actually has, and what used to fall in it.
+
+    ``admit`` hands the grant back and releases the lock; the request then does
+    an ownership query and loads a bundle before asking for a session. A
+    revocation landing in that gap used to be silently undone — the grant was
+    popped and its sessions retired, and then ``admit_session`` attached a new
+    live one to the object still in the caller's hand. The result was a working
+    token for a launch the store no longer had, which nothing could revoke
+    afterwards because nothing could find it.
+    """
+    grant = granted(store)
+
+    assert store.revoke(grant.launch_id) is True
+
+    assert open_session(store, sessions, grant) is None
+    assert grant.session is None
+    assert len(sessions) == 0, "a revoked launch minted a session"
+
+
+def test_a_grant_that_expired_in_the_admission_window_mints_nothing(store, sessions, clock):
+    """Same window, different cause. Expiry is checked again, not assumed."""
+    grant = granted(store)
+
+    clock.advance(grants_module.DEFAULT_GRANT_TTL_SECONDS + 1)
+
+    assert open_session(store, sessions, grant) is None
+    assert len(sessions) == 0
+
+
+def test_a_concurrent_revocation_and_admission_never_both_win(store, sessions):
+    """Under real contention, with the interleaving forced rather than hoped for."""
+    import threading
+
+    grant = granted(store)
+    barrier = threading.Barrier(2, timeout=10)
+    outcomes: dict[str, object] = {}
+
+    def revoking() -> None:
+        barrier.wait()
+        outcomes["revoked"] = store.revoke(grant.launch_id)
+
+    def admitting() -> None:
+        barrier.wait()
+        outcomes["admitted"] = open_session(store, sessions, grant)
+
+    threads = [threading.Thread(target=revoking), threading.Thread(target=admitting)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+        assert not thread.is_alive()
+
+    assert outcomes["revoked"] is True
+    # Whichever order the lock granted, a revoked launch holds no live session.
+    assert store.admit(launch_id=grant.launch_id, telegram_user_id="1001") is None
+    assert grant.session is None or grant.session.expires_at <= 0

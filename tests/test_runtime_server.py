@@ -19,6 +19,7 @@ import pytest
 from learning_studio.runtime import environment as env
 from learning_studio.runtime import server
 from learning_studio.runtime.ownership import CONTROL_HEADER
+from learning_studio.runtime.tunnel import TunnelError
 from learning_studio.sessions import SessionStore
 
 TOKEN = "control-token-for-tests"
@@ -341,3 +342,78 @@ def test_an_unexpected_failure_is_reported_without_its_message(monkeypatch, capl
     assert code == server.EXIT_SERVE_FAILED
     assert "AAHsecret" not in caplog.text
     assert "123456" not in caplog.text
+
+
+# ── A stop that could not close the public address says so ────────────────
+
+
+class _Stubborn:
+    """A tunnel whose ``aclose`` reports that it could not confirm the stop."""
+
+    state = "ready"
+    url = "https://x.trycloudflare.com"
+
+    async def aclose(self, **_kwargs):
+        raise TunnelError("tunnel_cleanup_indeterminate")
+
+
+class _Cooperative:
+    state = "ready"
+    url = "https://x.trycloudflare.com"
+
+    async def aclose(self, **_kwargs):
+        return None
+
+
+class _Server:
+    should_exit = False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tunnel", "expected"),
+    [(_Cooperative(), True), (_Stubborn(), False)],
+)
+async def test_shutdown_reports_whether_the_public_address_is_known_closed(
+    tmp_path: Path, clock, tunnel, expected: bool
+):
+    """The distinction the exit code is built on.
+
+    A shutdown that could not confirm the tunnel was gone used to log a warning
+    and carry on to exit 0 — so a ``cloudflared`` outliving its runtime was
+    reported to the operator as a clean stop, and the address stayed open with
+    nothing left watching it.
+    """
+    settings = server.RuntimeSettings(
+        runtime_id="r-1",
+        generation=1,
+        control_token="t" * 32,
+        profile="default",
+        handshake_path=tmp_path / "handshake.json",
+        idle_timeout_seconds=60,
+        max_lifetime_seconds=300,
+    )
+    settings.handshake_path.write_text("{}", encoding="utf-8")
+    state = server.RuntimeState(settings=settings, started_at=clock())
+    state.tunnel = tunnel
+
+    async def already_finished():
+        return None
+
+    closed = await server._shutdown(
+        state, _Server(), asyncio.ensure_future(already_finished()), settings
+    )
+
+    assert closed is expected
+    assert not settings.handshake_path.exists(), "the handshake was left behind"
+
+
+def test_the_indeterminate_exit_code_is_distinct():
+    """Distinct from success *and* from every other failure the supervisor knows."""
+    codes = {
+        server.EXIT_BAD_ENVIRONMENT,
+        server.EXIT_SERVE_FAILED,
+        server.EXIT_TUNNEL_INDETERMINATE,
+    }
+    assert len(codes) == 3
+    assert 0 not in codes

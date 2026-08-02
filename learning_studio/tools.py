@@ -105,7 +105,13 @@ def _run(tool_name: str, raw: Any, call) -> str:
         # without naming a path, a profile, or another learner.
         return _error(str(exc))
     except Exception as exc:
-        logger.exception("%s failed: %s", tool_name, exc)
+        # The **class name**, not `str(exc)`. An unexpected exception here can
+        # be carrying anything the code below it was handling — a learner's
+        # answer, a storage path, a request URL with a bot token in it — and
+        # this line is the one place all of them converge. The traceback still
+        # goes to the log, because a tool that fails silently is worse; what
+        # does not go is a message chosen by whatever raised.
+        logger.exception("%s failed: %s", tool_name, type(exc).__name__)
         return _error(_INTERNAL_ERROR)
 
 

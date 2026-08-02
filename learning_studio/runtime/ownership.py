@@ -410,10 +410,30 @@ class ProcessHandle:
     def signal_group(self, sig: int, record: RuntimeRecord) -> bool:
         """Deliver to the runtime's process group, re-proving first.
 
-        The group rather than the process, because the runtime has a tunnel
-        child and killing only the leader would leave it running. Safe because
-        the leader's pid is pinned by this handle and the group id equals it —
-        so no unrelated group can have acquired that number.
+        The group rather than the process alone, because the runtime has a
+        tunnel child and stopping only the leader would leave a public address
+        being served by an orphan.
+
+        **The leader is signalled through the descriptor, and the group only
+        afterwards.** That order is the whole safety argument, and the previous
+        version did not have it: it checked ``getpgid`` and then called
+        ``killpg`` on a *number*, so a runtime that exited in between handed
+        that number — and the signal — to whatever the kernel gave it to next.
+        Holding a pidfd made the race narrower without closing it, because the
+        pidfd was never the thing used to signal.
+
+        Now:
+
+        1. ``pidfd_send_signal`` delivers to the pinned process. The descriptor
+           *is* the identity, so there is no number for anything to recycle,
+           and a leader that has already gone raises ``ProcessLookupError``
+           rather than reaching a stranger.
+        2. Only because step 1 succeeded is the group id then usable: the
+           kernel does not reuse a pid while the process it names still exists,
+           even as a zombie, so ``self._pid`` still names this runtime's group
+           and nobody else's.
+
+        A failure at step 1 returns False without step 2 ever running.
         """
         if not owned(record, timeout=1.0):
             return False
@@ -421,10 +441,22 @@ class ProcessHandle:
             if os.getpgid(self._pid) != self._pid:
                 logger.warning("refusing to signal runtime: process group is not its own")
                 return False
+            # (1) The pinned leader, by descriptor. Race-free by construction.
+            os.pidfd_send_signal(self._fd, sig)  # type: ignore[attr-defined]
+        except (OSError, PermissionError) as exc:
+            logger.warning("could not signal the runtime process: %s", type(exc).__name__)
+            return False
+
+        try:
+            # (2) Its descendants. Reachable only by number — there is no
+            # descriptor for a process group — but the number is safe to use
+            # here, and only here, because the leader was alive a moment ago.
             os.killpg(self._pid, sig)
         except (OSError, PermissionError) as exc:
-            logger.warning("could not signal the runtime process group: %s", type(exc).__name__)
-            return False
+            # The leader has the signal either way, so this is not a failure to
+            # signal the runtime; it is a failure to reach the rest of a group
+            # that may already be empty.
+            logger.debug("could not signal the runtime process group: %s", type(exc).__name__)
         return True
 
     def close(self) -> None:
@@ -442,7 +474,14 @@ def handle_supported() -> bool:
     rather than leaving an operator to discover it from a stop that reports
     ``unprovable``.
     """
-    return hasattr(os, "pidfd_open") and hasattr(os, "killpg")
+    return (
+        hasattr(os, "pidfd_open")
+        # The one that actually delivers. Without it a handle could pin an
+        # identity and then have no way to use it, which is how signalling a
+        # number crept back in the first time.
+        and hasattr(os, "pidfd_send_signal")
+        and hasattr(os, "killpg")
+    )
 
 
 def acquire_handle(record: RuntimeRecord) -> ProcessHandle | None:

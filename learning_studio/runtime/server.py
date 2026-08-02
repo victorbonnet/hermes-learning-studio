@@ -45,9 +45,9 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import signal
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +69,12 @@ TICK_SECONDS = 0.25
 #: crash and is reported as one.
 EXIT_BAD_ENVIRONMENT = 2
 EXIT_SERVE_FAILED = 3
+#: The server stopped, but the tunnel could not be confirmed gone. A distinct
+#: code because the difference is the whole point: exit 0 says "the public
+#: address is closed", and this says "it may still be open". Silently exiting 0
+#: here let a `cloudflared` that outlived its runtime be reported as a clean
+#: stop, all the way up to the operator.
+EXIT_TUNNEL_INDETERMINATE = 4
 
 
 @dataclass
@@ -363,20 +369,39 @@ def write_handshake(path: Path, payload: dict[str, Any]) -> None:
     Atomic because the supervisor is polling for this file and must never read
     a half-written one; owner-only because it sits beside the record and there
     is no reason for it to be readable by anybody else.
+
+    Created, chmod-ed and renamed relative to a descriptor for the directory,
+    never by pathname. The directory is opened ``O_NOFOLLOW`` so a link
+    substituted for it is refused by the kernel instead of quietly redirecting
+    a file the supervisor is about to read a port out of.
     """
-    handle, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=".handshake-")
+    directory = os.open(
+        str(path.parent),
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, sort_keys=True))
-            stream.flush()
-            os.fsync(stream.fileno())
-        with contextlib.suppress(OSError, NotImplementedError):
-            os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(temporary)
-        raise
+        temporary = f".handshake-{os.getpid()}-{secrets.token_hex(8)}"
+        handle = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory,
+        )
+        try:
+            with contextlib.suppress(OSError, NotImplementedError):
+                os.fchmod(handle, 0o600)
+            os.write(handle, json.dumps(payload, sort_keys=True).encode("utf-8"))
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+        try:
+            os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary, dir_fd=directory)
+            raise
+    finally:
+        os.close(directory)
 
 
 async def _watchdog(state: RuntimeState, *, clock=time.time, tick: float = TICK_SECONDS) -> None:
@@ -486,6 +511,7 @@ async def serve(settings: RuntimeSettings, *, clock=time.time) -> int:
     await _after_ready(state, settings, clock=clock)
 
     watchdog = asyncio.create_task(_watchdog(state, clock=clock))
+    closed = False
     try:
         await state.stop_event.wait()
     finally:
@@ -493,8 +519,8 @@ async def serve(settings: RuntimeSettings, *, clock=time.time) -> int:
         watchdog.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watchdog
-        await _shutdown(state, server, serving, settings)
-    return 0
+        closed = await _shutdown(state, server, serving, settings)
+    return 0 if closed else EXIT_TUNNEL_INDETERMINATE
 
 
 async def _after_ready(state: RuntimeState, settings: RuntimeSettings, *, clock) -> None:
@@ -554,14 +580,20 @@ async def _await_started(server, serving, *, timeout: float = 60.0) -> None:
     raise RuntimeError("the server did not start listening in time")
 
 
-async def _shutdown(state: RuntimeState, server, serving, settings: RuntimeSettings) -> None:
+async def _shutdown(state: RuntimeState, server, serving, settings: RuntimeSettings) -> bool:
     """Stop the tunnel, then the server, then clean up what this process made.
 
     That order is not arbitrary. Closing the public entrance first means the
     last thing a learner sees is "this exercise has closed" rather than a
     half-served page, and it means no request can arrive during the window in
     which the server is tearing down.
+
+    Returns whether the public address is *known* to be closed. False is not a
+    failure to stop — the server still stops, and the handshake still goes —
+    it is the difference between "closed" and "may still be open", which the
+    caller turns into an exit code rather than discarding.
     """
+    closed = True
     tunnel = state.tunnel
     if tunnel is not None:
         try:
@@ -572,6 +604,7 @@ async def _shutdown(state: RuntimeState, server, serving, settings: RuntimeSetti
             await tunnel.aclose()
         except Exception:
             logger.warning("the tunnel could not be confirmed stopped")
+            closed = False
 
     server.should_exit = True
     with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
@@ -579,6 +612,8 @@ async def _shutdown(state: RuntimeState, server, serving, settings: RuntimeSetti
 
     with contextlib.suppress(OSError):
         os.unlink(settings.handshake_path)
+
+    return closed
 
 
 def main(argv: list[str] | None = None) -> int:

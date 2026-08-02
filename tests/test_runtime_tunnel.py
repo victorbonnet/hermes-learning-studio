@@ -409,3 +409,66 @@ def test_the_tunnel_is_started_without_a_shell():
     assert "create_subprocess_exec" in called
     assert "create_subprocess_shell" not in called
     assert "system" not in called and "popen" not in called
+
+
+# ── Cancellation must not leave a public address behind ───────────────────
+
+
+class HangingStream:
+    async def readline(self) -> bytes:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class StubbornProcess(FakeProcess):
+    """A ``cloudflared`` that ignores ``SIGTERM``, as a wedged one does."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        # Never produces a line, so the read is still in flight when the task
+        # is cancelled — which is the state this path exists for.
+        self.stdout = HangingStream()
+        self.killed = False
+
+    def terminate(self) -> None:
+        self.terminated = True  # noted, and otherwise ignored
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self._gone.set()
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_open_kills_a_tunnel_that_ignores_terminate():
+    """The teardown path that cannot wait must not stop at a polite request.
+
+    A cancelled task raises ``CancelledError`` again at its first suspension
+    point, so this path cannot await the process and cannot see whether the
+    signal worked. Sending only ``SIGTERM`` therefore left a ``cloudflared``
+    that declines it serving a public address for a runtime that has gone.
+    """
+    process = StubbornProcess()
+    spawner = Spawner(process)
+
+    task = asyncio.create_task(
+        tunnel.open_tunnel(
+            executable="/usr/bin/cloudflared",
+            target="http://127.0.0.1:8080",
+            environment={},
+            timeout_seconds=30,
+            spawn=spawner,
+        )
+    )
+    # Let it get as far as reading output, so there is a live process to leak.
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if spawner.argv is not None:
+            break
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert process.terminated is True
+    assert process.killed is True, "a cancelled launch left the tunnel running"

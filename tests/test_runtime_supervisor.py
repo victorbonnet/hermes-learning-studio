@@ -732,3 +732,80 @@ def test_a_runtime_whose_tunnel_prints_nothing_usable_stays_without_one(
         assert handle.reply.server_state == "ready"
     finally:
         supervisor.stop(settings)
+
+
+# ── The window between spawning and holding ───────────────────────────────
+
+
+def test_interrupting_signals_are_blocked_while_the_child_is_being_spawned(
+    hermes_home, interpreter
+):
+    """The one instruction no ``try`` block can cover.
+
+    ``popen`` returns a running process, and the assignment that stores it is a
+    separate step. A Ctrl-C delivered between them — the ordinary way to hit
+    this — unwinds with the reference already dropped, so the rollback handler
+    finds nothing to stop and a runtime keeps running with nothing naming it.
+    """
+    import signal
+
+    class Watching(FakePopen):
+        def __init__(self) -> None:
+            super().__init__(raises=OSError("stop here"))
+            self.blocked: set = set()
+
+        def __call__(self, command, **kwargs):
+            self.blocked = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+            return super().__call__(command, **kwargs)
+
+    popen = Watching()
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+
+    with pytest.raises(RuntimeUnavailable):
+        supervisor.ensure_running(config(), python=interpreter, popen=popen)
+
+    assert {signal.SIGINT, signal.SIGTERM} <= popen.blocked
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before, "the mask was not restored"
+
+
+def test_a_spawn_that_raises_leaves_the_signal_mask_alone(hermes_home, interpreter):
+    """Restored in a ``finally``, so a failed start blocks nothing afterwards."""
+    import signal
+
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    with pytest.raises(RuntimeUnavailable):
+        supervisor.ensure_running(
+            config(), python=interpreter, popen=FakePopen(raises=OSError("no such file"))
+        )
+
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before
+
+
+def test_the_runtime_entry_point_clears_an_inherited_signal_mask():
+    """A blocked set survives ``exec``; ``restore_signals`` does not clear it.
+
+    Without the clear at the top of ``launch_server``, a runtime started while
+    the supervisor held signals would ignore the ``SIGTERM`` its own shutdown
+    depends on — and would pass the same deafness to ``cloudflared``.
+    """
+    import subprocess
+
+    pytest.importorskip("fastapi")
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import signal;"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT});"
+            "import learning_studio.runtime.launch_server;"
+            "print(sorted(signal.pthread_sigmask(signal.SIG_BLOCK, [])))",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "[]"

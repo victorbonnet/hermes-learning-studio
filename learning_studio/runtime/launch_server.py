@@ -16,12 +16,26 @@ below would fail. Appending the root — rather than inserting it — is the who
 subtlety: the runtime virtual environment's own FastAPI and Uvicorn must win
 over anything of the same name sitting beside the plugin, and an entry appended
 after the environment's own ``site-packages`` cannot shadow them.
+
+**The signal mask is cleared first.** A process inherits its parent's blocked
+set across ``exec``, and the supervisor deliberately blocks interrupting
+signals for the length of the spawn so a Ctrl-C cannot land between ``popen``
+returning and the reference being stored. Nothing resets that for us —
+``restore_signals`` restores dispositions, not the mask — so a runtime started
+that way would ignore the ``SIGTERM`` its own shutdown depends on, and would
+hand the same deafness to every process it starts, ``cloudflared`` included.
+Clearing it here, before anything else runs, is what keeps the parent's
+one-instruction safety measure from becoming the child's permanent condition.
 """
 
 from __future__ import annotations
 
+import signal
 import sys
 from pathlib import Path
+
+if hasattr(signal, "pthread_sigmask"):
+    signal.pthread_sigmask(signal.SIG_SETMASK, set())
 
 #: ``<root>/learning_studio/runtime/launch_server.py`` → ``<root>``.
 _PACKAGE_ROOT = str(Path(__file__).resolve().parents[2])

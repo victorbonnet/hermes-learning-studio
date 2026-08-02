@@ -426,3 +426,115 @@ def test_a_telegram_description_is_never_relayed_even_when_it_quotes_us():
 
     assert TOKEN not in str(caught.value)
     assert "chat 1001" not in str(caught.value)
+
+
+# ── Descriptor-relative, not pathname-then-write ──────────────────────────
+
+
+def test_managed_files_are_only_ever_touched_through_a_directory_descriptor():
+    """The check and the write must be one lookup, not two.
+
+    Every earlier version inspected a pathname and then wrote to that pathname.
+    Between the two the name can be replaced — and the record holds a control
+    secret, so a redirected write hands it to whoever planted the link. The
+    three functions every managed file goes through take a directory descriptor
+    and a bare name, which resolves once.
+
+    The two deliberate exceptions are named: ``_open_directory`` is what
+    *produces* the descriptor, and ``ProfileLock.acquire`` honours an explicit
+    path when a test hands it one, where there is no managed directory to be
+    relative to.
+    """
+    import ast
+
+    tree = ast.parse(Path(state.__file__).read_text(encoding="utf-8"))
+    relative_only = {"open_managed", "write_managed", "remove_managed", "read_managed"}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name not in relative_only:
+            continue
+        for call in ast.walk(node):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+                continue
+            if call.func.attr not in ("open", "unlink", "replace"):
+                continue
+            keywords = {keyword.arg for keyword in call.keywords}
+            assert keywords & {"dir_fd", "src_dir_fd", "dst_dir_fd"}, (
+                f"os.{call.func.attr} is called by pathname in {node.name} at line {call.lineno}"
+            )
+
+    # `chmod` follows links; `fchmod` cannot. There must be none of the former
+    # anywhere in the module, not merely none in those four functions.
+    chmods = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "chmod"
+    ]
+    assert chmods == [], f"a mode change is made by pathname at {chmods}"
+
+
+def test_a_link_planted_at_the_record_name_redirects_nothing(storage, tmp_path):
+    """The write lands inside the runtime directory, and the link goes with it.
+
+    A rename does not follow a link at its destination, so replacing the record
+    replaces the *link* — the file it pointed at is never opened, never
+    written, and never has its mode changed. That is what the old
+    write-by-pathname did do.
+    """
+    runtime = storage / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    victim = tmp_path / "someone-elses-file"
+    victim.write_text("untouched", encoding="utf-8")
+    victim.chmod(0o644)
+    os.symlink(victim, runtime / "runtime.json")
+
+    state.write_record(_record())
+
+    assert victim.read_text(encoding="utf-8") == "untouched"
+    assert victim.stat().st_mode & 0o777 == 0o644, "a mode change followed the link"
+    assert not (runtime / "runtime.json").is_symlink()
+    restored = state.read_record()
+    assert restored is not None and restored.runtime_id == "r"
+
+
+def test_a_record_read_back_through_a_planted_link_is_ignored(storage, tmp_path):
+    """Reading refuses the link rather than believing what it points at.
+
+    A record is the input to a decision about signalling a process. One planted
+    by somebody else naming somebody else's pid is exactly the input that must
+    not be half-believed.
+    """
+    runtime = storage / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    forged = tmp_path / "forged.json"
+    forged.write_text(json.dumps(_record().to_json()), encoding="utf-8")
+    os.symlink(forged, runtime / "runtime.json")
+
+    assert state.read_record() is None
+
+
+def test_a_link_planted_at_the_stamp_name_redirects_nothing(storage, tmp_path):
+    """Same rule for the bootstrap stamp, which is written after a build."""
+    from learning_studio.runtime import bootstrap
+
+    runtime = storage / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    victim = tmp_path / "stamp-target"
+    victim.write_text("untouched", encoding="utf-8")
+    victim.chmod(0o644)
+    os.symlink(victim, runtime / bootstrap.STAMP_FILENAME)
+
+    bootstrap._write_stamp(runtime)
+
+    assert victim.read_text(encoding="utf-8") == "untouched"
+    assert victim.stat().st_mode & 0o777 == 0o644
+    assert not (runtime / bootstrap.STAMP_FILENAME).is_symlink()
+
+
+def test_a_managed_name_that_could_escape_the_directory_is_refused():
+    """Nothing passes a name from a request today. This is for tomorrow's caller."""
+    for name in ("", ".", "..", "../runtime.json", "sub/dir"):
+        with pytest.raises(ContainmentError):
+            state.remove_managed(name)

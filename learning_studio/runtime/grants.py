@@ -308,7 +308,8 @@ class GrantStore:
             return grant
 
     def admit_session(self, grant: LaunchGrant, create):
-        """Give this grant its one live session, replacing any it already had.
+        """Give this grant its one live session, or ``None`` if it is no longer
+        admissible.
 
         ``create`` is called *under the lock* and returns ``(token, session)``.
         That is what makes two simultaneous admissions safe: they serialise
@@ -318,8 +319,27 @@ class GrantStore:
         A reload therefore resumes rather than restarts, and the token it
         replaces stops working immediately — so there is never a second live
         token for one launch.
+
+        Every condition :meth:`admit` checked is checked **again** here, under
+        the lock, because the caller had to let go of it in between: it has an
+        ownership query and a bundle load to do, and a revocation landing in
+        that window used to be lost. The grant was popped and its sessions
+        retired, then this method attached a brand-new live session to the
+        object the caller was still holding — leaving a working token for a
+        launch the store no longer had, which no later revocation could reach.
+
+        Identity, not equality: ``is`` compares against the object currently in
+        the store, so a grant that was revoked and whose selector was somehow
+        reissued cannot pass by looking alike.
         """
         with self._lock:
+            now = float(self._clock())
+            if self._grants.get(grant.launch_id) is not grant:
+                return None
+            if grant.revoked or grant.generation != self._generation:
+                return None
+            if not grant.admissible(now):
+                return None
             previous = grant.session
             token, session = create()
             if previous is not None:

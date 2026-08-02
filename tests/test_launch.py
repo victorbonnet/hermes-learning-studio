@@ -493,21 +493,43 @@ def test_an_explicit_request_never_needs_a_confirmation_flag(
     assert "request to practise" in result["basis"]
 
 
-def test_a_failed_launch_does_not_spend_the_learner_message(
+def test_a_failure_that_proves_nothing_was_sent_frees_the_message(
     runtime, spoken, principal, experience_id
 ):
-    """A delivery failure must not force the learner to be asked again."""
-    with pytest.raises(RuntimeError):
+    """No token means no request was made, so a retry may use the same words."""
+    from learning_studio.runtime.errors import DELIVERY_FAILED, LaunchRefused
+
+    with pytest.raises(LaunchRefused):
         launch(
             principal,
             experience_id,
-            deliver=Deliveries(fails=RuntimeError("telegram is down")),
+            deliver=Deliveries(fails=LaunchRefused(DELIVERY_FAILED, reason="bot_token_absent")),
             evidence=spoken,
         )
 
     result = launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
 
     assert result["button_delivered"] is True
+
+
+def test_a_failure_that_might_have_sent_something_keeps_the_message_claimed(
+    runtime, spoken, principal, experience_id
+):
+    """A connection that dropped mid-request proves nothing.
+
+    A message may be sitting in the learner's chat. A retry on the same
+    sentence would put a second button beside a first one nobody can see, so
+    the agent has to go back and ask.
+    """
+    deliver = Deliveries(fails=RuntimeError("connection reset mid-request"))
+
+    with pytest.raises(RuntimeError):
+        launch(principal, experience_id, deliver=deliver, evidence=spoken)
+
+    with pytest.raises(ConsentRequired) as caught:
+        launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
+
+    assert caught.value.reason == "confirmation_already_used"
 
 
 # ── Rollback ──────────────────────────────────────────────────────────────
@@ -937,23 +959,112 @@ def test_a_committed_launch_admits_its_learner(runtime, spoken, principal, exper
     assert admitted.activated is True
 
 
-def test_a_failed_commit_does_not_spend_the_learner_message(
+def test_a_failed_commit_keeps_the_message_claimed(
     runtime, spoken, principal, experience_id, monkeypatch
 ):
-    """An indeterminate launch must not also cost them their words."""
-    working = {"value": False}
-    real = launch_module._activate
+    """An indeterminate launch must not let a retry send a second button.
 
-    def sometimes(handle, launch_id):
-        return real(handle, launch_id) if working["value"] else False
-
-    monkeypatch.setattr(launch_module, "_activate", sometimes)
+    The message went out. Whether the exercise works is unknown — but a retry
+    on the same sentence would put a *second* button in the chat, which is the
+    one thing an unknown state must not be allowed to cause. The claim is kept,
+    so the agent has to go back to the learner.
+    """
+    deliver = Deliveries()
+    monkeypatch.setattr(launch_module, "_activate", lambda handle, launch_id: False)
 
     with pytest.raises(RuntimeUnavailable):
-        launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
+        launch(principal, experience_id, deliver=deliver, evidence=spoken)
 
-    # A later, working attempt still has consent to spend.
-    working["value"] = True
-    result = launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
+    monkeypatch.setattr(
+        launch_module,
+        "_activate",
+        launch_module._activate.__wrapped__
+        if hasattr(launch_module._activate, "__wrapped__")
+        else _real_activate,
+    )
+
+    with pytest.raises(ConsentRequired) as caught:
+        launch(principal, experience_id, deliver=deliver, evidence=spoken)
+
+    assert caught.value.reason == "confirmation_already_used"
+    assert len(deliver.sent) == 1, "a retry sent a second button"
+
+
+def _real_activate(handle, launch_id):
+    from learning_studio.runtime import ownership as _ownership
+
+    reply = _ownership.call(handle.record, _ownership.GRANT_ACTIVATE_PATH, {"launch_id": launch_id})
+    return bool(reply.get("activated"))
+
+
+def test_a_failure_before_anything_is_sent_hands_the_message_back(
+    runtime, spoken, principal, experience_id, clock
+):
+    """A tunnel that is not ready proves no button went out, so a retry may."""
+    fake = runtime
+    fake.tunnel_url = ""
+    deliver = Deliveries()
+
+    with pytest.raises(RuntimeUnavailable) as caught:
+        launch(principal, experience_id, deliver=deliver, evidence=spoken)
+    assert caught.value.reason == "tunnel_not_ready"
+
+    fake.tunnel_url = TUNNEL_URL
+    result = launch(principal, experience_id, deliver=deliver, evidence=spoken)
 
     assert result["button_delivered"] is True
+
+
+def test_two_launches_racing_on_one_message_deliver_exactly_one_button(
+    runtime, spoken, principal, experience_id, monkeypatch
+):
+    """The race the reservation exists to arbitrate.
+
+    Both callers validate the *same* unspent message and both reach the point
+    of claiming it. Before the reservation there was nothing between them: two
+    grants were created, two buttons went out, and the loser of the eventual
+    spend was discarded in silence — the learner saw two messages and the agent
+    was told twice that one had been sent.
+
+    The barrier is what makes this deterministic. Both threads finish consent
+    before either claims, so the interleaving under test happens on every run
+    rather than on an unlucky one.
+    """
+    import threading
+
+    from learning_studio import consent as consent_module
+
+    barrier = threading.Barrier(2, timeout=10)
+    real_reserve = consent_module.reserve
+
+    def synchronised(decision, *, store=None):
+        barrier.wait()
+        return real_reserve(decision, store=store)
+
+    monkeypatch.setattr(consent_module, "reserve", synchronised)
+
+    deliver = Deliveries()
+    outcomes: list[object] = []
+
+    def attempt() -> None:
+        try:
+            outcomes.append(launch(principal, experience_id, deliver=deliver, evidence=spoken))
+        except BaseException as exc:  # noqa: BLE001 - the failure is the assertion
+            outcomes.append(exc)
+
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "a racing launch never finished"
+
+    delivered = [item for item in outcomes if isinstance(item, dict)]
+    refused = [item for item in outcomes if isinstance(item, ConsentRequired)]
+
+    assert len(deliver.sent) == 1, "one message authorised two buttons"
+    assert len(delivered) == 1
+    assert delivered[0]["button_delivered"] is True
+    assert len(refused) == 1
+    assert refused[0].reason == "confirmation_already_used"
+    assert len(runtime.store) == 1, "one message created two launches"

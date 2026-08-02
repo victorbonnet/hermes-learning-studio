@@ -155,6 +155,9 @@ class EvidenceStore:
         self._lock = threading.Lock()
         self._entries: dict[EvidenceKey, _Entry] = {}
         self._spent: dict[EvidenceKey, float] = {}
+        #: Claimed but not yet resolved. Held for the length of one launch
+        #: transaction, and never handed to a second caller.
+        self._reserved: dict[EvidenceKey, float] = {}
 
     def __len__(self) -> int:
         with self._lock:
@@ -172,9 +175,10 @@ class EvidenceStore:
         now = float(self._clock())
         with self._lock:
             self._purge(now)
-            if key in self._spent:
-                # A message id this store has already spent must not be
-                # re-armed by a second delivery of the same update.
+            if key in self._spent or key in self._reserved:
+                # A message id this store has already spent — or is in the
+                # middle of spending — must not be re-armed by a second
+                # delivery of the same update.
                 return
             self._entries[key] = _Entry(text=cleaned, captured_at=now)
             while len(self._entries) > self._max:
@@ -201,36 +205,74 @@ class EvidenceStore:
         now = float(self._clock())
         with self._lock:
             self._purge(now)
-            if key in self._spent:
+            if key in self._spent or key in self._reserved:
+                # A reservation reads as spent to everybody except the holder.
+                # It may become free again if that launch gives up, but until
+                # then nobody else may act on it.
                 return "spent"
             entry = self._entries.get(key)
             if entry is None:
                 return "absent"
             return "matched" if needle in entry.text else "mismatched"
 
-    def spend(self, key: EvidenceKey) -> bool:
-        """Consume this message's authority, once.
+    def reserve(self, key: EvidenceKey) -> bool:
+        """Claim this message's authority *before* acting on it. Once.
 
-        Returns True for the caller that won. Concurrent duplicate launches
-        both reach here; exactly one is told it may proceed, which is what
-        makes "one message, one launch" true under a double-tap rather than
-        merely intended.
+        This is the arbitration, and it has to happen here rather than at the
+        end. Spending only after delivery meant two concurrent launches could
+        both read the message as unspent, both create a grant, and both send a
+        button — and the loser of the eventual ``spend`` race was simply
+        ignored. The learner got two messages for one sentence.
+
+        A reservation is held from the moment a launch is authorised until it
+        either commits or explicitly gives up. Nothing else can reserve the
+        same message in between, so "one message, one launch" is true under a
+        double tap rather than merely intended.
+
+        A reservation that is never resolved — an interruption after the button
+        went out, a process that died mid-transaction — stays held and expires
+        with the tombstone. That is deliberate: the safe residue of "we may
+        have launched" is "this message cannot launch again".
         """
         if not key.complete:
             return False
         now = float(self._clock())
         with self._lock:
             self._purge(now)
-            if key in self._spent:
+            if key in self._spent or key in self._reserved:
                 return False
             if key not in self._entries:
                 return False
-            del self._entries[key]
+            self._reserved[key] = now
+            return True
+
+    def commit(self, key: EvidenceKey) -> bool:
+        """Turn a reservation into a spend. The launch happened."""
+        now = float(self._clock())
+        with self._lock:
+            if key not in self._reserved:
+                return False
+            del self._reserved[key]
+            self._entries.pop(key, None)
             self._spent[key] = now
             while len(self._spent) > MAX_TOMBSTONES:
                 oldest = min(self._spent, key=lambda k: self._spent[k])
                 del self._spent[oldest]
             return True
+
+    def release(self, key: EvidenceKey) -> bool:
+        """Give a reservation back, because nothing reached the learner.
+
+        Only ever called on a path that has *proved* nothing was delivered. A
+        failure that might have sent a message keeps the reservation, because
+        releasing one there is what would let a retry send a second.
+        """
+        with self._lock:
+            return self._reserved.pop(key, None) is not None
+
+    def spend(self, key: EvidenceKey) -> bool:
+        """Reserve and commit in one step, for a caller with nothing to undo."""
+        return self.reserve(key) and self.commit(key)
 
     # -- housekeeping ----------------------------------------------------
 
@@ -246,12 +288,18 @@ class EvidenceStore:
             del self._entries[key]
         for key in [k for k, at in self._spent.items() if now - at > self._tombstone_ttl]:
             del self._spent[key]
+        # A reservation nobody resolved expires on the tombstone clock too, so
+        # a crashed transaction does not hold a message hostage forever — but
+        # it outlives the evidence, so it cannot become "new" in between.
+        for key in [k for k, at in self._reserved.items() if now - at > self._tombstone_ttl]:
+            del self._reserved[key]
 
     def clear(self) -> None:
         """Forget everything. For tests, and for a deliberate shutdown."""
         with self._lock:
             self._entries.clear()
             self._spent.clear()
+            self._reserved.clear()
 
 
 #: One store per Hermes process. Keyed by profile inside, so two profiles

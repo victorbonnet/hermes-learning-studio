@@ -44,14 +44,13 @@ import contextlib
 import hashlib
 import json
 import logging
-import os
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..paths import DIRECTORY_MODE, FILE_MODE
-from .state import managed_path, runtime_dir
+from ..paths import DIRECTORY_MODE
+from .state import managed_path, read_managed, remove_managed, runtime_dir, write_managed
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +60,9 @@ REQUIREMENTS = Path(__file__).resolve().parent / "requirements.txt"
 
 VENV_DIRNAME = "venv"
 STAMP_FILENAME = "venv.stamp"
+
+#: A stamp is two short strings. Anything larger is not one this module wrote.
+MAX_STAMP_BYTES = 4096
 
 #: Bounded so a pathological build log cannot become the return value.
 MAX_DETAIL_CHARS = 4000
@@ -116,9 +118,12 @@ def is_bootstrapped() -> bool:
     """
     if not runtime_python().is_file():
         return False
+    raw = read_managed(STAMP_FILENAME, max_bytes=MAX_STAMP_BYTES)
+    if raw is None:
+        return False
     try:
-        recorded = json.loads(stamp_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        recorded = json.loads(raw)
+    except ValueError:
         return False
     return isinstance(recorded, dict) and recorded == _expected_stamp()
 
@@ -234,11 +239,13 @@ def _write_stamp(directory: Path) -> None:
     Written last on purpose: a stamp that exists before the install finishes
     would describe an environment that does not work yet, and the next launch
     would believe it.
+
+    Through a descriptor for the runtime directory rather than by pathname, for
+    the same reason as the record: a link planted at the stamp's name would
+    otherwise have redirected both the write and the ``chmod`` that follows it.
     """
-    path = directory / STAMP_FILENAME
-    path.write_text(json.dumps(_expected_stamp(), sort_keys=True), encoding="utf-8")
-    with contextlib.suppress(OSError, NotImplementedError):
-        path.chmod(FILE_MODE)
+    del directory
+    write_managed(STAMP_FILENAME, json.dumps(_expected_stamp(), sort_keys=True))
 
 
 def remove() -> None:
@@ -252,5 +259,4 @@ def remove() -> None:
     target = venv_dir()
     if target.is_dir():
         shutil.rmtree(target, ignore_errors=True)
-    with contextlib.suppress(OSError):
-        os.unlink(stamp_path())
+    remove_managed(STAMP_FILENAME)

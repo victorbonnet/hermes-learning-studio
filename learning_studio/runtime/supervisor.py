@@ -206,9 +206,10 @@ def read_handshake(path: Path, runtime_id: str) -> int | None:
     """
     import json
 
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
+    from .state import MAX_HANDSHAKE_BYTES, read_managed
+
+    raw = read_managed(path.name, max_bytes=MAX_HANDSHAKE_BYTES)
+    if raw is None:
         return None
     try:
         parsed = json.loads(raw)
@@ -284,6 +285,38 @@ def ensure_running(
     )
 
 
+#: Kept out of the child: `subprocess` restores an empty mask in the child when
+#: `restore_signals` is left at its default, and there is a test for that.
+_DEFERRED_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})
+
+
+@contextlib.contextmanager
+def _interruptions_deferred():
+    """Hold interrupting signals for the length of one spawn.
+
+    There is a window no ``try`` can cover: ``popen`` returns a live process
+    and the interpreter has not yet performed the assignment that stores it. A
+    signal delivered between those two — Ctrl-C during a launch is the ordinary
+    way to hit it — raises out of the statement with the reference already
+    dropped, and the cleanup handler below finds ``child is None`` and has
+    nothing to kill. The process keeps running, holding a port and a tunnel,
+    with nothing in the profile that names it.
+
+    Blocking the signal moves its delivery to the moment the mask is restored,
+    by which time the assignment has happened and the handler can do its job.
+    Nothing is swallowed: a blocked signal stays pending and arrives late.
+
+    The mask is per-thread, so this affects only the thread doing the spawn,
+    and it is restored in a ``finally`` — an exception from ``popen`` itself
+    leaves no signals blocked.
+    """
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, _DEFERRED_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
 def _start(
     config: LearningStudioConfig,
     *,
@@ -298,8 +331,7 @@ def _start(
 
     runtime_id = uuid.uuid4().hex
     handshake = handshake_path(runtime_id)
-    with contextlib.suppress(OSError):
-        handshake.unlink()
+    _forget_handshake(handshake)
 
     record_without_port = RuntimeRecord(
         runtime_id=runtime_id,
@@ -324,24 +356,26 @@ def _start(
 
     child = None
     try:
-        child = popen(
-            # An argument array. There is no shell anywhere in this package and
-            # no string for one to reinterpret; both entries are paths this
-            # package computed, neither is reachable from a tool payload.
-            [str(interpreter), str(LAUNCHER)],
-            env=child_env,
-            # Its own session, so `pid == pgid` and the group this plugin may
-            # ever signal contains this child and its descendants alone.
-            start_new_session=True,
-            stdin=subprocess.DEVNULL,
-            # The runtime logs through Python's logging, which goes to stderr.
-            # Neither stream is read by this process, so neither may be a pipe:
-            # an unread pipe fills and blocks the child forever.
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            cwd=str(runtime_dir()),
-        )
+        with _interruptions_deferred():
+            child = popen(
+                # An argument array. There is no shell anywhere in this package
+                # and no string for one to reinterpret; both entries are paths
+                # this package computed, neither is reachable from a tool
+                # payload.
+                [str(interpreter), str(LAUNCHER)],
+                env=child_env,
+                # Its own session, so `pid == pgid` and the group this plugin
+                # may ever signal contains this child and its descendants alone.
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                # The runtime logs through Python's logging, which goes to
+                # stderr. Neither stream is read by this process, so neither may
+                # be a pipe: an unread pipe fills and blocks the child forever.
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                cwd=str(runtime_dir()),
+            )
         record = dataclasses.replace(record_without_port, pid=child.pid)
         return _await_ready(
             config,
@@ -360,9 +394,9 @@ def _start(
         raise _unavailable(START_FAILED, "runtime_spawn_failed") from exc
     except BaseException:
         # `BaseException`, so a KeyboardInterrupt or a cancellation between the
-        # spawn and the record cannot leave a runtime nobody is holding. The
-        # window used to be real: `popen` returned, and an interruption during
-        # the very next statement leaked a process with no record of it.
+        # spawn and the record cannot leave a runtime nobody is holding. Note
+        # that this handler can only help once `child` is bound, which is what
+        # `_interruptions_deferred` above exists to guarantee.
         #
         # Cleanup only. The exception is re-raised immediately, because
         # swallowing a cancellation is how a shutdown hangs.
@@ -408,12 +442,22 @@ def _await_ready(
             continue
 
         write_record(record)
-        with contextlib.suppress(OSError):
-            handshake.unlink()
+        _forget_handshake(handshake)
         return RuntimeHandle(record=record, reply=reply, started=True)
 
     logger.warning("the runtime did not become ready within the configured timeout")
     raise _unavailable(START_FAILED, "runtime_readiness_timeout")
+
+
+def _forget_handshake(handshake: Path) -> None:
+    """Remove the handshake, relative to a descriptor for its directory.
+
+    By name rather than by path so a link planted at that name unlinks the link
+    and not whatever it points at.
+    """
+    from .state import remove_managed
+
+    remove_managed(handshake.name)
 
 
 def _roll_back(child, record: RuntimeRecord, handshake: Path, config) -> None:
@@ -437,8 +481,7 @@ def _roll_back(child, record: RuntimeRecord, handshake: Path, config) -> None:
             _terminate_held_child(child, config.runtime_graceful_stop_seconds)
 
     clear_record()
-    with contextlib.suppress(OSError):
-        handshake.unlink()
+    _forget_handshake(handshake)
 
 
 def _terminate_held_child(child, graceful_seconds: int) -> None:

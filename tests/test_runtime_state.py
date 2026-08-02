@@ -431,17 +431,24 @@ def test_a_wedged_runtime_escalates_to_its_own_process_group(monkeypatch):
     monkeypatch.setattr(ownership, "_request", request)
     monkeypatch.setattr(os, "getpgid", lambda pid: pid)
     killed: list[tuple[int, int]] = []
+    signalled: list[tuple[int, int]] = []
 
     def killpg(pid, sig):
         killed.append((pid, sig))
         alive["value"] = False
 
     monkeypatch.setattr(os, "killpg", killpg)
+    # The leader is reached through the pinned descriptor, and the group by
+    # number only afterwards.
+    monkeypatch.setattr(
+        os, "pidfd_send_signal", lambda fd, sig: signalled.append((fd, sig)), raising=False
+    )
 
     outcome = ownership.stop_owned(rec, graceful_seconds=2, clock=clock, sleep=clock.sleep)
 
     assert outcome.result == "stopped"
     assert outcome.method == "sigterm"
+    assert signalled and signalled[0][0] == 99
     assert killed and killed[0][0] == rec.pid
 
 
