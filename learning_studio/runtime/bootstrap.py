@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..paths import DIRECTORY_MODE, FILE_MODE
-from .state import runtime_dir
+from .state import managed_path, runtime_dir
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +72,18 @@ INSTALL_TIMEOUT_SECONDS = 900
 
 
 def venv_dir() -> Path:
-    return runtime_dir() / VENV_DIRNAME
+    """The plugin-local environment, refused if something has linked it away.
+
+    A symbolic link here would put a virtual environment — and therefore an
+    *interpreter this package later executes* — somewhere the profile does not
+    control. That is the one path in this module where following a link would
+    change what code runs.
+    """
+    return managed_path(VENV_DIRNAME)
 
 
 def stamp_path() -> Path:
-    return runtime_dir() / STAMP_FILENAME
+    return managed_path(STAMP_FILENAME)
 
 
 def runtime_python() -> Path:

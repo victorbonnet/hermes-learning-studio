@@ -68,21 +68,83 @@ _CONTROL_TOKEN_BYTES = 32
 MAX_RECORD_BYTES = 8192
 
 
+class ContainmentError(RuntimeError):
+    """A managed path is not where this profile's storage says it should be."""
+
+
 def runtime_dir() -> Path:
-    """Create and return ``<storage root>/runtime``, owner-only."""
-    root = ensure_storage_root() / RUNTIME_SUBDIR
-    root.mkdir(mode=DIRECTORY_MODE, parents=True, exist_ok=True)
+    """Create and return ``<storage root>/runtime``, owner-only and contained.
+
+    The containment check is not decoration. ``mkdir(exist_ok=True)`` follows an
+    existing symlink, so a link planted at this path — by another profile, an
+    unpacked archive, a careless sync tool — silently redirected the runtime
+    record, the lock, the handshake, the bootstrap environment *and* the
+    permission changes made to all of them somewhere else entirely. The record
+    holds a control secret, so "somewhere else" is not an abstract problem.
+
+    So: refuse a symlink at this component outright rather than resolving it,
+    and then verify that what exists really does sit under the profile's own
+    storage root. Both, because the first catches the plant and the second
+    catches a link further up the path that this component knows nothing about.
+    """
+    root = ensure_storage_root()
+    target = root / RUNTIME_SUBDIR
+
+    if target.is_symlink():
+        raise ContainmentError(
+            "the Learning Studio runtime directory is a symbolic link and was refused"
+        )
+    target.mkdir(mode=DIRECTORY_MODE, parents=True, exist_ok=True)
+    _require_contained(root, target)
     with contextlib.suppress(OSError, NotImplementedError):
-        root.chmod(DIRECTORY_MODE)
-    return root
+        target.chmod(DIRECTORY_MODE)
+    return target
+
+
+def _require_contained(root: Path, path: Path) -> None:
+    """Refuse a path that does not physically live under the storage root.
+
+    Resolved on both sides, so a link anywhere along the way is caught — not
+    only one at the last component. A mismatch is a refusal rather than a
+    correction: this plugin does not know why the path moved, and guessing is
+    how a profile's data ends up in another profile's directory.
+    """
+    try:
+        resolved = path.resolve()
+        resolved_root = root.resolve()
+    except OSError as exc:  # pragma: no cover - unreadable path
+        raise ContainmentError(
+            "the Learning Studio runtime directory could not be verified"
+        ) from exc
+
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise ContainmentError(
+            "the Learning Studio runtime directory resolves outside this profile's "
+            "storage and was refused"
+        )
+
+
+def managed_path(name: str) -> Path:
+    """One file inside the runtime directory, refused if it is a link.
+
+    Every sensitive file this package writes goes through here: the record, the
+    lock, the handshake, the bootstrap stamp. A symbolic link at any of them
+    would redirect a write, a ``chmod``, or both — and ``chmod`` follows links,
+    so loosening the mode of somebody else's file is one of the things that
+    could happen.
+    """
+    path = runtime_dir() / name
+    if path.is_symlink():
+        raise ContainmentError(f"the Learning Studio {name} is a symbolic link and was refused")
+    return path
 
 
 def record_path() -> Path:
-    return runtime_dir() / RECORD_FILENAME
+    return managed_path(RECORD_FILENAME)
 
 
 def lock_path() -> Path:
-    return runtime_dir() / LOCK_FILENAME
+    return managed_path(LOCK_FILENAME)
 
 
 def new_control_token() -> str:
@@ -313,7 +375,11 @@ class ProfileLock:
         import fcntl
 
         path = self._path or lock_path()
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, FILE_MODE)
+        # `O_NOFOLLOW` so a link planted at the lock path is refused by the
+        # kernel rather than opened. The check in `managed_path` catches the
+        # same thing a moment earlier; this one cannot be raced.
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path), flags, FILE_MODE)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:

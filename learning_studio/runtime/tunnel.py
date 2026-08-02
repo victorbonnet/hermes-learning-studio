@@ -61,6 +61,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -88,14 +89,36 @@ _URL_CHARACTERS = re.compile(r"\A[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+\Z")
 #: A candidate longer than this is not a hostname anybody typed.
 MAX_URL_CHARS = 253
 
+#: How long to keep reading after the first address, watching for a second.
+#: Short, because it is added to every launch; long enough that a conflicting
+#: line printed in the same breath is seen.
+URL_SETTLE_SECONDS = 0.75
+
 #: Bounds on what is read from the tunnel process before giving up on it.
 MAX_OUTPUT_LINES = 400
 MAX_OUTPUT_BYTES = 128 * 1024
 MAX_LINE_BYTES = 8192
 
-#: Where a URL may appear in a line of output. Cloudflared prints it inside a
-#: box of ``+---+`` characters, so the line is not the URL.
-_URL_IN_LINE = re.compile(r"https://[A-Za-z0-9.-]+\.[A-Za-z]{2,63}/?")
+#: How a candidate is cut out of a line of output.
+#:
+#: This is the rule the first version got wrong, and the mistake is worth
+#: stating because it looks like a detail. The pattern used to be
+#: ``https://[A-Za-z0-9.-]+\.[A-Za-z]{2,63}/?`` — which stops at ``@``, ``:``,
+#: ``/`` and ``?``. So given ``https://victim.trycloudflare.com@evil.test`` it
+#: yielded the *prefix* ``https://victim.trycloudflare.com``, and the validator
+#: then accepted that prefix and reported the address as clean.
+#:
+#: The validator was never wrong: it refuses userinfo, ports and paths, and its
+#: tests prove it. What was wrong is that it was never shown the whole thing.
+#: So extraction now takes a **complete token** — everything from ``https://``
+#: up to whitespace or a box-drawing character — and hands all of it over.
+#: Anything the validator dislikes is then refused rather than trimmed off.
+_URL_TOKEN = re.compile(r"https://[^\s|+\-]\S*")
+
+#: Characters cloudflared draws its box with, which end a token without being
+#: part of it. Everything else — including ``@``, ``:``, ``/`` and ``?`` — is
+#: kept, because keeping it is the entire point.
+_TOKEN_TRAILING = "|+-–—*"
 
 
 class TunnelError(Exception):
@@ -159,18 +182,34 @@ def validate_quick_tunnel_url(candidate: object) -> str:
     return f"https://{host}"
 
 
+def tokens_in(line: str) -> list[str]:
+    """Every complete URL-shaped token in a line, boundaries and all.
+
+    "Complete" is the whole idea. A token runs from ``https://`` to whitespace
+    or a box-drawing character, and everything in between — userinfo, port,
+    path, query, fragment — comes with it, so the validator sees what
+    cloudflared actually printed rather than a convenient prefix of it.
+    """
+    found: list[str] = []
+    for match in _URL_TOKEN.finditer(line):
+        token = match.group(0).rstrip(_TOKEN_TRAILING)
+        if token:
+            found.append(token)
+    return found
+
+
 def url_in(line: str) -> str | None:
     """The Quick Tunnel URL in one line of output, if there is exactly one.
 
     Cloudflared prints the URL inside a drawn box, so the line has to be
-    searched rather than parsed. Every candidate found is put through
+    searched rather than parsed. Every *complete* token found is put through
     :func:`validate_quick_tunnel_url`; a line with two different valid ones is
     as ambiguous as a process with two, and is refused the same way.
     """
     found: set[str] = set()
-    for match in _URL_IN_LINE.finditer(line):
+    for token in tokens_in(line):
         with contextlib.suppress(TunnelError):
-            found.add(validate_quick_tunnel_url(match.group(0)))
+            found.add(validate_quick_tunnel_url(token))
     if len(found) > 1:
         raise TunnelError("tunnel_url_conflicting")
     return found.pop() if found else None
@@ -392,32 +431,66 @@ async def _spawn(argv: list[str], environment: dict[str, str]):
     )
 
 
-async def _read_url(process) -> str | None:
-    """Read bounded output until a URL appears or the process gives up.
+async def _read_url(process, *, settle_seconds: float = URL_SETTLE_SECONDS) -> str | None:
+    """Read bounded output until a URL appears, then keep reading for a moment.
 
-    Both bounds matter and they bound different things: the line count and byte
-    total stop a chatty process from being read forever, while the enclosing
+    Three bounds, each stopping a different thing: the line count and byte
+    total stop a chatty process from being read forever, and the enclosing
     ``wait_for`` stops a silent one from being *waited* on forever.
+
+    The settle window is the fourth, and it is what makes the "unanimous
+    output" rule true rather than merely stated. The first version returned on
+    the first line carrying a URL, so a *second, different* address on the next
+    line was never looked at — the module refused conflicting URLs within one
+    line and silently accepted them across two. Now the first address is held,
+    reading continues for a brief bounded window, and a conflicting one turns
+    the whole thing into a refusal.
+
+    It is a window rather than "read to the end" because cloudflared does not
+    end: it prints its address and then runs. Waiting for the stream to close
+    would mean waiting for the tunnel to die.
     """
     stream = process.stdout
     if stream is None:  # pragma: no cover - the spawner always requests a pipe
         raise TunnelError("tunnel_no_output")
 
     total = 0
+    first: str | None = None
+    deadline: float | None = None
+
     for _ in range(MAX_OUTPUT_LINES):
+        timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+        if timeout == 0.0:
+            return first
         try:
-            raw = await stream.readline()
+            raw = await (
+                stream.readline()
+                if timeout is None
+                else asyncio.wait_for(stream.readline(), timeout=timeout)
+            )
+        except TimeoutError:
+            # The settle window closed with nothing else to say. That is the
+            # ordinary case: one address, then silence.
+            return first
         except (ValueError, asyncio.LimitOverrunError) as exc:
             # A single line longer than the reader's limit. Not output this
             # waits around to make sense of.
             raise TunnelError("tunnel_output_line_too_long") from exc
         if not raw:
-            return None  # the stream closed: the process has finished talking
+            return first  # the stream closed: the process has finished talking
         total += len(raw)
         if total > MAX_OUTPUT_BYTES:
             raise TunnelError("tunnel_output_too_large")
 
         found = url_in(raw.decode("utf-8", errors="replace"))
-        if found is not None:
-            return found
+        if found is None:
+            continue
+        if first is None:
+            first = found
+            deadline = time.monotonic() + settle_seconds
+        elif found != first:
+            raise TunnelError("tunnel_url_conflicting")
+
+    if first is not None:
+        return first
     raise TunnelError("tunnel_output_too_many_lines")

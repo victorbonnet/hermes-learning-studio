@@ -254,19 +254,62 @@ def _require_success(raw: bytes) -> None:
         raise LaunchRefused(DELIVERY_FAILED, reason="telegram_refused")
 
 
-def _urlopen(endpoint: str, body: bytes, timeout: int) -> bytes:
-    """The real request. One host, one method, HTTPS, no redirects followed.
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect, before a second request is made.
 
-    ``Request`` is constructed with the method named explicitly so that a
-    redirect cannot turn this into a GET of a URL that contains the token.
+    This is the fix for a real leak, not a hardening flourish. ``urllib``
+    follows redirects by default, and the bot token is *in the request path* —
+    so a ``Location`` pointing anywhere else would have sent the token to
+    whoever supplied it. Telegram does not redirect ``sendMessage``; anything
+    that does is not Telegram, or is something between us and Telegram.
+
+    Raising rather than returning ``None``: returning ``None`` from a redirect
+    handler means "do not follow", but leaves the 3xx to be handled as an
+    ordinary response, and this must be a failure.
     """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            # The *original* URL is not repeated here; ``_post`` reports the
+            # status code and never renders this exception.
+            "",
+            code,
+            "redirect refused",
+            headers,
+            fp,
+        )
+
+
+#: One opener, built once, with no redirect handling and no proxy handling.
+#:
+#: ``ProxyHandler({})`` is an empty proxy map rather than the default, which
+#: reads ``http_proxy``/``https_proxy`` from the environment. An operator's
+#: proxy is a reasonable thing to want, but it is also a way for a variable
+#: nobody audited to become the destination of a request carrying a bot token —
+#: so it is not honoured until somebody asks for it explicitly.
+_OPENER = urllib.request.build_opener(
+    _NoRedirects(),
+    urllib.request.ProxyHandler({}),
+)
+
+
+def _urlopen(endpoint: str, body: bytes, timeout: int) -> bytes:
+    """The real request. One host, one method, HTTPS, no redirects, no proxy.
+
+    ``Request`` is constructed with the method named explicitly, and the opener
+    refuses redirects outright, so nothing can turn this into a second request
+    to a URL somebody else chose.
+    """
+    if not endpoint.startswith(TELEGRAM_API_ORIGIN + "/"):  # pragma: no cover - constant
+        raise LaunchRefused(DELIVERY_FAILED, reason="telegram_endpoint_unexpected")
+
     request = urllib.request.Request(  # noqa: S310 - a fixed https:// constant
         endpoint,
         data=body,
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+    with _OPENER.open(request, timeout=timeout) as response:
         return response.read(MAX_RESPONSE_BYTES + 1)
 
 

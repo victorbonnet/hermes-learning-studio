@@ -192,7 +192,9 @@ def handshake_path(runtime_id: str) -> Path:
     can never read each other's file. A single fixed name would let a start
     that timed out and a start that succeeded write the same path.
     """
-    return runtime_dir() / f"handshake-{runtime_id}.json"
+    from .state import managed_path
+
+    return managed_path(f"handshake-{runtime_id}.json")
 
 
 def read_handshake(path: Path, runtime_id: str) -> int | None:
