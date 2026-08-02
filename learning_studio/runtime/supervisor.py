@@ -320,6 +320,7 @@ def _start(
         cloudflared=resolve_cloudflared(config),
     )
 
+    child = None
     try:
         child = popen(
             # An argument array. There is no shell anywhere in this package and
@@ -339,12 +340,7 @@ def _start(
             close_fds=True,
             cwd=str(runtime_dir()),
         )
-    except (OSError, ValueError) as exc:
-        logger.warning("the runtime process could not be started: %s", type(exc).__name__)
-        raise _unavailable(START_FAILED, "runtime_spawn_failed") from exc
-
-    record = dataclasses.replace(record_without_port, pid=child.pid)
-    try:
+        record = dataclasses.replace(record_without_port, pid=child.pid)
         return _await_ready(
             config,
             child=child,
@@ -353,8 +349,22 @@ def _start(
             clock=clock,
             sleep=sleep,
         )
+    except (OSError, ValueError) as exc:
+        # The spawn itself failed, so there is nothing running to clean up
+        # unless `popen` returned before raising — which it does not, but the
+        # rollback below is cheap and unconditional for exactly that reason.
+        _roll_back(child, record_without_port, handshake, config)
+        logger.warning("the runtime process could not be started: %s", type(exc).__name__)
+        raise _unavailable(START_FAILED, "runtime_spawn_failed") from exc
     except BaseException:
-        _roll_back(child, record, handshake, config)
+        # `BaseException`, so a KeyboardInterrupt or a cancellation between the
+        # spawn and the record cannot leave a runtime nobody is holding. The
+        # window used to be real: `popen` returned, and an interruption during
+        # the very next statement leaked a process with no record of it.
+        #
+        # Cleanup only. The exception is re-raised immediately, because
+        # swallowing a cancellation is how a shutdown hangs.
+        _roll_back(child, record_without_port, handshake, config)
         raise
 
 
@@ -419,9 +429,9 @@ def _roll_back(child, record: RuntimeRecord, handshake: Path, config) -> None:
       itself is the one saying which process this is.
     """
     with contextlib.suppress(Exception):
-        if ownership.owned(record, timeout=1.0):
+        if record.port > 1 and ownership.owned(record, timeout=1.0):
             ownership.stop_owned(record, graceful_seconds=config.runtime_graceful_stop_seconds)
-        elif child.poll() is None:
+        elif child is not None and child.poll() is None:
             _terminate_held_child(child, config.runtime_graceful_stop_seconds)
 
     clear_record()

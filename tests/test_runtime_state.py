@@ -413,7 +413,10 @@ def test_a_live_runtime_is_asked_to_stop_before_it_is_signalled(monkeypatch):
 
 
 def test_a_wedged_runtime_escalates_to_its_own_process_group(monkeypatch):
-    """Escalation targets the group, and only after ownership is proved again."""
+    """Escalation targets the group, from a pinned identity, proved again first."""
+    monkeypatch.setattr(ownership, "handle_supported", lambda: True)
+    monkeypatch.setattr(os, "pidfd_open", lambda pid, flags: 99, raising=False)
+    monkeypatch.setattr(os, "close", lambda fd: None)
     rec = record()
     clock = Clock()
     alive = {"value": True}

@@ -228,8 +228,25 @@ class QuickTunnel:
         """Safe status. The URL is deliberately absent."""
         return {"tunnel_state": self.state, "tunnel_ready": self.ready}
 
-    def stop(self) -> None:
-        """End the tunnel. Idempotent, and never signals anything else.
+    @property
+    def alive(self) -> bool:
+        """True when the tunnel process is still running.
+
+        Read on every watchdog tick. A tunnel that exits after publishing a URL
+        leaves a runtime that believes it has a public entrance and has not —
+        so the learner taps a button that goes nowhere and the agent has been
+        told the exercise is open.
+        """
+        process = self.process
+        return process is not None and getattr(process, "returncode", None) is None
+
+    async def aclose(self, *, grace_seconds: float = 5.0) -> None:
+        """End the tunnel and **wait for it to be gone**. Idempotent.
+
+        Terminate, wait, kill, wait. The previous version called ``terminate``
+        and returned, so a cloudflared that ignores SIGTERM outlived the stop
+        that reported success — and a caller was told the public address was
+        closed while it was still open.
 
         The only process touched is the child this object is holding. There is
         no process id here that was read from anywhere.
@@ -240,9 +257,46 @@ class QuickTunnel:
             self.state = "stopped"
         if process is None:
             return
+
         with contextlib.suppress(ProcessLookupError, OSError):
             if getattr(process, "returncode", None) is None:
                 process.terminate()
+        if await _reaped(process, grace_seconds):
+            return
+
+        with contextlib.suppress(ProcessLookupError, OSError):
+            process.kill()
+        if not await _reaped(process, grace_seconds):
+            # Reported rather than hidden: the caller has to be able to say
+            # "the address may still be open" instead of claiming it is closed.
+            logger.warning("the tunnel process did not exit after being killed")
+            raise TunnelError("tunnel_cleanup_indeterminate")
+
+    def stop(self) -> None:
+        """Synchronous best effort, for a caller with no event loop.
+
+        Prefer :meth:`aclose`, which waits. This exists because a teardown path
+        that cannot await still has to try, and terminating without waiting is
+        better than not terminating.
+        """
+        process = self.process
+        self.process = None
+        if self.state != "failed":
+            self.state = "stopped"
+        if process is None:
+            return
+        with contextlib.suppress(ProcessLookupError, OSError):
+            if getattr(process, "returncode", None) is None:
+                process.terminate()
+
+
+async def _reaped(process, timeout: float) -> bool:
+    """Wait, bounded, for a process to be gone."""
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except (TimeoutError, ProcessLookupError, OSError):
+        return getattr(process, "returncode", None) is not None
+    return True
 
 
 async def open_tunnel(
@@ -284,18 +338,38 @@ async def open_tunnel(
     except TunnelError as exc:
         tunnel.state = "failed"
         tunnel.reason = exc.reason
+    except BaseException:
+        # Cancellation, most likely: the runtime is shutting down while this is
+        # still waiting. The process was created by this call and nothing else
+        # knows about it yet, so it has to be stopped here or it outlives the
+        # runtime that started it.
+        #
+        # Synchronously, and deliberately so. Awaiting inside a cancelled task
+        # raises `CancelledError` again at the first suspension point, so an
+        # `await tunnel.aclose()` here would never reach the process at all.
+        # `stop()` signals without suspending, which is the part that has to
+        # happen; the bounded wait is what cannot be had on this path.
+        tunnel.stop()
+        raise
     else:
         if url is None:
             tunnel.state = "failed"
             tunnel.reason = "tunnel_no_url"
+        elif not tunnel.alive:
+            # A process that printed an address and then exited has published
+            # nothing: the hostname it named is not being served. Reporting it
+            # ready would send a learner to a URL that answers nobody.
+            tunnel.state = "failed"
+            tunnel.reason = "tunnel_exited_after_publishing"
         else:
             tunnel.state = "ready"
             tunnel.url = url
             return tunnel
 
-    # Every failure path converges here: the child this call created is stopped,
-    # and nothing is left running that nobody is watching.
-    tunnel.stop()
+    # Every failure path converges here: the child this call created is stopped
+    # and waited for, so nothing is left running that nobody is watching.
+    with contextlib.suppress(TunnelError):
+        await tunnel.aclose()
     tunnel.state = "failed"
     return tunnel
 

@@ -213,9 +213,106 @@ def test_signalling_goes_to_a_group_the_runtime_leads(monkeypatch):
     """A group led by somebody else would take strangers down with it."""
     source = Path(ownership.__file__).read_text(encoding="utf-8")
 
-    assert "os.getpgid(record.pid) != record.pid" in source
+    assert "os.getpgid(self._pid) != self._pid" in source
     assert "os.killpg" in source
     assert "os.kill(" not in source
+
+
+def test_a_signal_is_only_ever_sent_through_a_pinned_identity():
+    """The race the previous version could not win.
+
+    It proved ownership in userspace, discarded the proof, then called
+    ``getpgid`` and ``killpg`` on a number — and between those the runtime
+    could exit and the number could be reused. Signalling now happens only from
+    a ``ProcessHandle``, which holds a pid file descriptor precisely so the
+    kernel will not recycle the identity underneath it.
+    """
+    import ast
+
+    tree = ast.parse(Path(ownership.__file__).read_text(encoding="utf-8"))
+    signallers = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr in ("killpg", "kill", "pidfd_send_signal")
+            ):
+                signallers.append(node.name)
+
+    assert signallers == ["signal_group"], signallers
+
+
+def test_escalation_fails_closed_where_no_identity_can_be_pinned(monkeypatch):
+    """macOS has no pidfd. Refusing to signal is the correct answer there."""
+    monkeypatch.setattr(ownership, "handle_supported", lambda: False)
+    monkeypatch.setattr(ownership, "_request", _answering(record()))
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+
+    clock = _Clock()
+    outcome = ownership.stop_owned(record(), graceful_seconds=1, clock=clock, sleep=clock.sleep)
+
+    assert outcome.result == "unprovable"
+    assert killed == [], "a signal was sent to an identity nothing was holding"
+
+
+def test_a_pid_reused_between_proof_and_signal_is_never_reached(monkeypatch):
+    """The canary: the runtime exits, its number is recycled, we signal nobody.
+
+    Simulated deterministically rather than by racing: acquiring the handle is
+    what would have pinned the identity, and here it fails because the process
+    has already gone — which is exactly the state a recycled pid is reached
+    from.
+    """
+    monkeypatch.setattr(ownership, "handle_supported", lambda: True)
+    monkeypatch.setattr(ownership, "_request", _answering(record()))
+    monkeypatch.setattr(
+        os,
+        "pidfd_open",
+        lambda pid, flags: (_ for _ in ()).throw(ProcessLookupError(pid)),
+        raising=False,
+    )
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+
+    clock = _Clock()
+    ownership.stop_owned(record(), graceful_seconds=1, clock=clock, sleep=clock.sleep)
+
+    assert killed == []
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _answering(rec):
+    def request(record_, method, path, *, body=None, timeout=None):
+        if path == ownership.SHUTDOWN_PATH:
+            return {}
+        return {
+            "runtime_id": record_.runtime_id,
+            "generation": record_.generation,
+            "pid": record_.pid,
+            "executable": record_.executable,
+            "started_at": 0.0,
+            "idle_seconds": None,
+            "server_state": "ready",
+            "tunnel_state": "ready",
+            "tunnel_ready": False,
+            "tunnel_url": "",
+        }
+
+    return request
 
 
 # ── Corrupt state fails closed ────────────────────────────────────────────

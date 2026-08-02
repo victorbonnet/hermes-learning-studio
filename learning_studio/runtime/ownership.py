@@ -336,45 +336,129 @@ def stop_owned(
             return StopOutcome(result="stopped", method="control")
         sleep(0.1)
 
-    for sig, method in ((signal.SIGTERM, "sigterm"), (signal.SIGKILL, "sigkill")):
-        if not _signal_group(record, sig):
-            # Ownership could not be re-proved. Either it has just gone (in
-            # which case there is nothing to do) or it cannot be verified (in
-            # which case there is nothing this module is willing to do).
-            return StopOutcome(
-                result="stopped" if not owned(record) else "unprovable", method=method
-            )
-        escalation_deadline = clock() + max(1, int(graceful_seconds))
-        while clock() < escalation_deadline:
-            if not owned(record, timeout=1.0):
-                return StopOutcome(result="stopped", method=method)
-            sleep(0.1)
-
-    return StopOutcome(result="unprovable", method="sigkill")
+    return _escalate(record, graceful_seconds=graceful_seconds, clock=clock, sleep=sleep)
 
 
-def _signal_group(record: RuntimeRecord, sig: int) -> bool:
-    """Signal the runtime's process group, having proved it is ours.
+def _escalate(
+    record: RuntimeRecord,
+    *,
+    graceful_seconds: int,
+    clock,
+    sleep,
+) -> StopOutcome:
+    """Signal, but only through an identity the kernel is holding still for us.
 
-    Two checks, and neither is redundant. The control challenge proves the
-    process at that pid is the runtime this plugin started. ``getpgid`` then
-    proves that pid is its own group leader — which it is because the child was
-    started with ``start_new_session=True`` — so the group about to be signalled
-    contains that process and its descendants and nothing else. Without the
-    second check, a runtime that had somehow ended up in another process's group
-    would take that group down with it.
+    This is where the previous version had a race it could not win. It proved
+    ownership in userspace, threw the proof away, and then called ``getpgid``
+    and ``killpg`` on a *number*. Between the proof and the signal the runtime
+    could exit and the operating system could hand that number to something
+    else — so the check said "ours" and the signal went to a stranger.
+
+    A pid file descriptor closes that window. ``pidfd_open`` pins the process
+    identity: while the descriptor is open the pid cannot be recycled, so the
+    group id — which equals it, because the child leads its own session —
+    cannot be recycled either. The sequence is therefore: pin first, re-prove
+    against the pinned identity, and only then signal.
+
+    Where no such handle exists — macOS has no ``pidfd`` — escalation **fails
+    closed**. The graceful path above needs no signal at all and is what stops
+    a runtime in practice; a wedged one is left to the deadline it enforces on
+    itself, which is a worse outcome than killing it and a much better one than
+    killing something else.
     """
-    if not owned(record, timeout=1.0):
-        return False
+    handle = acquire_handle(record)
+    if handle is None:
+        if not owned(record, timeout=1.0):
+            # It went away while we were reaching for it.
+            return StopOutcome(result="stopped", method="control")
+        logger.warning(
+            "the Learning Studio will not escalate on this platform: it cannot pin the "
+            "runtime's identity for long enough to signal it safely"
+        )
+        return StopOutcome(result="unprovable", method="none")
+
     try:
-        if os.getpgid(record.pid) != record.pid:
-            logger.warning("refusing to signal runtime: process group is not its own")
+        for sig, method in ((signal.SIGTERM, "sigterm"), (signal.SIGKILL, "sigkill")):
+            if not handle.signal_group(sig, record):
+                return StopOutcome(
+                    result="stopped" if not owned(record) else "unprovable", method=method
+                )
+            escalation_deadline = clock() + max(1, int(graceful_seconds))
+            while clock() < escalation_deadline:
+                if not owned(record, timeout=1.0):
+                    return StopOutcome(result="stopped", method=method)
+                sleep(0.1)
+        return StopOutcome(result="unprovable", method="sigkill")
+    finally:
+        handle.close()
+
+
+class ProcessHandle:
+    """A kernel reference that keeps one process identity from being reused.
+
+    Only the pid *file descriptor* form is real. Its whole value is that the
+    operating system will not recycle the pid while it is open, which is what
+    makes "the thing I proved is the thing I am signalling" true across the gap
+    between the two.
+    """
+
+    def __init__(self, pid: int, fd: int) -> None:
+        self._pid = pid
+        self._fd = fd
+
+    def signal_group(self, sig: int, record: RuntimeRecord) -> bool:
+        """Deliver to the runtime's process group, re-proving first.
+
+        The group rather than the process, because the runtime has a tunnel
+        child and killing only the leader would leave it running. Safe because
+        the leader's pid is pinned by this handle and the group id equals it —
+        so no unrelated group can have acquired that number.
+        """
+        if not owned(record, timeout=1.0):
             return False
-        os.killpg(record.pid, sig)
-    except (OSError, PermissionError) as exc:
-        logger.warning("could not signal the runtime process group: %s", type(exc).__name__)
-        return False
-    return True
+        try:
+            if os.getpgid(self._pid) != self._pid:
+                logger.warning("refusing to signal runtime: process group is not its own")
+                return False
+            os.killpg(self._pid, sig)
+        except (OSError, PermissionError) as exc:
+            logger.warning("could not signal the runtime process group: %s", type(exc).__name__)
+            return False
+        return True
+
+    def close(self) -> None:
+        fd, self._fd = self._fd, -1
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def handle_supported() -> bool:
+    """True when this platform can pin a process identity.
+
+    Linux, through ``pidfd_open``. Reported so the runtime status and the
+    documentation can say plainly that escalation is unavailable elsewhere,
+    rather than leaving an operator to discover it from a stop that reports
+    ``unprovable``.
+    """
+    return hasattr(os, "pidfd_open") and hasattr(os, "killpg")
+
+
+def acquire_handle(record: RuntimeRecord) -> ProcessHandle | None:
+    """Pin the recorded process, or return ``None``.
+
+    ``None`` means one of two things and the caller treats them the same:
+    the platform has no way to pin an identity, or the process is already gone.
+    Neither is a reason to signal a number.
+    """
+    if not handle_supported():
+        return None
+    try:
+        fd = os.pidfd_open(record.pid, 0)  # type: ignore[attr-defined]
+    except (OSError, ProcessLookupError, PermissionError, AttributeError) as exc:
+        logger.debug("could not pin the runtime process: %s", type(exc).__name__)
+        return None
+    return ProcessHandle(record.pid, fd)
 
 
 def unprovable_error() -> RuntimeUnavailable:

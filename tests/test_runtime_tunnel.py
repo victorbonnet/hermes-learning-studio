@@ -210,10 +210,22 @@ class FakeProcess:
         self.stdout = FakeStream(lines, **kwargs)
         self.returncode = None
         self.terminated = False
+        self._gone = asyncio.Event()
 
     def terminate(self) -> None:
         self.terminated = True
         self.returncode = -15
+        self._gone.set()
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self._gone.set()
+
+    async def wait(self) -> int:
+        # `aclose` waits for the process to actually be gone, so a fake that
+        # never finishes waiting would make every teardown time out.
+        await self._gone.wait()
+        return self.returncode
 
 
 class Spawner:

@@ -153,6 +153,24 @@ class RuntimeState:
         last = getattr(self.sessions, "last_activity_at", None)
         return None if last is None else max(0.0, now - float(last))
 
+    def tunnel_lost(self) -> None:
+        """Record that the public entrance has gone, and close what depended on it.
+
+        Every grant is revoked, which also expires the sessions they minted. A
+        learner mid-exercise loses their session — which is right: the address
+        they are talking to has stopped existing, and a token that outlived it
+        would be a credential for a server nobody can reach.
+        """
+        tunnel = self.tunnel
+        if tunnel is not None:
+            tunnel.state = "failed"
+            tunnel.url = ""
+        grants = self.grants
+        if grants is not None:
+            with contextlib.suppress(Exception):
+                for launch_id in list(getattr(grants, "_grants", {})):
+                    grants.revoke(launch_id)
+
     def request_stop(self, reason: str) -> None:
         """Ask for shutdown once; later reasons do not overwrite the first."""
         if self.server_state != "stopping":
@@ -368,8 +386,24 @@ async def _watchdog(state: RuntimeState, *, clock=time.time, tick: float = TICK_
         if since_quiet >= state.settings.idle_timeout_seconds:
             state.request_stop("idle_timeout")
             return
+        if _tunnel_lost(state):
+            # The public entrance died after it was opened. A runtime that
+            # keeps serving now is one whose button goes nowhere, and whose
+            # grants would still admit a learner who could never arrive — so
+            # the grants go, and so does the runtime.
+            state.tunnel_lost()
+            state.request_stop("tunnel_lost")
+            return
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=tick)
+
+
+def _tunnel_lost(state: RuntimeState) -> bool:
+    """True when a tunnel that *was* ready is no longer running."""
+    tunnel = state.tunnel
+    if tunnel is None:
+        return False
+    return bool(getattr(tunnel, "url", "")) and not getattr(tunnel, "alive", False)
 
 
 def _bound_port(server) -> int:
@@ -517,8 +551,14 @@ async def _shutdown(state: RuntimeState, server, serving, settings: RuntimeSetti
     """
     tunnel = state.tunnel
     if tunnel is not None:
-        with contextlib.suppress(Exception):
-            tunnel.stop()
+        try:
+            # Waits for the process to be gone, and raises rather than
+            # pretending if it will not go. A stop that reported success while
+            # cloudflared was still running told the operator the public
+            # address was closed when it was not.
+            await tunnel.aclose()
+        except Exception:
+            logger.warning("the tunnel could not be confirmed stopped")
 
     server.should_exit = True
     with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
