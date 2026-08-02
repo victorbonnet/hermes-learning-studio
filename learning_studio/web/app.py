@@ -417,6 +417,22 @@ def create_app(dependencies: Dependencies | None = None):
 
         bundle = load_bundle(verified, experience_id.strip())
         experience = bundle.experience
+
+        # On a runtime this plugin launched, a verified Telegram account that
+        # owns the exercise is still not enough: a launch must have granted
+        # *this* account access to *this* exercise, and that grant must not have
+        # expired or been withdrawn. The 404 is the same one an experience
+        # belonging to somebody else produces, so a caller cannot tell a
+        # revoked launch from an exercise that was never theirs.
+        grant = None
+        if deps.grants is not None:
+            grant = deps.grants.admit(
+                telegram_user_id=verified.user_id,
+                experience_id=str(experience["experience_id"]),
+            )
+            if grant is None:
+                raise ApiError(404, NOT_FOUND, reason="no_launch_grant")
+
         token, session = deps.sessions.create(
             SessionScope(
                 profile=deps.profile(),
@@ -428,6 +444,11 @@ def create_app(dependencies: Dependencies | None = None):
             component_count=len(experience["components"]),
             auth_date=verified.auth_date,
         )
+        if grant is not None:
+            # Binds the launch to the session it admitted, which is the only
+            # reason `learning_studio_results` can say whether somebody opened
+            # the exercise without inventing anything.
+            deps.grants.bind_session(grant, session)
         deps.sessions.note_activity()
         log_request(
             event="session_opened",

@@ -1,4 +1,4 @@
-"""JSON schemas for the four registered tools.
+"""JSON schemas for the eight registered tools.
 
 The schemas are the plugin's actual security boundary against a confused or
 adversarial caller, so they are restrictive by construction:
@@ -10,6 +10,11 @@ adversarial caller, so they are restrictive by construction:
   it to Hermes' active-profile image cache. No field accepts executable code
   or SQL.
 - Nothing names a subject, a language, or a discipline.
+- Nothing in the runtime tools names a machine. No property anywhere accepts a
+  host, port, URL, executable, command, process id, timeout, environment
+  variable, chat, or account — so the model cannot supply one, and the values
+  that decide those things come from the operator's config.yaml and from
+  Hermes' own session context.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from .candidates import Action, Category, Confidence, ConfirmationState, Durability, Origin
+from .consent import INITIATIONS, MAX_QUOTE_CHARS, MIN_QUOTE_CHARS
 from .models import (
     LIST_FIELDS,
     MAX_LIST_ITEMS,
@@ -432,9 +438,10 @@ PREPARE_SCHEMA: dict[str, Any] = {
         "answer key. The answer key, rubrics, scoring rules, hints and feedback are kept "
         "server-side and are never returned to you, so nothing you get back can give the "
         "answers away. Returns an opaque experience id and a learner-safe summary. This "
-        "tool stores an exercise; it does not run one, render one, or open anything - "
-        "deliver it in conversation and say so. The learner is identified from the Hermes "
-        "session, never from an argument."
+        "tool stores an exercise; it does not run one, render one, or open anything. Call "
+        "learning_studio_launch with the experience_id it returns to put it on the "
+        "learner's screen, and deliver it in conversation if that is unavailable. The "
+        "learner is identified from the Hermes session, never from an argument."
     ),
     "parameters": _prepare_parameters(),
 }
@@ -517,3 +524,148 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     PREPARE_TOOL_NAME: PREPARE_SCHEMA,
     IMPORT_ASSET_TOOL_NAME: IMPORT_ASSET_SCHEMA,
 }
+
+
+# ── The on-demand runtime ─────────────────────────────────────────────────
+#
+# Four tools that start, inspect, report on, and stop a real process — and
+# whose payloads, between them, carry one opaque identifier, one enumerated
+# word, one boolean, and one quotation.
+#
+# What is deliberately absent from every schema below: a host, a port, a URL,
+# an executable, a command, an argument, a process id, a lock path, an
+# environment variable, a timeout, a chat id, a Telegram user id, a bot token,
+# and a profile. None of those has a property here, so none of them can be
+# supplied, mistyped, or injected. They come from the operator's config.yaml
+# and from Hermes' own session context, and the model has no way to reach
+# either.
+
+LAUNCH_TOOL_NAME = "learning_studio_launch"
+STATUS_TOOL_NAME = "learning_studio_status"
+RESULTS_TOOL_NAME = "learning_studio_results"
+STOP_TOOL_NAME = "learning_studio_stop"
+
+_EXPERIENCE_ID = {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 64,
+    "description": "Opaque experience id returned by learning_studio_prepare.",
+}
+
+#: Tools that take nothing at all. Still an object with
+#: ``additionalProperties: false``, so a caller that invents a parameter is
+#: told rather than quietly ignored.
+_NO_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {},
+}
+
+
+LAUNCH_SCHEMA: dict[str, Any] = {
+    "name": LAUNCH_TOOL_NAME,
+    "description": (
+        "Open a prepared exercise on the learner's screen: start the Learning Studio "
+        "runtime, and send them a button that opens it. Use it after "
+        "learning_studio_prepare when someone has asked to practise, revise, be quizzed, or "
+        "drill something. The exercise opens in the private Telegram conversation you are "
+        "already in - the destination comes from the session, never from you, and there is "
+        "no argument for it. Nothing about how they do will be stored: no score, no attempt, "
+        "no progress record. Only claim an exercise opened if this call succeeds and reports "
+        "button_delivered; if it refuses, run the exercise in conversation instead and say "
+        "that is what you are doing."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["experience_id", "initiation"],
+        "properties": {
+            "experience_id": _EXPERIENCE_ID,
+            "initiation": {
+                "type": "string",
+                "enum": list(INITIATIONS),
+                "description": (
+                    "'learner_request' when they asked to practise, revise, be tested, or "
+                    "open the exercise - that request is the agreement, and no second ask is "
+                    "needed. 'agent_suggestion' when you proposed it and they had not asked; "
+                    "that needs their explicit yes first."
+                ),
+            },
+            "learner_confirmed": {
+                "type": "boolean",
+                "description": (
+                    "Required with 'agent_suggestion': your assertion that the learner said "
+                    "yes in so many words to this exercise. Nothing here can verify it, so "
+                    "it is a statement you are making, not a check you are passing."
+                ),
+            },
+            "confirmation_quote": {
+                "type": "string",
+                "minLength": MIN_QUOTE_CHARS,
+                "maxLength": MAX_QUOTE_CHARS,
+                "description": (
+                    "Required with 'agent_suggestion': what the learner actually said when "
+                    "they agreed, in their words. One agreement opens one exercise once; a "
+                    "later launch needs a fresh one."
+                ),
+            },
+        },
+    },
+}
+
+
+STATUS_SCHEMA: dict[str, Any] = {
+    "name": STATUS_TOOL_NAME,
+    "description": (
+        "Report whether a Learning Studio runtime is open for this profile, and whether this "
+        "machine can open one at all. Takes no arguments: it always reports on the current "
+        "profile's own runtime and can see no other. Use it to explain to the learner why an "
+        "exercise cannot be opened - the answer says whether the runtime has been prepared "
+        "and whether the tunnel program is installed, both of which are an operator's job. "
+        "It reports no address, and nothing about anyone's performance."
+    ),
+    "parameters": _NO_PARAMETERS,
+}
+
+
+RESULTS_SCHEMA: dict[str, Any] = {
+    "name": RESULTS_TOOL_NAME,
+    "description": (
+        "Report what happened to an exercise you opened: whether the learner opened it, how "
+        "far through they are, and whether they finished. That is all this can know. "
+        "Nothing is marked and no attempt is stored in this release, so there is no score, "
+        "no mastery estimate, and no review schedule to fetch - do not describe one. It does "
+        "not return the learner's answers either; ask them how it went. The exercise must be "
+        "one prepared for the person you are talking to."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["experience_id"],
+        "properties": {"experience_id": _EXPERIENCE_ID},
+    },
+}
+
+
+STOP_SCHEMA: dict[str, Any] = {
+    "name": STOP_TOOL_NAME,
+    "description": (
+        "Close this profile's Learning Studio runtime and its temporary public address. "
+        "Takes no arguments and can stop nothing but this profile's own runtime. Safe to "
+        "call when nothing is running. The runtime also stops itself once it has been idle "
+        "or has been open for its maximum time, so this is for finishing early rather than "
+        "for tidying up. Stopping loses no record of how anyone did, because no score or "
+        "attempt was being kept in the first place."
+    ),
+    "parameters": _NO_PARAMETERS,
+}
+
+
+TOOL_SCHEMAS.update(
+    {
+        LAUNCH_TOOL_NAME: LAUNCH_SCHEMA,
+        STATUS_TOOL_NAME: STATUS_SCHEMA,
+        RESULTS_TOOL_NAME: RESULTS_SCHEMA,
+        STOP_TOOL_NAME: STOP_SCHEMA,
+    }
+)

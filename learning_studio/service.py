@@ -1938,8 +1938,10 @@ def prepare_experience(
         # Said on every response because the agent's next move depends on it:
         # something was *stored*, and nothing was started.
         "delivery": (
-            "Stored only. No exercise has been launched, rendered, or opened, and there is "
-            "no runtime yet. Present it in conversation and say that is what you are doing."
+            "Stored only. Nothing has been launched, rendered, or opened by this call. To "
+            "put it on the learner's screen, call learning_studio_launch with this "
+            "experience_id; if that is unavailable or refuses, present the exercise in "
+            "conversation and say that is what you are doing."
         ),
         "answers_withheld": (
             "Answer keys, rubrics, scoring rules, hints and feedback are stored server-side "

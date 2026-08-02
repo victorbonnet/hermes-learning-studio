@@ -1,13 +1,16 @@
 """Plugin registration.
 
-The plugin's contract with Hermes: one bundled read-only skill and four typed
-tools for learning context, managed assets, and prepared exercises.
+The plugin's contract with Hermes: one bundled read-only skill and eight typed
+tools — four for learning context, managed assets, and prepared exercises, and
+four that open, inspect, report on, and close an exercise on the learner's
+screen.
 
-The Mini App — the API and the renderer that serves a prepared exercise — is not
-part of that contract and deliberately not reachable from here. It lives behind
-the optional ``web`` extra and is started by an operator, never by registration;
-what is still to come is the tooling that launches it. Scoring, durable attempts,
-and a scheduler are not here either.
+The Mini App itself is still not reachable from here. It lives behind the
+optional ``web`` extra and is served by a *separate process* that
+``learning_studio_launch`` starts on demand; registration imports no FastAPI,
+opens no socket, and starts nothing. Scoring, durable attempts, and a scheduler
+are not here either, and the runtime tools say so in their own descriptions
+rather than leaving it to be inferred.
 
 ``register(ctx)`` runs at every Hermes startup for every enabled plugin, so
 it must not raise. It deliberately does **not** open the database: a
@@ -37,6 +40,29 @@ TOOLSET_NAME = "plugin_learning_studio"
 
 SKILLS_DIR = Path(__file__).parent / "skills"
 
+#: The tools that manage a real process, and therefore the only ones gated by
+#: a ``check_fn``.
+#:
+#: The gate is the *platform* and nothing else. Without POSIX process groups
+#: this plugin cannot prove which process it owns and will not signal one it
+#: cannot prove, so those four tools genuinely cannot work — and no
+#: conversation can change that.
+#:
+#: Everything else that can go wrong is deliberately *not* gated here. A
+#: runtime environment that has not been prepared, or a missing ``cloudflared``,
+#: is reported by the handler with something an operator can act on. Gating on
+#: those would make the tools vanish from the model's list, and an agent cannot
+#: explain the absence of a tool it cannot see — the learner would get silence
+#: where they should get "somebody needs to install one thing".
+RUNTIME_TOOLS = frozenset(
+    {
+        "learning_studio_launch",
+        "learning_studio_status",
+        "learning_studio_results",
+        "learning_studio_stop",
+    }
+)
+
 _SKILL_DESCRIPTION = (
     "Structure a study session: plan what to cover, run recall practice, "
     "and review what needs another pass."
@@ -61,6 +87,7 @@ def register(ctx: Any) -> None:
 
     # Imported here rather than at module scope so that a syntax or import
     # error in the tool layer cannot stop the skill from registering.
+    from .runtime.availability import runtime_tools_supported
     from .schemas import TOOL_SCHEMAS
     from .tools import HANDLERS
 
@@ -71,5 +98,6 @@ def register(ctx: Any) -> None:
             schema=schema,
             handler=HANDLERS[name],
             description=schema["description"],
+            check_fn=runtime_tools_supported if name in RUNTIME_TOOLS else None,
         )
     logger.debug("Registered %d tools in toolset %s", len(TOOL_SCHEMAS), TOOLSET_NAME)

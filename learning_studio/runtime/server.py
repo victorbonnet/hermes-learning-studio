@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hmac
 import json
 import logging
@@ -271,7 +272,7 @@ def install_control_routes(app, state: RuntimeState, *, clock=time.time) -> None
             return JSONResponse({"error": "grants unavailable"}, status_code=409)
         try:
             payload = await _control_body(request)
-            progress = state.grants.progress(str(payload.get("launch_id", "")))
+            progress = state.grants.progress(payload)
         except (ValueError, TypeError):
             return JSONResponse({"error": "bad request"}, status_code=400)
         return JSONResponse(progress)
@@ -387,14 +388,18 @@ async def serve(settings: RuntimeSettings, *, clock=time.time) -> int:
     from ..config import load_config
     from ..web.app import create_app
     from ..web.dependencies import build_dependencies
+    from .grants import GrantStore
 
     config = load_config()
+    grants = GrantStore(profile=settings.profile, generation=settings.generation, clock=clock)
     dependencies = build_dependencies(config=config, profile=lambda: settings.profile)
+    dependencies = dataclasses.replace(dependencies, grants=grants)
 
     state = RuntimeState(
         settings=settings,
         started_at=float(clock()),
         sessions=dependencies.sessions,
+        grants=grants,
     )
     state.stop_event = asyncio.Event()
 

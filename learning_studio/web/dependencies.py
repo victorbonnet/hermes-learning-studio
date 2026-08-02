@@ -100,6 +100,20 @@ class Dependencies:
     #: aliases as though they were canonical — quietly, and only discovered by
     #: whatever tried to grade them later.
     component_aliases: Callable[..., Any] = field(default=lambda *_: _unwired("component_aliases"))
+    #: The launch grants this runtime honours, or ``None``.
+    #:
+    #: ``None`` means "this server was not started by a launch", which is the
+    #: case for an operator running the API themselves: authentication,
+    #: authorisation and session scoping are unchanged and are what protect it.
+    #: A runtime this plugin launched always has a store here, and then opening
+    #: a session additionally requires an unexpired grant for that Telegram
+    #: account and that exercise — so the tunnel address behind a button is not
+    #: on its own enough to open anything.
+    #:
+    #: There is deliberately no configuration that clears this on a launched
+    #: runtime. The field is set by the process that starts one, in code, and a
+    #: setting able to unset it would be a switch for turning the check off.
+    grants: Any = None
 
     def now(self) -> float:
         return float(self.clock())

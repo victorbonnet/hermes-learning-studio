@@ -651,10 +651,17 @@ def test_the_plugin_depends_only_on_session_variables_the_host_defines():
     """
     session_context = _load_session_context(_hermes_src())
 
+    import learning_studio.destination as destination
     import learning_studio.identity as identity
 
-    source = Path(identity.__file__).read_text(encoding="utf-8")
-    read_names = set(re.findall(r'_session_value\(\s*"([A-Z_]+)"', source))
+    read_names: set[str] = set()
+    for module in (identity, destination):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        # The call site in `destination` passes a module constant rather than a
+        # literal, so both forms are collected: the literal call, and the
+        # constants that name a session variable.
+        read_names |= set(re.findall(r'session_value\(\s*"([A-Z_]+)"', source))
+        read_names |= set(re.findall(r'^[A-Z_]+ = "(HERMES_SESSION_[A-Z_]+)"', source, re.M))
     assert read_names, "no session variables are read — has identity resolution moved?"
 
     unsupported = sorted(read_names - set(session_context._VAR_MAP))

@@ -65,11 +65,16 @@ class Principal:
     #: ``gateway_session`` | ``local_profile`` — which resolution path applied.
     source: str = "local_profile"
 
-    # Conversation scope is deliberately absent. It played no part in
-    # authorisation or storage, and reading it meant depending on session
-    # variables (``HERMES_SESSION_CHAT_TYPE``) that not every Hermes version
-    # exposes. This plugin now depends on exactly two host session values:
-    # the platform and the sender ID.
+    # Conversation scope is deliberately absent *from identity*. It plays no
+    # part in authorisation or storage: who somebody is does not depend on
+    # which chat they typed in, and making it depend on that would have tied
+    # every stored row to session variables not every Hermes version exposes.
+    #
+    # :mod:`learning_studio.destination` does read the chat, and only for the
+    # one decision that genuinely is about a conversation: where a launch
+    # message may be sent. That is a routing question, not an identity one, and
+    # it fails closed when the variables are absent rather than storing
+    # anything.
 
     @property
     def is_local(self) -> bool:
@@ -98,7 +103,7 @@ class Principal:
         }
 
 
-def _session_value(name: str) -> str:
+def session_value(name: str) -> str:
     """Read one Hermes session variable.
 
     ``gateway.session_context`` is documented as the public replacement for
@@ -150,8 +155,8 @@ def resolve_principal() -> Principal:
     can read.
     """
     profile = profile_id()
-    platform = _session_value("HERMES_SESSION_PLATFORM")
-    user_id = _session_value("HERMES_SESSION_USER_ID")
+    platform = session_value("HERMES_SESSION_PLATFORM")
+    user_id = session_value("HERMES_SESSION_USER_ID")
 
     if platform and user_id:
         return Principal(

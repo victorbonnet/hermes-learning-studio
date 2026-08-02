@@ -42,8 +42,8 @@ def test_skill_is_addressable_as_namespaced_name(ctx):
     assert ctx.qualified_skill_names == ["learning-studio:adaptive-learning"]
 
 
-def test_register_registers_exactly_the_four_tools(ctx):
-    """Four tools, no more. The exercise *runtime* is still a later PR."""
+def test_register_registers_exactly_the_eight_tools(ctx):
+    """Eight tools, no more. Four for the record, four for the runtime."""
     from learning_studio import register
 
     register(ctx)
@@ -51,8 +51,12 @@ def test_register_registers_exactly_the_four_tools(ctx):
     assert sorted(tool.name for tool in ctx.tools) == [
         "learning_studio_get_context",
         "learning_studio_import_asset",
+        "learning_studio_launch",
         "learning_studio_prepare",
+        "learning_studio_results",
         "learning_studio_save_context",
+        "learning_studio_status",
+        "learning_studio_stop",
     ]
 
 
