@@ -56,7 +56,7 @@ def test_the_manifest_declares_exactly_what_is_registered(registered, repo_root:
     manifest = yaml.safe_load((repo_root / "plugin.yaml").read_text(encoding="utf-8"))
 
     assert sorted(manifest["provides_tools"]) == ALL_TOOLS
-    assert manifest["provides_hooks"] == []
+    assert manifest["provides_hooks"] == ["pre_gateway_dispatch"]
 
 
 def test_the_manifest_requires_no_environment_variable(repo_root: Path):
@@ -71,8 +71,10 @@ def test_the_manifest_requires_no_environment_variable(repo_root: Path):
     assert manifest["requires_env"] == []
 
 
-def test_registration_still_registers_no_hook_or_command(registered):
-    assert registered.hooks == []
+def test_registration_registers_one_observe_only_hook_and_no_commands(registered):
+    from learning_studio.plugin import CONSENT_EVIDENCE_HOOK
+
+    assert [name for name, _ in registered.hooks] == [CONSENT_EVIDENCE_HOOK]
     assert registered.commands == []
     assert registered.cli_commands == []
 
@@ -182,14 +184,45 @@ def test_the_no_argument_tools_accept_nothing(name: str):
     assert parameters["additionalProperties"] is False
 
 
-def test_launch_requires_an_experience_and_says_who_initiated_it():
+def test_launch_requires_an_experience_an_initiation_and_the_learner_words():
     parameters = TOOL_SCHEMAS["learning_studio_launch"]["parameters"]
 
-    assert sorted(parameters["required"]) == ["experience_id", "initiation"]
+    assert sorted(parameters["required"]) == ["experience_id", "initiation", "learner_quote"]
     assert parameters["properties"]["initiation"]["enum"] == [
         "learner_request",
         "agent_suggestion",
     ]
+
+
+def test_the_schema_itself_refuses_an_incomplete_suggestion():
+    """Encoded in JSON Schema as well as in the handler.
+
+    A provider that validates before dispatch must refuse the same payloads
+    this code would, or the two disagree about what a valid call is.
+    """
+    from learning_studio.validation import SchemaViolation, validate
+
+    parameters = TOOL_SCHEMAS["learning_studio_launch"]["parameters"]
+
+    with pytest.raises(SchemaViolation):
+        validate(
+            {
+                "experience_id": "e",
+                "initiation": "agent_suggestion",
+                "learner_quote": "go on then",
+            },
+            parameters,
+        )
+
+    validate(
+        {
+            "experience_id": "e",
+            "initiation": "agent_suggestion",
+            "learner_confirmed": True,
+            "learner_quote": "go on then",
+        },
+        parameters,
+    )
 
 
 def test_every_runtime_string_is_bounded():

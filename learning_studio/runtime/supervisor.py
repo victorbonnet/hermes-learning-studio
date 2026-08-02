@@ -149,7 +149,6 @@ def child_environment(
     straight into a process that answers a public URL, and nobody would notice
     until it appeared in a crash report.
     """
-    incoming = os.environ if source is None else source
     child: dict[str, str] = {
         env.RUNTIME_ID: record.runtime_id,
         env.GENERATION: str(record.generation),
@@ -162,10 +161,28 @@ def child_environment(
     if cloudflared:
         child[env.CLOUDFLARED] = cloudflared
     for name in env.INHERITED:
-        value = incoming.get(name)
+        value = _inherited(name, source)
         if value:
             child[name] = value
     return child
+
+
+def _inherited(name: str, source: dict[str, str] | None) -> str:
+    """One value to pass on, resolved for the profile actually being served.
+
+    The runtime this starts verifies Telegram signatures and computes an
+    allowlist. Both depend on credentials that, in a multiplexed Hermes, are
+    *not* the ones in the process environment — so they are resolved through
+    the host's secret scope here, in the parent, where the active profile is
+    known. The child then reads its own environment, which is correct because
+    the environment it has is the one this function built.
+    """
+    if source is not None:
+        return str(source.get(name, "") or "").strip()
+
+    from ..secrets import get_secret
+
+    return get_secret(name)
 
 
 def handshake_path(runtime_id: str) -> Path:

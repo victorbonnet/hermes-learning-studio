@@ -10,11 +10,13 @@ The order is the design
 
 1. **Who is asking**, from Hermes' session context. Never from an argument.
 2. **Which exercise**, by opaque id, checked in SQL against that learner.
-3. **May this happen without asking?** — :mod:`learning_studio.consent`.
-4. **Where would the message go?** — :mod:`learning_studio.destination`,
+3. **Where would the message go?** — :mod:`learning_studio.destination`,
    derived from the authenticated private chat and the profile's own
    allowlist. Resolved *before* anything is started, because a launch that
-   could never be delivered should not start a server first.
+   could never be delivered should not start a server first — and before
+   consent, so somebody in a group is told they are in a group.
+4. **May this happen at all?** — :mod:`learning_studio.consent`, which checks
+   the quotation against the message the platform actually delivered.
 5. **A runtime**, started or reused, under the profile lock.
 6. **A public address**, which the runtime's tunnel has already validated and
    which is validated again on the way in.
@@ -71,11 +73,11 @@ def launch_experience(
     principal: Principal,
     experience_id: str,
     initiation: str,
+    learner_quote: str,
     learner_confirmed: bool = False,
-    confirmation_quote: str | None = None,
     config: LearningStudioConfig | None = None,
     deliver=None,
-    ledger: consent_policy.ConsentLedger | None = None,
+    evidence=None,
 ) -> dict[str, Any]:
     """Open a prepared exercise for the learner who asked for it.
 
@@ -85,7 +87,6 @@ def launch_experience(
     that the one function that holds a bot token is small enough to read.
     """
     settings = config or load_config()
-    ledger = ledger or consent_policy.LEDGER
     send = deliver or _default_deliver
 
     # (1) and (2): identity is already resolved; ownership is checked in SQL,
@@ -95,21 +96,25 @@ def launch_experience(
     )
     experience = bundle.experience
 
-    # (3) Consent, before anything exists to roll back.
-    decision = ledger.decide(
-        profile=principal.profile,
-        learner_scope=principal.scope,
-        experience_id=str(experience["experience_id"]),
-        initiation=initiation,
-        learner_confirmed=learner_confirmed,
-        confirmation_quote=confirmation_quote,
-    )
-
-    # (4) The destination, before a process is started. A launch that has
-    # nowhere to send a button is a refusal, not a runtime plus a refusal.
+    # (3) The destination, before anything else that could fail. It is derived
+    # entirely from trusted session context, it is cheap, and putting it first
+    # means a learner in a group chat is told *that* rather than being told
+    # something about consent — which would be true, but useless to them.
     from .destination import resolve_destination
 
     destination = resolve_destination(principal=principal, config=settings)
+
+    # (4) Consent, before anything exists to roll back. The quotation is
+    # checked against the message the platform actually delivered — see
+    # `learning_studio.evidence` — so this step can fail on a launch the model
+    # was certain about, which is the entire reason it is here.
+    decision = consent_policy.decide(
+        profile=principal.profile,
+        initiation=initiation,
+        learner_confirmed=learner_confirmed,
+        learner_quote=learner_quote,
+        store=evidence,
+    )
 
     manager.require_prerequisites(settings)
 
@@ -125,8 +130,7 @@ def launch_experience(
                 experience=experience,
                 principal=principal,
                 decision=decision,
-                confirmation_quote=confirmation_quote,
-                ledger=ledger,
+                evidence=evidence,
                 send=send,
             )
         except BaseException:
@@ -146,8 +150,7 @@ def _launch_within(
     experience: dict[str, Any],
     principal: Principal,
     decision: consent_policy.Decision,
-    confirmation_quote: str | None,
-    ledger: consent_policy.ConsentLedger,
+    evidence,
     send,
 ) -> dict[str, Any]:
     """Steps 6 to 9, with the grant as the thing that gets rolled back."""
@@ -200,15 +203,11 @@ def _launch_within(
             ownership.call(handle.record, ownership.GRANT_REVOKE_PATH, {"launch_id": launch_id})
         raise
 
-    if decision.initiation == consent_policy.AGENT_SUGGESTION:
-        # Spent only now, so a failure anywhere above leaves the learner's
-        # agreement intact and the next attempt does not need a second ask.
-        ledger.spend(
-            profile=principal.profile,
-            learner_scope=principal.scope,
-            experience_id=str(experience["experience_id"]),
-            quote=confirmation_quote or "",
-        )
+    # Spent only now, and only once. A failure anywhere above leaves the
+    # learner's words intact so the next attempt does not need a second ask;
+    # two calls racing on one message do not both get here, because the spend
+    # itself is the arbitration.
+    consent_policy.spend(decision, store=evidence)
 
     return _result(
         experience=experience, granted=granted, decision=decision, delivered=True, reused=False

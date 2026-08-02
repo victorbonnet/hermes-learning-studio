@@ -42,9 +42,13 @@ def test_manifest_declares_exactly_the_tools_that_are_registered(manifest, ctx):
     assert sorted(manifest.get("provides_tools", [])) == sorted(tool.name for tool in ctx.tools)
 
 
-def test_manifest_declares_no_hooks_yet(manifest):
-    """No lifecycle hooks are registered, so none may be claimed."""
-    assert manifest.get("provides_hooks", []) == []
+def test_manifest_declares_the_one_observe_only_hook(manifest):
+    """Exactly the hook that is registered, and nothing else.
+
+    A manifest that under-declares is how an operator's audit misses a
+    capability; one that over-declares claims a surface the code does not have.
+    """
+    assert manifest.get("provides_hooks", []) == ["pre_gateway_dispatch"]
 
 
 def test_manifest_requires_no_env_vars(manifest):

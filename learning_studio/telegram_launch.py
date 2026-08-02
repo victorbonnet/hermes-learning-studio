@@ -28,8 +28,10 @@ grant.
 The token
 ---------
 
-Read from the environment on each send — where Hermes already keeps it — and
-never copied into configuration, a record, a log line, a response, an exception
+Read on each send through :mod:`learning_studio.secrets`, which asks Hermes for
+the *active profile's* value rather than reading the process environment — in a
+multiplexed host those are not the same credential. It is never copied into
+configuration, a record, a log line, a response, an exception
 message, or a process argument. It appears in exactly one place: the request
 path, which is how the Bot API authenticates, and which is why :func:`redact`
 exists and why nothing in this module ever puts a URL it built into an error.
@@ -60,9 +62,6 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API_ORIGIN = "https://api.telegram.org"
 
 SEND_MESSAGE_METHOD = "sendMessage"
-
-#: Where Hermes already keeps the bot token.
-BOT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 
 #: A send either works quickly or is not worth waiting for: the learner is
 #: watching a conversation, and a tool call that hangs is worse than one that
@@ -144,9 +143,16 @@ def _bounded(text: object, limit: int) -> str:
 
 
 def _token_from_environment() -> str:
-    import os
+    """The active profile's token, through Hermes' own secret scope.
 
-    return str(os.environ.get(BOT_TOKEN_ENV, "") or "").strip()
+    Not ``os.environ``. Hermes can multiplex several profiles through one
+    process, and the token in the process environment there may belong to a
+    different profile — so a launch for profile B would be delivered by
+    profile A's bot, to a chat id that means somebody else on that bot.
+    """
+    from .secrets import telegram_bot_token
+
+    return telegram_bot_token()
 
 
 def _post(token: str, payload: dict[str, Any], *, opener=None) -> None:

@@ -68,15 +68,34 @@ def test_registered_tools_share_the_reserved_toolset(ctx):
     assert {tool.toolset for tool in ctx.tools} == {"plugin_learning_studio"}
 
 
-def test_register_registers_no_hooks_or_commands(ctx):
-    """Hooks, slash commands, and CLI subcommands belong to later PRs."""
+def test_register_registers_one_observe_only_hook_and_no_commands(ctx):
+    """One hook, and it only watches.
+
+    ``pre_gateway_dispatch`` is how launching learns what the learner actually
+    said rather than taking the model's word for it. The callback records and
+    returns ``None``, so message dispatch is unchanged. Slash commands and CLI
+    subcommands are still not registered at all.
+    """
     from learning_studio import register
+    from learning_studio.plugin import CONSENT_EVIDENCE_HOOK
 
     register(ctx)
 
-    assert ctx.hooks == []
+    assert [name for name, _ in ctx.hooks] == [CONSENT_EVIDENCE_HOOK]
     assert ctx.commands == []
     assert ctx.cli_commands == []
+
+
+def test_the_registered_hook_only_observes(ctx):
+    """It must never skip or rewrite a message: returning None is "carry on"."""
+    from learning_studio import register
+
+    register(ctx)
+    callback = dict(ctx.hooks)[  # noqa: RUF015 - one hook, named for clarity
+        "pre_gateway_dispatch"
+    ]
+
+    assert callback(event=None) is None
 
 
 def test_root_shim_loads_the_way_hermes_loads_it(repo_root: Path, ctx):

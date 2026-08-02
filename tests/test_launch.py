@@ -17,11 +17,10 @@ from pathlib import Path
 
 import pytest
 
-from learning_studio import consent as consent_policy
 from learning_studio import launch as launch_module
 from learning_studio import service
 from learning_studio.config import LearningStudioConfig
-from learning_studio.consent import ConsentLedger, ConsentRequired
+from learning_studio.consent import ConsentRequired
 from learning_studio.identity import Principal
 from learning_studio.runtime import bootstrap, ownership, state, supervisor
 from learning_studio.runtime import grants as grants_module
@@ -167,8 +166,48 @@ def telegram_session(gateway_session, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "1001")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "1001")
-    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "private")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "555")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "1001,2002")
+
+
+#: What the learner is holding in every test below. Recorded through the same
+#: store the gateway hook writes to, so the quotation a launch supplies is
+#: checked against a message the platform "delivered" rather than model say-so.
+LEARNER_MESSAGE = "can you quiz me on photosynthesis please"
+LEARNER_QUOTE = "quiz me on photosynthesis"
+SUGGESTION_REPLY = "go on then, that sounds useful"
+SUGGESTION_QUOTE = "go on then"
+
+
+@pytest.fixture(autouse=True)
+def spoken(clock, telegram_session, monkeypatch):
+    """An evidence store holding the learner's current message.
+
+    Written the way `pre_gateway_dispatch` writes it: keyed by the exact
+    message id the session carries, before the model gets a turn.
+
+    Autouse because *every* launch now needs it. A test about destinations or
+    rollback is not a test about consent, and it should not have to restate
+    that somebody spoke — but it does have to be true, because a launch with no
+    trusted message is refused before it reaches anything else.
+    """
+    from learning_studio.evidence import EvidenceKey, EvidenceStore
+
+    store = EvidenceStore(clock=clock)
+    monkeypatch.setattr("learning_studio.consent.STORE", store)
+    store.record(
+        EvidenceKey(
+            profile="default",
+            platform="telegram",
+            chat_id="1001",
+            thread_id="",
+            user_id="1001",
+            message_id="555",
+        ),
+        LEARNER_MESSAGE + " " + SUGGESTION_REPLY,
+    )
+    return store
 
 
 @pytest.fixture
@@ -181,15 +220,23 @@ def experience_id(hermes_home, principal) -> str:
     return result["experience_id"]
 
 
-def launch(principal, experience_id, *, deliver, ledger=None, settings=None, **kwargs):
-    payload = {"initiation": "learner_request"}
+#: The words the learner is holding in every test below. Recorded by the
+#: `spoken` fixture the way the gateway hook records a real message, so the
+#: quotation the launch supplies is checked against something the platform
+#: "delivered" rather than against the model's say-so.
+LEARNER_MESSAGE = "can you quiz me on photosynthesis please"
+LEARNER_QUOTE = "quiz me on photosynthesis"
+
+
+def launch(principal, experience_id, *, deliver, evidence=None, settings=None, **kwargs):
+    payload = {"initiation": "learner_request", "learner_quote": LEARNER_QUOTE}
     payload.update(kwargs)
     return launch_module.launch_experience(
         principal=principal,
         experience_id=experience_id,
         config=settings or config(),
         deliver=deliver,
-        ledger=ledger or ConsentLedger(),
+        evidence=evidence,
         **payload,
     )
 
@@ -262,13 +309,13 @@ def test_a_grant_is_created_and_bound_to_the_learner(
 
 
 def test_a_repeat_launch_reuses_the_grant_and_sends_nothing_new(
-    runtime, telegram_session, principal, experience_id
+    runtime, spoken, principal, experience_id
 ):
+    """A retry reports the launch that is open; it does not send a second button."""
     deliver = Deliveries()
-    ledger = ConsentLedger()
 
-    first = launch(principal, experience_id, deliver=deliver, ledger=ledger)
-    second = launch(principal, experience_id, deliver=deliver, ledger=ledger)
+    first = launch(principal, experience_id, deliver=deliver)
+    second = launch(principal, experience_id, deliver=deliver)
 
     assert first["button_delivered"] is True
     assert second["reused_existing_launch"] is True
@@ -277,7 +324,10 @@ def test_a_repeat_launch_reuses_the_grant_and_sends_nothing_new(
     assert first["launch_id"] == second["launch_id"]
 
 
-def test_a_second_exercise_gets_its_own_launch(runtime, telegram_session, principal, hermes_home):
+def test_a_second_exercise_needs_a_second_message(
+    runtime, spoken, principal, hermes_home, monkeypatch
+):
+    """One message opens one exercise. Two exercises take two messages."""
     deliver = Deliveries()
     first_id = service.prepare_experience(
         principal=principal, manifest=manifest([example("true_false", id="a")]), config=config()
@@ -287,144 +337,169 @@ def test_a_second_exercise_gets_its_own_launch(runtime, telegram_session, princi
     )["experience_id"]
 
     first = launch(principal, first_id, deliver=deliver)
-    second = launch(principal, second_id, deliver=deliver)
+
+    # The learner writes again, and the gateway records the new message.
+    from learning_studio.evidence import EvidenceKey
+
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "556")
+    spoken.record(
+        EvidenceKey(
+            profile="default",
+            platform="telegram",
+            chat_id="1001",
+            thread_id="",
+            user_id="1001",
+            message_id="556",
+        ),
+        "now quiz me on respiration instead",
+    )
+    second = launch(principal, second_id, deliver=deliver, learner_quote="quiz me on respiration")
 
     assert first["launch_id"] != second["launch_id"]
     assert len(deliver.sent) == 2
 
 
 # ── Consent ───────────────────────────────────────────────────────────────
+#
+# The policy itself is tested in `tests/test_consent_evidence.py`. What these
+# cover is how it meets the transaction: a refusal must start nothing, and a
+# success must spend the learner's message exactly once and only after the
+# button has actually gone.
 
 
 def test_an_unconfirmed_suggestion_is_refused_before_anything_starts(
-    runtime, telegram_session, principal, experience_id
+    runtime, spoken, principal, experience_id
 ):
     deliver = Deliveries()
 
     with pytest.raises(ConsentRequired) as caught:
-        launch(principal, experience_id, deliver=deliver, initiation="agent_suggestion")
+        launch(
+            principal,
+            experience_id,
+            deliver=deliver,
+            evidence=spoken,
+            initiation="agent_suggestion",
+            learner_quote=SUGGESTION_QUOTE,
+        )
 
     assert caught.value.reason == "suggestion_not_confirmed"
     assert deliver.sent == []
     assert len(runtime.store) == 0
 
 
-def test_a_confirmed_suggestion_without_a_quote_is_refused(
-    runtime, telegram_session, principal, experience_id
-):
+def test_a_launch_quoting_words_nobody_wrote_is_refused(runtime, spoken, principal, experience_id):
+    """The headline regression: the model asserts a request that was not made."""
+    deliver = Deliveries()
+
     with pytest.raises(ConsentRequired) as caught:
         launch(
             principal,
             experience_id,
-            deliver=Deliveries(),
-            initiation="agent_suggestion",
-            learner_confirmed=True,
+            deliver=deliver,
+            evidence=spoken,
+            learner_quote="yes open the exercise for me",
         )
 
-    assert caught.value.reason == "confirmation_quote_missing"
+    assert caught.value.reason == "quote_not_in_current_message"
+    assert deliver.sent == []
+    assert len(runtime.store) == 0
 
 
-def test_a_confirmed_suggestion_opens_the_exercise(
-    runtime, telegram_session, principal, experience_id
+def test_a_turn_carrying_no_learner_message_cannot_launch(
+    runtime, spoken, principal, experience_id, monkeypatch
 ):
+    """A cron job or background task has nobody to have asked."""
+    monkeypatch.delenv("HERMES_SESSION_MESSAGE_ID", raising=False)
+    deliver = Deliveries()
+
+    with pytest.raises(ConsentRequired):
+        launch(principal, experience_id, deliver=deliver, evidence=spoken)
+
+    assert deliver.sent == []
+
+
+def test_a_confirmed_suggestion_opens_the_exercise(runtime, spoken, principal, experience_id):
     deliver = Deliveries()
 
     result = launch(
         principal,
         experience_id,
         deliver=deliver,
+        evidence=spoken,
         initiation="agent_suggestion",
         learner_confirmed=True,
-        confirmation_quote="yes please, that sounds useful",
+        learner_quote=SUGGESTION_QUOTE,
     )
 
     assert result["button_delivered"] is True
-    assert "agreed" in result["basis"]
+    assert "you read them as" in result["basis"]
 
 
-def test_a_replayed_confirmation_cannot_open_a_second_launch(
-    runtime, telegram_session, principal, experience_id, clock
+def test_the_reported_basis_never_claims_the_learner_agreed(
+    runtime, spoken, principal, experience_id
 ):
-    """The rule that makes retries safe, and the one worth reading twice.
+    """The response reports a check that passed, not a state of mind."""
+    result = launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
 
-    The learner agreed once. The first launch spends that agreement; when the
-    grant it created has gone, the same agreement must not quietly open a
-    second public entrance.
+    assert "the learner agreed" not in result["basis"].lower()
+    assert "quoted are in the learner's current message" in result["basis"]
+
+
+def test_one_message_cannot_open_a_second_launch(runtime, spoken, principal, experience_id, clock):
+    """The learner said one thing once; it opens one exercise once.
+
+    The first launch spends that message. When the grant it created has lapsed,
+    the same words must not quietly open a second public entrance — which is
+    exactly what the previous ledger did, because it deleted its own stale
+    entry and the next call then read the consent as fresh.
     """
     deliver = Deliveries()
-    ledger = ConsentLedger(clock=clock)
-    suggestion = {
-        "initiation": "agent_suggestion",
-        "learner_confirmed": True,
-        "confirmation_quote": "go on then",
-    }
+    launch(principal, experience_id, deliver=deliver, evidence=spoken)
 
-    launch(principal, experience_id, deliver=deliver, ledger=ledger, **suggestion)
-
-    # The learner never opened it and the grant lapsed.
     clock.advance(grants_module.DEFAULT_GRANT_TTL_SECONDS + 1)
 
     with pytest.raises(ConsentRequired) as caught:
-        launch(principal, experience_id, deliver=deliver, ledger=ledger, **suggestion)
+        launch(principal, experience_id, deliver=deliver, evidence=spoken)
 
     assert caught.value.reason == "confirmation_already_used"
     assert len(deliver.sent) == 1
 
 
-def test_a_stale_confirmation_is_refused(
-    runtime, telegram_session, principal, experience_id, clock
+def test_a_spent_message_keeps_failing_on_every_retry(
+    runtime, spoken, principal, experience_id, clock
 ):
-    deliver = Deliveries()
-    ledger = ConsentLedger(clock=clock)
-    suggestion = {
-        "initiation": "agent_suggestion",
-        "learner_confirmed": True,
-        "confirmation_quote": "go on then",
-    }
+    """Not only on the first retry. Stale is a terminal state."""
+    launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
+    clock.advance(grants_module.DEFAULT_GRANT_TTL_SECONDS + 1)
 
-    launch(principal, experience_id, deliver=deliver, ledger=ledger, **suggestion)
-    clock.advance(consent_policy.CONSENT_TTL_SECONDS + 60)
-
-    with pytest.raises(ConsentRequired) as caught:
-        launch(principal, experience_id, deliver=deliver, ledger=ledger, **suggestion)
-
-    assert caught.value.reason == "confirmation_stale"
+    for _ in range(3):
+        with pytest.raises(ConsentRequired):
+            launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
 
 
-def test_an_explicit_request_never_needs_a_confirmation(
-    runtime, telegram_session, principal, experience_id, clock
+def test_an_explicit_request_never_needs_a_confirmation_flag(
+    runtime, spoken, principal, experience_id
 ):
     """Asking to practise *is* the agreement; a second ask is friction."""
-    ledger = ConsentLedger(clock=clock)
-    deliver = Deliveries()
-
-    result = launch(principal, experience_id, deliver=deliver, ledger=ledger)
+    result = launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
 
     assert result["button_delivered"] is True
-    assert "asked for this exercise" in result["basis"]
+    assert "request to practise" in result["basis"]
 
 
-def test_a_failed_launch_does_not_spend_the_learner_agreement(
-    runtime, telegram_session, principal, experience_id, clock
+def test_a_failed_launch_does_not_spend_the_learner_message(
+    runtime, spoken, principal, experience_id
 ):
     """A delivery failure must not force the learner to be asked again."""
-    ledger = ConsentLedger(clock=clock)
-    suggestion = {
-        "initiation": "agent_suggestion",
-        "learner_confirmed": True,
-        "confirmation_quote": "yes, go on",
-    }
-
     with pytest.raises(RuntimeError):
         launch(
             principal,
             experience_id,
             deliver=Deliveries(fails=RuntimeError("telegram is down")),
-            ledger=ledger,
-            **suggestion,
+            evidence=spoken,
         )
 
-    result = launch(principal, experience_id, deliver=Deliveries(), ledger=ledger, **suggestion)
+    result = launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
 
     assert result["button_delivered"] is True
 
@@ -627,8 +702,8 @@ def test_a_launch_with_no_bot_token_rolls_everything_back(
             principal=principal,
             experience_id=experience_id,
             initiation="learner_request",
+            learner_quote=LEARNER_QUOTE,
             config=config(),
-            ledger=ConsentLedger(),
         )
 
     assert caught.value.reason == "bot_token_absent"
@@ -639,11 +714,59 @@ def test_a_launch_with_no_bot_token_rolls_everything_back(
 # ── Destination ───────────────────────────────────────────────────────────
 
 
-def test_a_group_conversation_is_refused(runtime, monkeypatch, principal, experience_id):
+@pytest.mark.parametrize("chat_type", ["dm", "private", "sender"])
+def test_every_one_to_one_chat_type_resolves(
+    runtime, telegram_session, principal, experience_id, monkeypatch, chat_type: str
+):
+    """`dm` is the one that actually arrives, and it used to be refused.
+
+    Hermes normalises Telegram's `private` to its own canonical `dm` before the
+    session variables are bound, so a plugin accepting only `private` refused
+    every real direct message as though it were a group — the one surface the
+    whole feature exists for.
+    """
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", chat_type)
+    deliver = Deliveries()
+
+    result = launch(principal, experience_id, deliver=deliver)
+
+    assert result["button_delivered"] is True
+    assert deliver.sent[0]["chat_id"] == "1001"
+
+
+@pytest.mark.parametrize("chat_type", ["group", "forum", "supergroup", "channel", "thread"])
+def test_every_room_chat_type_is_refused(
+    runtime, telegram_session, principal, experience_id, monkeypatch, chat_type: str
+):
     from learning_studio.runtime.errors import LaunchRefused
 
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "1001")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", chat_type)
+    deliver = Deliveries()
+
+    with pytest.raises(LaunchRefused) as caught:
+        launch(principal, experience_id, deliver=deliver)
+
+    assert caught.value.reason == "destination_group_chat"
+    assert deliver.sent == []
+
+
+def test_an_unknown_chat_type_is_refused_rather_than_assumed(
+    runtime, telegram_session, principal, experience_id, monkeypatch
+):
+    """The accepted set is an allowlist, so a future Hermes value fails closed."""
+    from learning_studio.runtime.errors import LaunchRefused
+
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "some_future_surface")
+
+    with pytest.raises(LaunchRefused) as caught:
+        launch(principal, experience_id, deliver=Deliveries())
+
+    assert caught.value.reason == "destination_group_chat"
+
+
+def test_a_group_conversation_is_refused(runtime, spoken, monkeypatch, principal, experience_id):
+    from learning_studio.runtime.errors import LaunchRefused
+
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "-100987")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "supergroup")
     deliver = Deliveries()
@@ -655,12 +778,12 @@ def test_a_group_conversation_is_refused(runtime, monkeypatch, principal, experi
     assert deliver.sent == []
 
 
-def test_a_chat_that_is_not_the_sender_is_refused(runtime, monkeypatch, principal, experience_id):
+def test_a_chat_that_is_not_the_sender_is_refused(
+    runtime, spoken, monkeypatch, principal, experience_id
+):
     """Belt and braces: this holds even when `chat_type` is absent."""
     from learning_studio.runtime.errors import LaunchRefused
 
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "1001")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "-100987")
     monkeypatch.delenv("HERMES_SESSION_CHAT_TYPE", raising=False)
 
@@ -670,11 +793,9 @@ def test_a_chat_that_is_not_the_sender_is_refused(runtime, monkeypatch, principa
     assert caught.value.reason == "destination_not_the_sender"
 
 
-def test_a_session_with_no_chat_is_refused(runtime, monkeypatch, principal, experience_id):
+def test_a_session_with_no_chat_is_refused(runtime, spoken, monkeypatch, principal, experience_id):
     from learning_studio.runtime.errors import LaunchRefused
 
-    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_USER_ID", "1001")
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
 
     with pytest.raises(LaunchRefused) as caught:

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from learning_studio import consent, launch, telegram_launch
+from learning_studio import launch, telegram_launch
 from learning_studio.config import LearningStudioConfig
 from learning_studio.runtime import (
     bootstrap,
@@ -104,11 +104,11 @@ def test_the_launch_signature_accepts_nothing_a_model_should_not_supply():
         "principal",
         "experience_id",
         "initiation",
+        "learner_quote",
         "learner_confirmed",
-        "confirmation_quote",
         "config",
         "deliver",
-        "ledger",
+        "evidence",
     }
 
 
@@ -410,59 +410,75 @@ def test_a_runtime_reporting_a_look_alike_is_not_believed(monkeypatch):
         ownership.query(record())
 
 
-# ── Consent cannot be spent twice ─────────────────────────────────────────
+# ── Consent cannot be fabricated or spent twice ───────────────────────────
 
 
-def test_an_agreement_opens_one_exercise_once():
-    ledger = consent.ConsentLedger(clock=lambda: 0.0)
-    ask = {
-        "profile": "default",
-        "learner_scope": "telegram\x001001",
-        "experience_id": "exp-1",
-        "initiation": consent.AGENT_SUGGESTION,
-        "learner_confirmed": True,
-        "confirmation_quote": "yes",
-    }
+def test_a_launch_cannot_be_authorised_by_words_nobody_wrote():
+    """The model may read the meaning; it may not supply the words."""
+    from learning_studio.evidence import EvidenceKey, EvidenceStore
 
-    assert ledger.decide(**ask).may_create is True
-    ledger.spend(
-        profile="default", learner_scope="telegram\x001001", experience_id="exp-1", quote="yes"
+    store = EvidenceStore(clock=lambda: 0.0)
+    store.record(
+        EvidenceKey("default", "telegram", "1001", "", "1001", "555"),
+        "what does chlorophyll actually do",
     )
 
-    assert ledger.decide(**ask).may_create is False
-
-
-def test_a_learner_request_never_needs_an_agreement():
-    ledger = consent.ConsentLedger(clock=lambda: 0.0)
-
-    decided = ledger.decide(
-        profile="default",
-        learner_scope="telegram\x001001",
-        experience_id="exp-1",
-        initiation=consent.LEARNER_REQUEST,
-        learner_confirmed=False,
-        confirmation_quote=None,
+    assert (
+        store.state(
+            EvidenceKey("default", "telegram", "1001", "", "1001", "555"),
+            "quiz me on photosynthesis",
+        )
+        == "mismatched"
     )
 
-    assert decided.may_create is True
+
+def test_one_trusted_message_authorises_one_launch():
+    from learning_studio.evidence import EvidenceKey, EvidenceStore
+
+    store = EvidenceStore(clock=lambda: 0.0)
+    key = EvidenceKey("default", "telegram", "1001", "", "1001", "555")
+    store.record(key, "quiz me on photosynthesis")
+
+    assert store.spend(key) is True
+    assert store.spend(key) is False
 
 
-def test_one_learner_agreement_does_not_authorise_another_learner():
-    ledger = consent.ConsentLedger(clock=lambda: 0.0)
-    ledger.spend(
-        profile="default", learner_scope="telegram\x001001", experience_id="exp-1", quote="yes"
-    )
+def test_a_spent_message_never_becomes_fresh_again():
+    """The exact regression: expiry used to delete the record and re-open it."""
+    clock = {"now": 0.0}
+    from learning_studio.evidence import EvidenceKey, EvidenceStore
 
-    decided = ledger.decide(
-        profile="default",
-        learner_scope="telegram\x002002",
-        experience_id="exp-1",
-        initiation=consent.AGENT_SUGGESTION,
-        learner_confirmed=True,
-        confirmation_quote="yes",
-    )
+    store = EvidenceStore(clock=lambda: clock["now"])
+    key = EvidenceKey("default", "telegram", "1001", "", "1001", "555")
+    store.record(key, "quiz me on photosynthesis")
+    store.spend(key)
 
-    assert decided.may_create is True, "a second learner was refused on the first one's ledger"
+    for elapsed in (1, 601, 1200, 1799):
+        clock["now"] = elapsed
+        assert store.state(key, "quiz me on photosynthesis") == "spent"
+
+
+def test_one_learner_message_does_not_authorise_another_identity():
+    from learning_studio.evidence import EvidenceKey, EvidenceStore
+
+    store = EvidenceStore(clock=lambda: 0.0)
+    store.record(EvidenceKey("default", "telegram", "1001", "", "1001", "555"), "quiz me now")
+
+    for other in (
+        EvidenceKey("default", "telegram", "1001", "", "2002", "555"),
+        EvidenceKey("family", "telegram", "1001", "", "1001", "555"),
+        EvidenceKey("default", "telegram", "-100777", "", "1001", "555"),
+        EvidenceKey("default", "telegram", "1001", "", "1001", "556"),
+    ):
+        assert store.state(other, "quiz me now") == "absent"
+
+
+def test_consent_evidence_is_never_written_to_disk():
+    """A learner's own words, held in memory, in the process that had them."""
+    source = Path(PACKAGE / "evidence.py").read_text(encoding="utf-8")
+
+    for forbidden in ("open(", "write_text", "sqlite", "storage", "Path("):
+        assert forbidden not in source, forbidden
 
 
 # ── The rest of the plugin is unchanged ───────────────────────────────────

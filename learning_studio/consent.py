@@ -1,54 +1,58 @@
-"""When a launch may happen without asking, and when it may not.
+"""When a launch may happen, decided from what the learner actually said.
 
-Opening a Mini App is not like storing a preference. It creates a temporary
-public address on the learner's behalf and sends them a message. So the
-question this module answers is narrow and worth stating precisely:
+Opening an exercise creates a temporary public address and sends somebody a
+message, so the authority to do it has to come from somewhere better than the
+model's own account of the conversation.
 
-**A learner who asked for practice has already consented.** "Can we revise
-photosynthesis?", "quiz me on chapter four", "let me try some of those again" —
-all of these *are* the request. Stopping to ask "shall I open an exercise?"
-after one of them is friction dressed up as consent, and it teaches the learner
-that the assistant does not listen.
+Two questions, two different sources
+------------------------------------
 
-**A suggestion the learner did not make needs a yes.** When the agent proposes
-practice unprompted, nothing has been consented to yet, and a public entrance
-must not appear because an assistant had an idea.
+**"Did the learner say this?"** is a question of fact, and the model is not the
+source. It is answered by :mod:`learning_studio.evidence`, which recorded the
+incoming message before the agent ran and keys it by exactly which message it
+was. The quotation the tool is given must appear in *that* message.
 
-**Consent is for one launch, not for an experience.** This is the rule that
-makes retries safe. An agreement is recorded when it is used, and a *second*
-new launch of the same exercise on the strength of that same agreement is
-refused. A repeat call is still allowed to return the launch that is already
-open — reporting on something that exists is not a new act — but it may not
-quietly create a second one.
+**"Did they mean 'open an exercise'?"** is a question of interpretation, and
+the model is exactly the right source. "Quiz me on chapter four" and "go on
+then, let's try some" are consent; "I'm tired" is not; and no rule this module
+could write would read those better than the agent already does.
 
-What this module cannot do, and says so
----------------------------------------
+So the model classifies, and the host supplies the words. Neither alone is
+enough, which is the point.
 
-It cannot verify that the learner agreed. ``learner_confirmed`` is written by
-the model, in the same call as everything else, so it is an assertion and not
-proof — the same limitation that governs ``track.confirmed`` elsewhere in this
-plugin. What the rule buys is not a guarantee; it is that an agent has to
-*state* that a specific person agreed to a specific thing, once, and cannot
-reuse that statement to keep opening tunnels. The quote is required for the
-same reason: writing down what somebody said is a different act from ticking a
-box, and it is legible to whoever reads the conversation afterwards.
+The two rules
+-------------
 
-The ledger is in memory and per-process. A Hermes restart forgets it, and the
-effect of forgetting is that the next agent-initiated launch asks again — the
-safe direction.
+**A learner who asked has already agreed.** Stopping to ask "shall I open an
+exercise?" after "quiz me on this" is friction dressed up as consent, and it
+teaches the learner that the assistant does not listen.
+
+**A suggestion the learner did not make needs a yes** — and that yes has to be
+a message they sent, not a summary of one.
+
+Both require evidence. The difference between them is what the evidence has to
+contain: a request, or an agreement to a proposal.
+
+One message, one launch
+-----------------------
+
+Authority is spent when a launch commits, and the spending is atomic — two
+concurrent calls on one message do not both win. A repeat call may still
+*return the launch that is already open*, because reporting on something that
+exists is not a new act; it may not create a second one.
+
+A spent message stays spent. The earlier version of this deleted its own record
+when the entry went stale and then raised — so the very next call found nothing,
+concluded the consent was fresh, and launched. Expiry now leaves a tombstone
+that outlives the evidence, which is what makes "stale" a terminal state rather
+than a step on the way back to "new".
 """
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-#: How long a recorded agreement stays relevant. Beyond this the learner has
-#: moved on, and re-opening on the strength of it would surprise them.
-CONSENT_TTL_SECONDS = 900
-
-#: Bound on the ledger, so a long session cannot grow it without limit.
-MAX_ENTRIES = 200
+from .evidence import STORE, EvidenceKey, EvidenceStore
 
 #: The two ways a launch can be initiated. Named rather than boolean, so the
 #: tool schema asks the agent to say which happened instead of inviting it to
@@ -57,8 +61,10 @@ LEARNER_REQUEST = "learner_request"
 AGENT_SUGGESTION = "agent_suggestion"
 INITIATIONS = (LEARNER_REQUEST, AGENT_SUGGESTION)
 
-#: Shortest quote that could plausibly record what somebody said.
-MIN_QUOTE_CHARS = 2
+#: Bounds on the quotation itself. The lower bound is not a security property —
+#: the message identity carries that — but a two-character quotation would tell
+#: a reader nothing about whether the model had read the message.
+MIN_QUOTE_CHARS = 4
 MAX_QUOTE_CHARS = 500
 
 
@@ -74,23 +80,30 @@ class ConsentRequired(Exception):
 NOT_CONFIRMED = (
     "You suggested this exercise rather than the learner asking for it, so it needs their "
     "agreement before anything is opened or sent. Describe it in one line, ask, and call "
-    "this again with what they said. Nothing was started."
+    "this again once they have answered — quoting what they said. Nothing was started."
 )
 
-QUOTE_REQUIRED = (
-    "An exercise you suggested needs the learner's own words recorded alongside the "
-    "confirmation. Nothing was started."
+NO_EVIDENCE = (
+    "There is no current learner message to launch from. An exercise opens in response to "
+    "something the learner has just said, and this turn does not carry one — it may be a "
+    "scheduled job, a background task, or a turn that has already moved on. Nothing was "
+    "started. Offer the exercise the next time they write."
+)
+
+QUOTE_MISMATCH = (
+    "The words you quoted are not in the learner's current message, so the Learning Studio "
+    "cannot confirm they asked for this. Quote what they actually wrote, or ask them. "
+    "Nothing was started."
 )
 
 ALREADY_USED = (
-    "The learner's agreement to that suggestion has already been used to open this exercise "
-    "once, and the earlier session is no longer open. Ask them again before starting a new "
-    "one. Nothing was started."
+    "That message has already opened an exercise, and the earlier one is no longer "
+    "available. Ask the learner again before starting a new one. Nothing was started."
 )
 
-STALE = (
-    "The learner agreed to this a while ago and the conversation has moved on. Ask again "
-    "before opening it. Nothing was started."
+UNUSABLE_QUOTE = (
+    "The quotation is too short to confirm anything. Quote a few words the learner "
+    "actually wrote. Nothing was started."
 )
 
 
@@ -101,98 +114,91 @@ class Decision:
     initiation: str
     #: False when the caller may only return a launch that already exists.
     may_create: bool
-    #: Recorded in the response so the conversation shows why it proceeded.
+    #: The trusted message this authority came from. The caller spends it, and
+    #: only after the launch has actually committed.
+    key: EvidenceKey
+    #: Said in the response. Written to describe what was *proved*, not to
+    #: repeat the model's own assertion back as a finding.
     basis: str
 
 
-@dataclass
-class _Entry:
-    used_at: float
-    quote: str
+def decide(
+    *,
+    profile: str,
+    initiation: str,
+    learner_confirmed: bool,
+    learner_quote: str | None,
+    store: EvidenceStore | None = None,
+) -> Decision:
+    """Apply the policy, or raise :class:`ConsentRequired`.
 
+    Nothing is spent here. The caller spends the decision's key with
+    :func:`spend` once a launch has actually been delivered, so a failure
+    further down — no runtime, no tunnel, no message — leaves the learner's
+    words intact and the next attempt does not need a second ask.
+    """
+    # `is None`, never `or`. An `EvidenceStore` defines `__len__`, so an empty
+    # one is falsy — and `store or STORE` therefore fell through to the global
+    # store the moment the injected one was emptied by spending. The visible
+    # symptom was a message reading as never-used immediately after being used.
+    evidence = STORE if store is None else store
 
-@dataclass
-class ConsentLedger:
-    """Agreements this process has already spent, per learner and exercise."""
+    if initiation not in INITIATIONS:
+        raise ConsentRequired(NOT_CONFIRMED, reason="initiation_unknown")
+    if initiation == AGENT_SUGGESTION and not learner_confirmed:
+        raise ConsentRequired(NOT_CONFIRMED, reason="suggestion_not_confirmed")
 
-    clock: object = time.time
-    ttl_seconds: int = CONSENT_TTL_SECONDS
-    _entries: dict[tuple[str, str, str], _Entry] = field(default_factory=dict, repr=False)
+    from .evidence import current_key
 
-    def decide(
-        self,
-        *,
-        profile: str,
-        learner_scope: str,
-        experience_id: str,
-        initiation: str,
-        learner_confirmed: bool,
-        confirmation_quote: str | None,
-    ) -> Decision:
-        """Apply the policy, or raise :class:`ConsentRequired`.
+    key = current_key(profile)
+    state = evidence.state(key, learner_quote or "")
 
-        Nothing is recorded here. The caller records the agreement with
-        :meth:`spend` only once a launch has actually been created, so a
-        refusal further down the sequence — no runtime, no tunnel, no delivery —
-        does not consume an agreement that never produced anything.
-        """
-        if initiation not in INITIATIONS:
-            raise ConsentRequired(NOT_CONFIRMED, reason="initiation_unknown")
-
-        if initiation == LEARNER_REQUEST:
-            return Decision(
-                initiation=initiation,
-                may_create=True,
-                basis="The learner asked for this exercise, so it started without a second ask.",
-            )
-
-        if not learner_confirmed:
-            raise ConsentRequired(NOT_CONFIRMED, reason="suggestion_not_confirmed")
-        quote = (confirmation_quote or "").strip()
-        if not MIN_QUOTE_CHARS <= len(quote) <= MAX_QUOTE_CHARS:
-            raise ConsentRequired(QUOTE_REQUIRED, reason="confirmation_quote_missing")
-
-        key = (profile, learner_scope, experience_id)
-        entry = self._entries.get(key)
-        if entry is None:
-            return Decision(
-                initiation=initiation,
-                may_create=True,
-                basis="The learner agreed to the exercise you suggested.",
-            )
-
-        now = float(self.clock())
-        if now - entry.used_at > self.ttl_seconds:
-            del self._entries[key]
-            raise ConsentRequired(STALE, reason="confirmation_stale")
-
-        # Within the window, and already spent. A repeat may still return the
-        # launch that is open; it may not become a second one.
+    if state == "matched":
+        return Decision(
+            initiation=initiation,
+            may_create=True,
+            key=key,
+            basis=_BASIS[initiation],
+        )
+    if state == "spent":
+        # The message is real and was theirs; it has simply already been used.
+        # A repeat may report the launch it opened, and may not open another.
         return Decision(
             initiation=initiation,
             may_create=False,
-            basis="Reporting the exercise that is already open for this learner.",
+            key=key,
+            basis="Reporting the exercise that message already opened.",
         )
-
-    def spend(self, *, profile: str, learner_scope: str, experience_id: str, quote: str) -> None:
-        """Record that an agreement has now produced a launch."""
-        self._purge()
-        self._entries[(profile, learner_scope, experience_id)] = _Entry(
-            used_at=float(self.clock()), quote=quote[:MAX_QUOTE_CHARS]
-        )
-
-    def _purge(self) -> None:
-        now = float(self.clock())
-        stale = [
-            key for key, entry in self._entries.items() if now - entry.used_at > self.ttl_seconds
-        ]
-        for key in stale:
-            del self._entries[key]
-        while len(self._entries) >= MAX_ENTRIES:
-            oldest = min(self._entries, key=lambda key: self._entries[key].used_at)
-            del self._entries[oldest]
+    if state == "mismatched":
+        raise ConsentRequired(QUOTE_MISMATCH, reason="quote_not_in_current_message")
+    if state == "unusable":
+        raise ConsentRequired(UNUSABLE_QUOTE, reason="quote_unusable")
+    raise ConsentRequired(NO_EVIDENCE, reason="no_current_learner_message")
 
 
-#: One ledger per Hermes process. Keyed by profile and learner inside, so two
-#: profiles served by one process cannot see each other's agreements.
-LEDGER = ConsentLedger()
+#: What the response is allowed to claim, per initiation.
+#:
+#: Both sentences describe a *check that passed*, not a state of mind. The
+#: earlier wording said "the learner agreed", which repeated the model's own
+#: assertion back as though this plugin had established it.
+_BASIS = {
+    LEARNER_REQUEST: (
+        "The words you quoted are in the learner's current message, and you read them as a "
+        "request to practise."
+    ),
+    AGENT_SUGGESTION: (
+        "The words you quoted are in the learner's current message, and you read them as "
+        "agreement to the exercise you suggested."
+    ),
+}
+
+
+def spend(decision: Decision, *, store: EvidenceStore | None = None) -> bool:
+    """Consume the message's authority. Returns True for the caller that won.
+
+    Atomic, so two launches racing on one message do not both commit. Called
+    only after delivery has succeeded — see
+    :func:`learning_studio.launch.launch_experience`.
+    """
+    evidence = STORE if store is None else store
+    return evidence.spend(decision.key)

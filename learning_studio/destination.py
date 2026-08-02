@@ -16,10 +16,24 @@ Five conditions, all required
 **Telegram.** A Web App button is a Telegram construct. Any other platform is
 refused rather than approximated.
 
-**A private chat.** ``chat_type`` must say ``private`` (or ``sender``, which is
-what Telegram calls a Mini App launched from an inline context). Groups,
-supergroups and channels are refused: an exercise is one person's, and a button
-in a room is an invitation to whoever is in the room.
+**A private chat.** ``chat_type`` must name a one-to-one conversation. Groups,
+forums, supergroups and channels are refused: an exercise is one person's, and
+a button in a room is an invitation to whoever is in the room.
+
+The accepted vocabulary is worth writing down, because getting it wrong is not
+a theoretical risk — it is a bug this code shipped with. **Hermes normalises
+Telegram's ``private`` to its own canonical ``dm``** before the session
+variables are ever bound (``plugins/platforms/telegram/adapter.py``: ``if
+chat_type == "private": chat_type = "dm"``), and it normalises ``supergroup``
+to ``group`` or ``forum``. A plugin that accepted only ``private`` therefore
+refused *every real Telegram direct message* as though it were a group — the
+one surface the whole feature exists for. ``dm`` is the value that actually
+arrives; ``private`` and ``sender`` are kept because they are unambiguously
+one-to-one in Telegram's own vocabulary and cost nothing to accept.
+
+Everything else is refused, including values this plugin has never seen. The
+list is an allowlist, not a denylist, so a chat type introduced by a future
+Hermes cannot quietly become a place to send somebody's exercise.
 
 **The chat is the person.** In a Telegram private chat the chat id *is* the
 user id. Requiring them to be equal is a second, independent check on the same
@@ -56,10 +70,17 @@ from .runtime.errors import LaunchRefused
 CHAT_ID = "HERMES_SESSION_CHAT_ID"
 CHAT_TYPE = "HERMES_SESSION_CHAT_TYPE"
 
-#: What Telegram calls a one-to-one conversation. ``sender`` is the chat type a
-#: Mini App reports when it was launched from an inline context in a private
-#: conversation, and is a private surface too.
-PRIVATE_CHAT_TYPES = frozenset({"private", "sender"})
+#: Every value that means "a one-to-one conversation", and no others.
+#:
+#: - ``dm`` is Hermes' canonical name and the one that actually arrives.
+#: - ``private`` is Telegram's raw value, which Hermes normalises away. Kept for
+#:   a host that has not, and because it is unambiguous.
+#: - ``sender`` is what a Telegram Mini App reports for an inline launch in a
+#:   private conversation. Also unambiguous.
+#:
+#: Deliberately absent: ``group``, ``forum``, ``channel``, ``supergroup``,
+#: ``thread``, and anything else. See the module docstring.
+PRIVATE_CHAT_TYPES = frozenset({"dm", "private", "sender"})
 
 NOT_TELEGRAM = (
     "Opening an exercise needs a Telegram conversation, and this session is not one. "

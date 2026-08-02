@@ -743,3 +743,92 @@ def test_a_failure_after_binding_does_not_leak_identity(tmp_path, monkeypatch):
     # process that means a refusal, never a silent fallback to some default.
     with pytest.raises(IdentityError):
         resolve_principal()
+
+
+# ── The Telegram direct-message contract, as the host actually normalises it ──
+
+
+def test_hermes_normalises_a_private_telegram_chat_to_dm():
+    """The contract the destination check depends on, read from the host.
+
+    This is a claim about somebody else's code, and it was wrong: the plugin
+    accepted only ``private``, while Hermes rewrites that to ``dm`` before the
+    session variables exist — so every real direct message was refused as a
+    group. Asserted against the adapter's source so a change upstream fails
+    here rather than in a learner's chat.
+    """
+    src = _hermes_src()
+    adapter = src / "plugins" / "platforms" / "telegram" / "adapter.py"
+    if not adapter.is_file():
+        pytest.skip("this Hermes checkout has no Telegram adapter")
+
+    body = adapter.read_text(encoding="utf-8")
+
+    assert 'chat_type = "dm"' in body, "Hermes no longer normalises private chats to 'dm'"
+    assert 'if chat_type == "private":' in body
+
+
+def test_every_chat_type_hermes_can_emit_is_classified_by_the_plugin():
+    """No Hermes chat type may be unaccounted for — accepted or refused.
+
+    A value the plugin has never heard of is refused, which is the safe
+    direction; this checks that the *known* ones are each deliberate rather
+    than accidentally falling into the same bucket.
+    """
+    from learning_studio.destination import PRIVATE_CHAT_TYPES
+
+    private = {"dm"}
+    rooms = {"group", "forum", "channel", "thread"}
+
+    assert private <= PRIVATE_CHAT_TYPES
+    assert rooms.isdisjoint(PRIVATE_CHAT_TYPES)
+
+
+def test_the_session_context_carries_the_message_id_consent_depends_on():
+    """Consent evidence is keyed by it, so its absence would fail every launch."""
+    session_context = _load_session_context(_hermes_src())
+
+    assert "HERMES_SESSION_MESSAGE_ID" in session_context._VAR_MAP
+
+
+def test_the_host_exposes_the_hook_consent_evidence_is_captured_through():
+    src = _hermes_src()
+    plugins = _load_module("_hermes_plugins_hooks", src / "hermes_cli" / "plugins.py", src)
+
+    from learning_studio.plugin import CONSENT_EVIDENCE_HOOK
+
+    assert CONSENT_EVIDENCE_HOOK in plugins.VALID_HOOKS
+
+
+def test_the_host_exposes_the_profile_scoped_secret_api():
+    """Reading os.environ under multiplexing is a cross-profile credential leak."""
+    src = _hermes_src()
+    scope = src / "agent" / "secret_scope.py"
+    if not scope.is_file():
+        pytest.skip("this Hermes checkout has no secret scope module")
+
+    body = scope.read_text(encoding="utf-8")
+
+    assert "def get_secret(" in body
+    assert "UnscopedSecretError" in body
+
+
+def test_registration_installs_the_evidence_hook_in_the_real_plugin_context(tmp_path, monkeypatch):
+    """Through Hermes' own PluginContext, not this repository's fake."""
+    src = _hermes_src()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hook-profile"))
+    plugins = _load_module("_hermes_plugins", src / "hermes_cli" / "plugins.py", src)
+
+    manifest = plugins.PluginManifest(name="learning-studio", version="0.1.0")
+    manager = plugins.PluginManager()
+    ctx = plugins.PluginContext(manifest, manager)
+
+    from learning_studio import register
+    from learning_studio.plugin import CONSENT_EVIDENCE_HOOK
+
+    register(ctx)
+
+    installed = manager._hooks.get(CONSENT_EVIDENCE_HOOK, [])
+    assert len(installed) == 1
+    # Observe-only: it returns None so dispatch is unchanged.
+    assert installed[0](event=None) is None

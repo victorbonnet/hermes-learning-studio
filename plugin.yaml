@@ -21,7 +21,12 @@ provides_tools:
   - learning_studio_status
   - learning_studio_results
   - learning_studio_stop
-provides_hooks: []
+# One hook, and it only observes. `pre_gateway_dispatch` fires with the real
+# incoming MessageEvent before the agent runs, which is how launching learns
+# what the learner actually said rather than taking the model's word for it.
+# The callback records and returns None: it never skips or rewrites a message.
+provides_hooks:
+  - pre_gateway_dispatch
 
 # Deliberately empty, even though launching a Mini App needs a Telegram bot
 # token. A non-empty `requires_env` gates the *whole plugin* off when the

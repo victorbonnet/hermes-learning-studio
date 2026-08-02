@@ -216,8 +216,8 @@ def handle_launch(params: Any = None, **_kwargs: Any) -> str:
             principal=principal,
             experience_id=args["experience_id"],
             initiation=args["initiation"],
+            learner_quote=args["learner_quote"],
             learner_confirmed=bool(args.get("learner_confirmed", False)),
-            confirmation_quote=args.get("confirmation_quote"),
         )
 
     return _run(LAUNCH_TOOL_NAME, params, call)

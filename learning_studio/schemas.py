@@ -570,15 +570,30 @@ LAUNCH_SCHEMA: dict[str, Any] = {
         "learning_studio_prepare when someone has asked to practise, revise, be quizzed, or "
         "drill something. The exercise opens in the private Telegram conversation you are "
         "already in - the destination comes from the session, never from you, and there is "
-        "no argument for it. Nothing about how they do will be stored: no score, no attempt, "
-        "no progress record. Only claim an exercise opened if this call succeeds and reports "
-        "button_delivered; if it refuses, run the exercise in conversation instead and say "
-        "that is what you are doing."
+        "no argument for it. You must quote the learner's own words from the message you "
+        "are replying to: the Studio checks that quotation against the message the platform "
+        "actually delivered, so an exercise cannot be opened on words nobody wrote. Nothing "
+        "about how they do will be stored: no score, no attempt, no progress record. Only "
+        "claim an exercise opened if this call succeeds and reports button_delivered; if it "
+        "refuses, run the exercise in conversation instead and say that is what you are "
+        "doing."
     ),
     "parameters": {
         "type": "object",
         "additionalProperties": False,
-        "required": ["experience_id", "initiation"],
+        "required": ["experience_id", "initiation", "learner_quote"],
+        # A suggestion additionally needs the explicit confirmation flag. Stated
+        # in the schema as well as in the handler so a provider that validates
+        # before dispatch refuses the same payloads this code would.
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"initiation": {"const": "agent_suggestion"}},
+                    "required": ["initiation"],
+                },
+                "then": {"required": ["learner_confirmed"]},
+            }
+        ],
         "properties": {
             "experience_id": _EXPERIENCE_ID,
             "initiation": {
@@ -588,25 +603,28 @@ LAUNCH_SCHEMA: dict[str, Any] = {
                     "'learner_request' when they asked to practise, revise, be tested, or "
                     "open the exercise - that request is the agreement, and no second ask is "
                     "needed. 'agent_suggestion' when you proposed it and they had not asked; "
-                    "that needs their explicit yes first."
+                    "that needs their explicit yes first. You are reading what they meant; "
+                    "the words themselves are checked against the real message."
                 ),
             },
             "learner_confirmed": {
                 "type": "boolean",
                 "description": (
-                    "Required with 'agent_suggestion': your assertion that the learner said "
-                    "yes in so many words to this exercise. Nothing here can verify it, so "
-                    "it is a statement you are making, not a check you are passing."
+                    "Required with 'agent_suggestion': your reading that the learner's "
+                    "current message agrees to the exercise you proposed. The words are "
+                    "verified; what they mean is your judgement."
                 ),
             },
-            "confirmation_quote": {
+            "learner_quote": {
                 "type": "string",
                 "minLength": MIN_QUOTE_CHARS,
                 "maxLength": MAX_QUOTE_CHARS,
                 "description": (
-                    "Required with 'agent_suggestion': what the learner actually said when "
-                    "they agreed, in their words. One agreement opens one exercise once; a "
-                    "later launch needs a fresh one."
+                    "A few words copied exactly from the learner's CURRENT message - the "
+                    "one you are replying to. Required for both kinds of launch. The Studio "
+                    "checks the quotation against the message the platform delivered, so it "
+                    "must be their words, not your paraphrase. One message opens one "
+                    "exercise: a later launch needs a newer message."
                 ),
             },
         },

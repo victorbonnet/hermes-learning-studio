@@ -27,7 +27,6 @@ import pytest
 from learning_studio import launch as launch_module
 from learning_studio import service
 from learning_studio.config import LearningStudioConfig
-from learning_studio.consent import ConsentLedger
 from learning_studio.runtime import bootstrap, ownership, state, supervisor
 from learning_studio.runtime import grants as grants_module
 from learning_studio.sessions import SessionStore
@@ -90,14 +89,45 @@ def config() -> LearningStudioConfig:
     )
 
 
+#: What the learner actually typed, and the words the agent quotes back.
+LEARNER_MESSAGE = "can you quiz me on photosynthesis"
+LEARNER_QUOTE = "quiz me on photosynthesis"
+
+
 @pytest.fixture
-def learner_session(monkeypatch):
-    """The private Telegram conversation the learner is speaking in."""
+def learner_session(monkeypatch, clock):
+    """The private Telegram conversation, and the message that started the turn.
+
+    ``chat_type`` is ``dm`` because that is what Hermes actually binds — it
+    normalises Telegram's ``private`` before the session variables exist.
+
+    The message is recorded through the same store the ``pre_gateway_dispatch``
+    hook writes to, so a launch here is authorised the way a real one is:
+    against words the platform delivered, not against the model's account.
+    """
+    from learning_studio.evidence import EvidenceKey, EvidenceStore
+
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", USER_ID)
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", USER_ID)
-    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "private")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "9001")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", USER_ID)
+
+    store = EvidenceStore(clock=clock)
+    store.record(
+        EvidenceKey(
+            profile="default",
+            platform="telegram",
+            chat_id=USER_ID,
+            thread_id="",
+            user_id=USER_ID,
+            message_id="9001",
+        ),
+        LEARNER_MESSAGE,
+    )
+    monkeypatch.setattr("learning_studio.consent.STORE", store)
+    return store
 
 
 @pytest.fixture
@@ -255,9 +285,9 @@ def test_a_learner_asks_to_practise_and_gets_a_working_exercise(
         principal=principal,
         experience_id=experience_id,
         initiation="learner_request",
+        learner_quote=LEARNER_QUOTE,
         config=config,
         deliver=telegram,
-        ledger=ConsentLedger(clock=clock),
     )
     assert launched["button_delivered"] is True
     assert len(telegram.messages) == 1
@@ -323,9 +353,9 @@ def test_the_agent_is_never_told_what_the_learner_wrote(
         principal=principal,
         experience_id=experience_id,
         initiation="learner_request",
+        learner_quote=LEARNER_QUOTE,
         config=config,
         deliver=Telegram(),
-        ledger=ConsentLedger(clock=clock),
     )
 
     token = webview.post(
@@ -399,9 +429,9 @@ def test_a_revoked_launch_cannot_be_opened(
             principal=principal,
             experience_id=experience_id,
             initiation="learner_request",
+            learner_quote=LEARNER_QUOTE,
             config=config,
             deliver=_failing_telegram,
-            ledger=ConsentLedger(clock=clock),
         )
 
     refused = webview.post("/api/session", headers=auth(), json={"experience_id": experience_id})
@@ -425,9 +455,9 @@ def test_another_account_cannot_use_this_learners_launch(
         principal=principal,
         experience_id=experience_id,
         initiation="learner_request",
+        learner_quote=LEARNER_QUOTE,
         config=config,
         deliver=Telegram(),
-        ledger=ConsentLedger(clock=clock),
     )
 
     intruder = webview.post(

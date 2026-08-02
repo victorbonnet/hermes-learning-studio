@@ -74,6 +74,42 @@ def skill_path(name: str = SKILL_NAME) -> Path:
     return SKILLS_DIR / name / "SKILL.md"
 
 
+#: Fired by the gateway with the real incoming ``MessageEvent``, before the
+#: agent runs. It is how launching learns what the learner actually said.
+CONSENT_EVIDENCE_HOOK = "pre_gateway_dispatch"
+
+
+def _register_consent_evidence(ctx: Any) -> None:
+    """Ask the host to show us each incoming message before the model sees it.
+
+    The hook only *records*: it never skips a message, never rewrites one, and
+    returns ``None`` so dispatch continues exactly as it would have.
+
+    Wrapped in a guard because registration must not raise. A Hermes without
+    this hook — or with a different registration surface — should cost the
+    profile its ability to *launch*, which then refuses with an explanation,
+    not its ability to use the plugin at all.
+    """
+    register_hook = getattr(ctx, "register_hook", None)
+    if not callable(register_hook):  # pragma: no cover - every current host has it
+        logger.warning(
+            "this Hermes exposes no %s hook, so the Learning Studio cannot confirm what a "
+            "learner asked for and will refuse to open exercises",
+            CONSENT_EVIDENCE_HOOK,
+        )
+        return
+    try:
+        from .evidence import capture_message_evidence
+
+        register_hook(CONSENT_EVIDENCE_HOOK, capture_message_evidence)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "the Learning Studio could not register %s (%s); launching will refuse",
+            CONSENT_EVIDENCE_HOOK,
+            type(exc).__name__,
+        )
+
+
 def register(ctx: Any) -> None:
     """Register this plugin's surface with Hermes.
 
@@ -84,6 +120,8 @@ def register(ctx: Any) -> None:
     path = skill_path()
     ctx.register_skill(SKILL_NAME, path, _SKILL_DESCRIPTION)
     logger.debug("Registered skill %s:%s from %s", PLUGIN_NAME, SKILL_NAME, path)
+
+    _register_consent_evidence(ctx)
 
     # Imported here rather than at module scope so that a syntax or import
     # error in the tool layer cannot stop the skill from registering.
