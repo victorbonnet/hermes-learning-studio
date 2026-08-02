@@ -19,6 +19,7 @@ import pytest
 
 from learning_studio import service
 from learning_studio.config import LearningStudioConfig
+from learning_studio.responses import INVALID_RESPONSE_MESSAGE
 from learning_studio.sessions import SessionStore
 from learning_studio.web.app import (
     INIT_DATA_HEADER,
@@ -28,6 +29,7 @@ from learning_studio.web.app import (
 from learning_studio.web.dependencies import Dependencies
 from tests.component_examples import CANARY, all_canaries, example, manifest
 from tests.init_data import BOT_TOKEN, OTHER_USER_ID, USER_ID, build_init_data
+from tests.served_responses import response_for
 
 NOW = 1_800_000_000
 
@@ -78,6 +80,12 @@ def deps(hermes_home, clock, config, allowlist) -> Dependencies:
         ),
         load_asset=lambda principal, asset_id: service.read_managed_asset(
             principal=principal, asset_id=asset_id, config=config
+        ),
+        component_aliases=lambda principal, experience_id, component_key: service.component_aliases(
+            principal=principal,
+            experience_id=experience_id,
+            component_key=component_key,
+            config=config,
         ),
     )
 
@@ -242,7 +250,15 @@ def test_a_full_exercise_can_be_served_and_answered(client, experience_id):
 
         answered = client.post(
             "/api/session/answer",
-            json={"component_id": component_id, "response": "an answer"},
+            json={
+                "component_id": component_id,
+                # Built from the component *as served*, aliased identifiers and
+                # all — which is the only response a real client could produce.
+                "response": response_for(
+                    current["component"]["type"],
+                    current["component"]["payload"].get("content", {}),
+                ),
+            },
             headers=session_headers(token),
         )
         assert answered.status_code == 200, answered.text
@@ -991,3 +1007,844 @@ def test_a_tampered_asset_is_not_served(client, hermes_home, principal, config):
     response = client.get(f"/api/assets/{asset_id}", headers=session_headers(token))
 
     assert response.status_code == 404
+
+
+# ── The response contract, at the route ───────────────────────────────────
+
+
+def test_a_missing_response_no_longer_advances_the_exercise(client, experience_id):
+    """The reported defect, exactly as reported.
+
+    `{"component_id": "q-one"}` carries no answer at all, and used to be recorded
+    as one — because the only check was that the body was bounded JSON.
+    """
+    token, _ = open_session(client, experience_id)
+
+    response = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one"},
+        headers=session_headers(token),
+    )
+
+    assert response.status_code == 400
+    still_here = client.get("/api/session/component", headers=session_headers(token)).json()
+    assert still_here["component"]["component_id"] == "q-one"
+    assert still_here["progress"] == {
+        "position": 0,
+        "component_count": 3,
+        "answered": 0,
+        "completed": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "response_value",
+    [None, "an answer", 42, [], {"value": "true"}, {"wrong_field": True}, {}],
+)
+def test_a_response_that_does_not_fit_its_component_is_refused(
+    client, experience_id, response_value
+):
+    token, _ = open_session(client, experience_id)
+
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": response_value},
+        headers=session_headers(token),
+    )
+
+    assert refused.status_code == 400
+    assert (
+        client.get("/api/session/component", headers=session_headers(token)).json()["progress"][
+            "answered"
+        ]
+        == 0
+    )
+
+
+def test_a_refused_response_is_not_recorded_anywhere(client, experience_id):
+    """State moves only after the contract is satisfied."""
+    token, _ = open_session(client, experience_id)
+
+    client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": "invented"}},
+        headers=session_headers(token),
+    )
+    result = client.get("/api/session/result", headers=session_headers(token)).json()
+
+    assert result["answered_components"] == []
+    assert result["progress"]["answered"] == 0
+
+
+def test_the_refusal_says_nothing_about_what_was_submitted(client, experience_id):
+    token, _ = open_session(client, experience_id)
+
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": "a-distinctive-guess"}},
+        headers=session_headers(token),
+    )
+
+    assert "a-distinctive-guess" not in refused.text
+
+
+def test_a_response_naming_a_canonical_identifier_is_refused(client, experience_id, config):
+    """A client may name only the identifiers it was served.
+
+    The canonical option ids never reach a learner, so one arriving in a request
+    came from somewhere else — and it is refused for the same reason an invented
+    one is.
+    """
+    from tests.component_examples import example
+
+    canonical = example("multiple_choice")["content"]["options"][0]["id"]
+    token, _ = open_session(client, experience_id)
+
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": canonical}},
+        headers=session_headers(token),
+    )
+
+    assert refused.status_code == 400
+
+
+def test_a_served_alias_is_accepted_and_stored_canonically(client, experience_id, deps):
+    """The round trip: alias out, canonical in."""
+    from tests.component_examples import example
+
+    token, _ = open_session(client, experience_id)
+    current = client.get("/api/session/component", headers=session_headers(token)).json()
+    served = current["component"]["payload"]["content"]["options"]
+    canonical_ids = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+
+    assert not {entry["id"] for entry in served} & canonical_ids
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served[0]["id"]}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+    stored = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+    assert stored["option_id"] in canonical_ids
+
+
+def test_the_alias_mapping_is_never_served_to_a_client(client, experience_id):
+    token, opened = open_session(client, experience_id)
+    bodies = [
+        json.dumps(opened),
+        client.get("/api/session/component", headers=session_headers(token)).text,
+        client.get("/api/session/result", headers=session_headers(token)).text,
+    ]
+
+    for body in bodies:
+        assert "aliases" not in body
+
+
+def test_a_card_the_client_cannot_draw_may_still_be_skipped(client, experience_id):
+    token, _ = open_session(client, experience_id)
+
+    skipped = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"skipped": True}},
+        headers=session_headers(token),
+    )
+
+    assert skipped.status_code == 200
+
+
+# ── Alias resolution, through the real route ──────────────────────────────
+#
+# Every rejection below is checked for *state neutrality*: a refused submission
+# must leave the position, the answered count, the stored answers, the completion
+# flag and the reveal state exactly as they were. A contract that refuses the
+# response but advances the exercise is not a contract.
+
+
+def session_state(deps):
+    """Everything a refused submission must not change."""
+    session = next(iter(deps.sessions._sessions.values()))
+    return {
+        "position": session.position,
+        "answered": len(session.answers),
+        "answers": dict(session.answers),
+        "completed": session.completed,
+        "completed_at": session.completed_at,
+        "revealed": dict(session.revealed),
+    }
+
+
+def assert_refused_and_unchanged(client, deps, token, response_value, before):
+    """Submit, expect the generic refusal, and prove nothing moved."""
+    refused = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": response_value},
+        headers=session_headers(token),
+    )
+
+    assert refused.status_code == 400
+    body = refused.json()
+    assert body["error"] == INVALID_RESPONSE_MESSAGE
+    # The message says nothing about which state failed, or about any identifier.
+    assert "alias" not in refused.text.lower()
+    assert session_state(deps) == before
+    return refused
+
+
+def alias_state(state, mapping=None):
+    from learning_studio.service import ComponentAliases
+
+    return lambda *_: ComponentAliases(state, dict(mapping or {}))
+
+
+def served_option(client, token) -> str:
+    current = client.get("/api/session/component", headers=session_headers(token)).json()
+    return current["component"]["payload"]["content"]["options"][0]["id"]
+
+
+def set_binding_marker(config, experience_id: str, scheme: int) -> None:
+    """Model the provenance marker migration 9 would have written for an old row."""
+    from learning_studio import storage
+
+    with storage.connect(config) as conn:
+        conn.execute(
+            "UPDATE experience_component_alias_bindings"
+            " SET binding_scheme = ?, binding_digest = NULL"
+            " WHERE experience_id = ?",
+            (scheme, experience_id),
+        )
+
+
+def test_a_current_scheme_with_a_complete_mapping_resolves(client, deps, experience_id):
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+    canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+    stored = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+    assert stored["option_id"] in canonical
+
+
+@pytest.mark.parametrize("damage", ["swap-targets", "rewrite-targets-and-inventory"])
+def test_a_mapping_without_its_original_binding_is_refused_and_changes_nothing(
+    client, deps, hermes_home, principal, config, damage
+):
+    """A target set is not the exact alias-to-canonical correspondence."""
+    from learning_studio import storage
+
+    experience_id = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("multiple_choice", id="q-one")]),
+        config=config,
+    )["experience_id"]
+
+    with storage.connect(config) as conn:
+        row = conn.execute(
+            "SELECT e.component_id, e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ? AND c.component_key = ?",
+            (experience_id, "q-one"),
+        ).fetchone()
+        evaluator = json.loads(row["evaluation"])
+        aliases = list(evaluator["aliases"])
+        if damage == "swap-targets":
+            first, second = aliases[:2]
+            evaluator["aliases"][first], evaluator["aliases"][second] = (
+                evaluator["aliases"][second],
+                evaluator["aliases"][first],
+            )
+        else:
+            invented = [f"invented-{index}" for index in range(1, len(aliases) + 1)]
+            evaluator["aliases"] = dict(zip(aliases, invented, strict=True))
+            evaluator["canonical_identifiers"] = invented
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(evaluator), row["component_id"]),
+        )
+
+    token, _ = open_session(client, experience_id)
+    before = session_state(deps)
+    assert_refused_and_unchanged(client, deps, token, {"option_id": aliases[0]}, before)
+
+
+def test_a_previous_head_record_still_resolves_through_the_route(
+    client, deps, hermes_home, principal, config
+):
+    """The explicit mapping-only compatibility path remains operational."""
+    from learning_studio import storage
+
+    experience_id = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("multiple_choice", id="q-one")]),
+        config=config,
+    )["experience_id"]
+
+    with storage.connect(config) as conn:
+        row = conn.execute(
+            "SELECT e.component_id, e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ? AND c.component_key = ?",
+            (experience_id, "q-one"),
+        ).fetchone()
+        stored = json.loads(row["evaluation"])
+        # Exactly what c71466f wrote: a mapping, no scheme number, and no
+        # canonical inventory — that field did not exist yet either.
+        del stored["alias_scheme"]
+        del stored["canonical_identifiers"]
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(stored), row["component_id"]),
+        )
+    set_binding_marker(config, experience_id, 1)
+
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+    canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+    assert served not in canonical, "the payload under test is not aliased"
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+    stored_answer = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+    assert stored_answer["option_id"] in canonical
+    assert stored_answer["option_id"] != served
+
+
+@pytest.mark.parametrize(
+    "state_name",
+    ["aliased-empty-mapping", "aliased-incomplete-mapping", "unresolved"],
+)
+def test_an_unresolvable_identifier_is_refused_and_changes_nothing(
+    client, deps, experience_id, state_name
+):
+    from learning_studio.service import AliasState
+
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+    real = deps.component_aliases(deps.principal(USER_ID), experience_id, "q-one")
+
+    states = {
+        "aliased-empty-mapping": alias_state(AliasState.ALIASED, {}),
+        "aliased-incomplete-mapping": alias_state(
+            AliasState.ALIASED,
+            {a: c for a, c in real.mapping.items() if a != served},
+        ),
+        "unresolved": alias_state(AliasState.UNRESOLVED),
+    }
+    object.__setattr__(deps, "component_aliases", states[state_name])
+    before = session_state(deps)
+
+    refused = assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+    assert served not in refused.text
+
+
+def test_a_missing_evaluator_row_fails_closed(client, deps, hermes_home, principal, config):
+    """Deleting the row is not evidence that the payload is canonical."""
+    from learning_studio import storage
+
+    experience_id = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("multiple_choice", id="q-one")]),
+        config=config,
+    )["experience_id"]
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+
+    with storage.connect(config) as conn:
+        conn.execute("DELETE FROM experience_component_evaluations")
+
+    before = session_state(deps)
+    assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param({"alias_scheme": "1"}, id="malformed-scheme"),
+        pytest.param({"alias_scheme": 99}, id="unsupported-future-scheme"),
+        pytest.param({"aliases": "not-a-mapping"}, id="malformed-aliases"),
+    ],
+)
+def test_a_damaged_alias_record_fails_closed(client, deps, hermes_home, principal, config, damage):
+    from learning_studio import storage
+
+    experience_id = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("multiple_choice", id="q-one")]),
+        config=config,
+    )["experience_id"]
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+
+    with storage.connect(config) as conn:
+        row = conn.execute(
+            "SELECT component_id, evaluation FROM experience_component_evaluations"
+        ).fetchone()
+        stored = {**json.loads(row["evaluation"]), **damage}
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(stored), row["component_id"]),
+        )
+
+    before = session_state(deps)
+    assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+
+def test_a_genuinely_pre_alias_component_still_works(client, deps, experience_id):
+    """Canonical identifiers, positively identified, still accepted."""
+    from learning_studio.service import AliasState
+
+    token, _ = open_session(client, experience_id)
+    canonical = example("multiple_choice")["content"]["options"][0]["id"]
+
+    object.__setattr__(deps, "component_aliases", alias_state(AliasState.CANONICAL))
+    object.__setattr__(
+        deps,
+        "load_experience",
+        lambda principal, experience: _legacy_bundle(deps, principal, experience),
+    )
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": canonical}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+
+
+def test_an_alias_belonging_to_another_component_is_refused(
+    client, deps, hermes_home, principal, config
+):
+    """A valid alias, from the wrong card. Aliases are per component."""
+    experience_id = service.prepare_experience(
+        principal=principal,
+        manifest=manifest(
+            [example("multiple_choice", id="q-one"), example("multiple_choice", id="q-two")]
+        ),
+        config=config,
+    )["experience_id"]
+    token, _ = open_session(client, experience_id)
+
+    other = deps.component_aliases(deps.principal(USER_ID), experience_id, "q-two")
+    borrowed = next(iter(other.mapping))
+    before = session_state(deps)
+
+    assert_refused_and_unchanged(client, deps, token, {"option_id": borrowed}, before)
+
+
+def test_no_refusal_reveals_whether_the_evaluator_row_exists(
+    client, deps, hermes_home, principal, config
+):
+    """A missing row, a damaged one and an incomplete map are one message."""
+    from learning_studio.service import AliasState
+
+    token, _ = open_session(client, _prepared(principal, config))
+    served = served_option(client, token)
+
+    bodies = set()
+    for state in (AliasState.UNRESOLVED, AliasState.ALIASED):
+        object.__setattr__(deps, "component_aliases", alias_state(state, {}))
+        bodies.add(
+            client.post(
+                "/api/session/answer",
+                json={"component_id": "q-one", "response": {"option_id": served}},
+                headers=session_headers(token),
+            ).text
+        )
+
+    assert len(bodies) == 1, "the refusal distinguishes one alias state from another"
+
+
+def _prepared(principal, config) -> str:
+    return service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("multiple_choice", id="q-one")]),
+        config=config,
+    )["experience_id"]
+
+
+def _legacy_bundle(deps, principal, experience_id):
+    """A delivery bundle whose components carry canonical identifiers.
+
+    What a stored experience looked like before identifiers were aliased.
+    """
+    bundle = service.delivery_bundle(
+        principal=principal, experience_id=experience_id, config=deps.config
+    )
+    for component in bundle.experience["components"]:
+        if component["type"] == "multiple_choice":
+            component["payload"]["content"] = example("multiple_choice")["content"]
+    return bundle
+
+
+@pytest.mark.parametrize(
+    "corrupt_value",
+    [
+        pytest.param(None, id="null"),
+        pytest.param(42, id="integer"),
+        pytest.param(True, id="boolean"),
+        pytest.param({"nested": "bad"}, id="object"),
+    ],
+)
+def test_a_malformed_alias_value_is_refused_and_changes_nothing(
+    client, deps, hermes_home, principal, config, corrupt_value
+):
+    """The reported probe: these returned 200 and recorded the coerced value.
+
+    `str(canonical)` made each of them identifier-shaped — `"None"`, `"42"`,
+    `"True"`, a `repr` — and the session advanced with a stored answer naming
+    nothing in the answer key.
+    """
+    from learning_studio import storage
+
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+
+    with storage.connect(config) as conn:
+        row = conn.execute(
+            "SELECT component_id, evaluation FROM experience_component_evaluations"
+        ).fetchone()
+        stored = json.loads(row["evaluation"])
+        stored["aliases"][next(iter(stored["aliases"]))] = corrupt_value
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(stored), row["component_id"]),
+        )
+
+    before = session_state(deps)
+    refused = assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+    # And nothing about the damage is described to the caller.
+    for leaked in ("None", "42", "True", "nested"):
+        assert leaked not in refused.json()["error"]
+
+
+@pytest.mark.parametrize("damage", ["absent", "null"])
+def test_absent_legacy_scheme_resolves_but_explicit_null_is_refused(
+    client, deps, hermes_home, principal, config, damage
+):
+    """Absence is the compatibility format; explicit null is damaged."""
+    from learning_studio import storage
+
+    experience_id = _prepared(principal, config)
+    with storage.connect(config) as conn:
+        row = conn.execute(
+            "SELECT e.component_id, e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ?",
+            (experience_id,),
+        ).fetchone()
+        stored = json.loads(row["evaluation"])
+        if damage == "absent":
+            stored.pop("alias_scheme")
+            stored.pop("canonical_identifiers")
+        else:
+            stored["alias_scheme"] = None
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(stored), row["component_id"]),
+        )
+    set_binding_marker(config, experience_id, 1)
+
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+    if damage == "absent":
+        accepted = client.post(
+            "/api/session/answer",
+            json={"component_id": "q-one", "response": {"option_id": served}},
+            headers=session_headers(token),
+        )
+        canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+        assert accepted.status_code == 200
+        answer = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+        assert answer["option_id"] in canonical
+    else:
+        before = session_state(deps)
+        assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+
+# ── Alias integrity, through the real route with real stored damage ───────
+#
+# Nothing here mocks `component_aliases`. Each test corrupts the stored evaluator
+# record the way a bug or a tampered database would, then drives the real API —
+# because the defect being closed was precisely that a syntactically valid record
+# sailed through every layer.
+
+
+def _damage_stored_component(config, experience_id: str, change, component_key: str = "q-one"):
+    from learning_studio import storage
+
+    with storage.connect(config) as conn:
+        row = conn.execute(
+            "SELECT e.component_id, e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ? AND c.component_key = ?",
+            (experience_id, component_key),
+        ).fetchone()
+        stored = json.loads(row["evaluation"])
+        change(stored)
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(stored), row["component_id"]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "change"),
+    [
+        pytest.param(
+            "unknown-target",
+            lambda stored: stored.__setitem__(
+                "aliases", {alias: "unknown" for alias in stored["aliases"]}
+            ),
+            id="every-target-unknown",
+        ),
+        pytest.param(
+            "one-unknown-target",
+            lambda stored: stored["aliases"].__setitem__(next(iter(stored["aliases"])), "unknown"),
+            id="one-target-unknown",
+        ),
+        pytest.param(
+            "duplicate-target",
+            lambda stored: stored.__setitem__(
+                "aliases",
+                {alias: next(iter(stored["aliases"].values())) for alias in stored["aliases"]},
+            ),
+            id="every-alias-one-target",
+        ),
+        pytest.param(
+            "missing-key",
+            lambda stored: stored["aliases"].pop(next(iter(stored["aliases"]))),
+            id="mapping-missing-a-served-alias",
+        ),
+        pytest.param(
+            "extra-key",
+            lambda stored: stored["aliases"].__setitem__("xdeadbeefdeadbeef", "matrix"),
+            id="mapping-has-an-unserved-alias",
+        ),
+        pytest.param(
+            "mismatched-inventory",
+            lambda stored: stored["canonical_identifiers"].append("extra"),
+            id="inventory-does-not-match",
+        ),
+        pytest.param(
+            "inventory-removed",
+            lambda stored: stored.pop("canonical_identifiers"),
+            id="scheme-3-without-an-inventory",
+        ),
+        pytest.param(
+            "alias-markers-stripped",
+            lambda stored: [
+                stored.pop(key, None)
+                for key in ("aliases", "alias_scheme", "canonical_identifiers")
+            ],
+            id="scheme-3-cannot-downgrade-to-canonical",
+        ),
+    ],
+)
+def test_a_corrupt_alias_record_is_refused_through_the_real_route(
+    client, deps, hermes_home, principal, config, name: str, change
+):
+    """The reported reproductions, and every neighbouring shape.
+
+    Both reported probes returned HTTP 200, recorded the value, and advanced the
+    session. Each must now be a state-neutral 400.
+    """
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+
+    _damage_stored_component(config, experience_id, change)
+    before = session_state(deps)
+
+    refused = assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+    # Nothing about the component or the damage is described to the caller.
+    for leaked in ("unknown", "canonical", "alias", "matrix", "cytosol", served):
+        assert leaked not in refused.json()["error"]
+
+
+def test_a_cross_component_mapping_is_refused_through_the_real_route(
+    client, deps, hermes_home, principal, config
+):
+    """A mapping that is valid — for the other card in the same experience."""
+    from learning_studio import storage
+
+    experience_id = service.prepare_experience(
+        principal=principal,
+        manifest=manifest(
+            [example("multiple_choice", id="q-one"), example("multi_select", id="q-two")]
+        ),
+        config=config,
+    )["experience_id"]
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+
+    with storage.connect(config) as conn:
+        other = json.loads(
+            conn.execute(
+                "SELECT e.evaluation FROM experience_components AS c"
+                "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+                " WHERE c.experience_id = ? AND c.component_key = ?",
+                (experience_id, "q-two"),
+            ).fetchone()["evaluation"]
+        )
+
+    _damage_stored_component(
+        config,
+        experience_id,
+        lambda stored: stored.update(
+            aliases=other["aliases"], canonical_identifiers=other["canonical_identifiers"]
+        ),
+    )
+    before = session_state(deps)
+
+    assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+
+def test_a_valid_current_mapping_still_resolves_through_the_real_route(
+    client, deps, hermes_home, principal, config
+):
+    """The mirror. Proving integrity must not make the ordinary case fail."""
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+    canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"option_id": served}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+    assert next(iter(deps.sessions._sessions.values())).answers["q-one"]["option_id"] in canonical
+
+
+@pytest.mark.parametrize("legacy_scheme", [1, 2])
+def test_legacy_mapping_only_resolves_but_inventory_only_fails_closed(
+    client, deps, hermes_home, principal, config, legacy_scheme
+):
+    """Preserve explicit scheme-1 compatibility without trusting scheme 2."""
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+    served = served_option(client, token)
+
+    def to_legacy_scheme(stored: dict) -> None:
+        stored["alias_scheme"] = legacy_scheme
+        if legacy_scheme == 1:
+            del stored["canonical_identifiers"]
+
+    _damage_stored_component(config, experience_id, to_legacy_scheme)
+    set_binding_marker(config, experience_id, legacy_scheme)
+
+    if legacy_scheme == 1:
+        accepted = client.post(
+            "/api/session/answer",
+            json={"component_id": "q-one", "response": {"option_id": served}},
+            headers=session_headers(token),
+        )
+        canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
+        assert accepted.status_code == 200
+        answer = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+        assert answer["option_id"] in canonical
+    else:
+        before = session_state(deps)
+        assert_refused_and_unchanged(client, deps, token, {"option_id": served}, before)
+
+
+def test_a_corrupt_record_does_not_block_an_identifier_free_response(
+    client, deps, hermes_home, principal, config
+):
+    """A response naming no identifier needs no mapping, and never did.
+
+    `true_false` submits a bare boolean and `{"skipped": true}` names nothing, so
+    failing closed on alias resolution must not make those unanswerable — the
+    resolver is only ever reached for an identifier that needs translating.
+    """
+    experience_id = service.prepare_experience(
+        principal=principal,
+        manifest=manifest([example("true_false", id="q-one")]),
+        config=config,
+    )["experience_id"]
+    token, _ = open_session(client, experience_id)
+
+    _damage_stored_component(
+        config, experience_id, lambda stored: stored.__setitem__("aliases", {"bogus": "x"})
+    )
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"value": True}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+
+
+def test_a_skip_is_accepted_whatever_the_alias_record_says(
+    client, deps, hermes_home, principal, config
+):
+    experience_id = _prepared(principal, config)
+    token, _ = open_session(client, experience_id)
+
+    _damage_stored_component(
+        config, experience_id, lambda stored: stored.__setitem__("aliases", {"bogus": "x"})
+    )
+
+    accepted = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-one", "response": {"skipped": True}},
+        headers=session_headers(token),
+    )
+
+    assert accepted.status_code == 200
+
+
+def test_every_corrupt_state_produces_one_indistinguishable_refusal(
+    client, deps, hermes_home, principal, config
+):
+    """A learner must not be able to tell which invariant failed."""
+    bodies = set()
+    statuses = set()
+
+    for change in (
+        lambda stored: stored.__setitem__(
+            "aliases", {alias: "unknown" for alias in stored["aliases"]}
+        ),
+        lambda stored: stored["aliases"].pop(next(iter(stored["aliases"]))),
+        lambda stored: stored.pop("canonical_identifiers"),
+        lambda stored: stored.pop("aliases"),
+    ):
+        experience_id = _prepared(principal, config)
+        token, _ = open_session(client, experience_id)
+        served = served_option(client, token)
+        _damage_stored_component(config, experience_id, change)
+        refused = client.post(
+            "/api/session/answer",
+            json={"component_id": "q-one", "response": {"option_id": served}},
+            headers=session_headers(token),
+        )
+        statuses.add(refused.status_code)
+        bodies.add(refused.text)
+
+    assert statuses == {400}
+    assert len(bodies) == 1, "the refusal distinguishes one damaged state from another"

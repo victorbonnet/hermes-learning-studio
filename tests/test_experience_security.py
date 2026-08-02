@@ -425,6 +425,10 @@ def test_the_new_modules_import_only_the_standard_library_and_this_package():
         "typing",
         "json",
         "re",
+        # Ordering cards are shuffled with `secrets.SystemRandom` so the
+        # arrangement cannot be predicted or seeded from elsewhere in the process.
+        # Standard library, so it adds nothing to a user's environment.
+        "secrets",
         "unicodedata",
         "learning_studio",
         "",

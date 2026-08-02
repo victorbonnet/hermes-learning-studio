@@ -10,12 +10,13 @@ An exercise is a description of *what to ask and how to judge the answer*. It
 is never an implementation of how to draw that on a screen.
 
 **Never write, generate, or emit HTML, JavaScript, CSS, or any other frontend
-code as the delivery mechanism for an exercise** — no renderer, no widget, no
-interactive page, not even "just to show what it would look like". Rendering is
-the runtime's job. Agent-authored UI code is unreviewable, unauditable,
-inaccessible by default, and impossible to score consistently. If you are
-writing a `<div>` so the learner can *interact* with it, you have left the
-contract.
+code as the delivery mechanism for an exercise** — no hand-rolled widget, no
+interactive page, not even "just to show what it would look like". Rendering
+belongs to the trusted renderer that ships with this plugin, which is trusted
+*because* the only thing it displays is validated, inert data from the registry.
+Agent-authored UI code is unreviewable, unauditable, inaccessible by default, and
+impossible to score consistently. If you are writing a `<div>` so the learner can
+*interact* with it, you have left the contract.
 
 The same goes for scoring: express the answer key as data. Do not emit a
 snippet of code that computes the score.
@@ -53,10 +54,15 @@ Write mathematical comparisons with spaces: `a < b`, not `a<b`.
 function, a SQL query, or a regex goes in `content.starter_code`,
 `answer.reference_solution`, or a prompt exactly as you would write it, and is
 never executed — `code_response` compares code as text. But because markup is
-refused everywhere, **you cannot teach HTML, CSS, or JavaScript syntax through
-a stored manifest in this release**. Run those sessions in conversation
-instead. Lifting the restriction needs a renderer that can prove it escapes
-what it displays, and there is no renderer yet.
+refused everywhere, **you cannot teach HTML, CSS, or JavaScript syntax through a
+stored manifest in this release**. Run those sessions in conversation instead.
+
+The renderer does now escape everything it displays — it writes text with
+`textContent` and builds elements one at a time, so a stored `<div>` would appear
+as those five characters. The restriction stays anyway: it is enforced in the
+*store*, which is the layer that cannot be replaced by a client with different
+ideas, and relaxing it would mean trusting every future consumer of a manifest to
+be as careful.
 
 ## Calling the tool
 

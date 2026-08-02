@@ -742,6 +742,73 @@ _MIGRATION_008 = (
 )
 
 
+# Version 9 records alias provenance for every evaluator row outside the mutable
+# evaluator JSON. Scheme 3 rows carry a digest binding the complete alias ->
+# canonical mapping to the component, learner projection, owner and experience.
+# Older rows receive explicit migration markers instead: scheme 1/unversioned
+# keeps its documented compatibility semantics, scheme 2 remains fail-closed,
+# and genuinely pre-alias evaluator rows are marked canonical. Requiring that
+# separate marker prevents a current record from being downgraded by stripping
+# its alias fields.
+_MIGRATION_009 = (
+    """
+    CREATE TABLE experience_component_alias_bindings (
+        component_id   TEXT PRIMARY KEY,
+        experience_id  TEXT NOT NULL,
+        learner_id     TEXT NOT NULL,
+        profile_id     TEXT NOT NULL,
+        binding_scheme INTEGER NOT NULL CHECK (binding_scheme BETWEEN 0 AND 3),
+        binding_digest TEXT,
+        created_at     TEXT NOT NULL,
+        CHECK (
+            (
+                binding_scheme = 3
+                AND binding_digest IS NOT NULL
+                AND length(binding_digest) = 64
+                AND binding_digest NOT GLOB '*[^0-9a-f]*'
+            )
+            OR (
+                binding_scheme IN (0, 1, 2)
+                AND binding_digest IS NULL
+            )
+        ),
+        FOREIGN KEY (component_id, experience_id, profile_id, learner_id)
+            REFERENCES experience_components (id, experience_id, profile_id, learner_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    INSERT INTO experience_component_alias_bindings
+        (component_id, experience_id, learner_id, profile_id,
+         binding_scheme, binding_digest, created_at)
+    SELECT
+        e.component_id,
+        e.experience_id,
+        e.learner_id,
+        e.profile_id,
+        CASE
+            WHEN json_valid(e.evaluation) = 0 THEN 0
+            WHEN json_type(e.evaluation, '$.aliases') = 'object' THEN
+                CASE
+                    WHEN json_type(e.evaluation, '$.alias_scheme') = 'integer'
+                         AND json_extract(e.evaluation, '$.alias_scheme') = 2
+                    THEN 2
+                    ELSE 1
+                END
+            ELSE 0
+        END,
+        NULL,
+        e.created_at
+    FROM experience_component_evaluations AS e
+    """,
+    """
+    CREATE INDEX idx_experience_alias_bindings_owner
+        ON experience_component_alias_bindings
+           (profile_id, learner_id, experience_id)
+    """,
+)
+
+
 #: Ordered, contiguous from 1. The list order is the application order.
 MIGRATIONS: list[Migration] = [
     Migration(version=1, statements=_MIGRATION_001),
@@ -752,6 +819,7 @@ MIGRATIONS: list[Migration] = [
     Migration(version=6, statements=_MIGRATION_006),
     Migration(version=7, statements=_MIGRATION_007),
     Migration(version=8, statements=_MIGRATION_008),
+    Migration(version=9, statements=_MIGRATION_009),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

@@ -13,13 +13,16 @@ repetition.
 >
 > There is now a **secure API** behind the optional `web` extra: a
 > Telegram-authenticated FastAPI service that serves a stored exercise to its
-> owner and collects their responses. See
-> [Telegram Mini App API](#telegram-mini-app-api).
+> owner and collects their responses, plus the **Telegram Mini App** that renders
+> it — all thirty-one component types, keyboard-operable, in three interface
+> languages. See [Telegram Mini App API](#telegram-mini-app-api) and
+> [The Mini App interface](#the-mini-app-interface).
 >
-> There is still **no delivery runtime**: no card renderer, no Mini App
-> frontend, no scoring engine, no scheduler, and nothing that starts a server
-> or opens a tunnel. Responses collected by the API live in the session and are
-> not marked or persisted. See [Roadmap](#roadmap) for what is still to come.
+> What is still missing is the **runtime around it**: no scoring engine, no
+> scheduler, and nothing that starts a server or opens a tunnel, so nothing
+> launches the Mini App yet. Responses collected by the API live in the session
+> and are not marked or persisted. See [Roadmap](#roadmap) for what is still to
+> come.
 
 ## Install
 
@@ -145,7 +148,14 @@ installable **Python package**, which drives the layout:
 │   ├── web/                    # Optional `web` extra — nothing else imports it
 │   │   ├── dependencies.py     # The single injection point
 │   │   ├── security.py         # Headers, body limits, rate limits, redaction
-│   │   └── app.py              # The protected API
+│   │   ├── static_files.py     # The static allowlist and the document policy
+│   │   ├── app.py              # The protected API and the shell routes
+│   │   └── static/             # The Mini App: no build step, no framework
+│   │       ├── index.html      # Structure only — no data, nothing inline
+│   │       ├── app.css         # Telegram-themed, mobile-first, safe areas
+│   │       ├── i18n.js         # UI strings, separate from exercise content
+│   │       ├── renderers.js    # One renderer per component type
+│   │       └── app.js          # Launch, session, states, the only fetch caller
 │   └── skills/
 │       └── adaptive-learning/
 │           ├── SKILL.md        # The orchestration workflow
@@ -210,14 +220,17 @@ own bundled skills use for sibling files, and warns explicitly against the
 against a real Hermes checkout, and fails if Hermes ever fixes the plugin path
 so the workaround can be removed.
 
-**The skill tells the truth about its own scope.** `SKILL.md` states plainly
-that this foundation has no tools and no persistence, because a skill that
-implies otherwise sends the agent after tools that do not exist. A test fails if
-the skill body references tool names while `register()` registers no tools, and
-textual contract tests pin the load-bearing rules: what may launch without
-asking, that a missing tool falls back to chat, that exercises are declarative
-data rather than generated frontend code, that image assets come from real tool
-results, and who owns which memory store.
+**The skill tells the truth about its own scope.** A skill that overstates what
+exists sends the agent after tools that are not there; one that understates it
+sends the agent to chat when a better route is available. `SKILL.md` therefore
+names the four tools it has, says that a trusted renderer for all thirty-one
+component types exists, and says just as plainly that **nothing launches it yet**
+— so an exercise is prepared for that renderer and delivered in conversation until
+the launch tooling lands. Textual contract tests pin the load-bearing rules: what
+may launch without asking, that a missing tool falls back to chat, that the agent
+writes validated manifests and never frontend code, that a learner never has to
+name an internal skill for the workflow to start, that image assets come from real
+tool results, and who owns which memory store.
 
 **Subject-agnostic by construction.** No subject is the plugin's default.
 Examples span language learning, programming, history, and science, and a test
@@ -685,10 +698,10 @@ create or modify.
 ## Telegram Mini App API
 
 An optional FastAPI service that serves a stored exercise to the person who
-owns it, over a Telegram-authenticated, same-origin API. It is **not started by
-the plugin**: nothing in this release launches a server, opens a tunnel, or
-sends a Telegram button. This PR builds the boundary; process lifecycle and the
-frontend land later.
+owns it, over a Telegram-authenticated, same-origin API, together with the
+static Mini App that renders it. It is **not started by the plugin**: nothing in
+this release launches a server, opens a tunnel, or sends a Telegram button. The
+boundary and the interface exist; process lifecycle lands later.
 
 ```bash
 uv pip install "hermes-learning-studio[web]"
@@ -837,11 +850,15 @@ with an older captured payload.
 | `POST` | `/api/session` | Bootstrap a session for one experience |
 | `GET` | `/api/session/component` | The component currently in view |
 | `POST` | `/api/session/answer` | Record a response and advance |
+| `POST` | `/api/session/reveal` | Turn a flashcard over, after an attempt |
 | `GET` | `/api/session/result` | Progress summary for the session |
 | `GET` | `/api/assets/{id}` | One managed image, verified on the way out |
+| `GET` | `/`, `/index.html` | The Mini App document |
+| `GET` | `/static/{app.css,i18n.js,renderers.js,app.js}` | The frontend, from a closed allowlist |
 
-There is no public route, and no interactive docs or OpenAPI schema is
-published. Answers are recorded **in the session** and nothing is marked:
+Every `/api/` route is authenticated. The five static files are the only public
+ones — see [The Mini App interface](#the-mini-app-interface) for why a webview
+shell cannot be — and no interactive docs or OpenAPI schema is published. Answers are recorded **in the session** and nothing is marked:
 grading and durable attempt storage arrive with the evaluation runtime, and
 every completion response says so rather than implying a score exists.
 
@@ -923,6 +940,338 @@ and then sign real payloads with that token, so the same HMAC path runs in tests
 as in production. A test parses the API sources and fails if an identifier that
 looks like a bypass switch ever appears.
 
+## The Mini App interface
+
+The trusted renderer: five static files, no build step, no framework, and no
+Node required to run it. `learning_studio/web/static/` holds a document, a
+stylesheet, and three scripts — UI strings, card renderers, application — served
+by the same FastAPI app from an explicit allowlist.
+
+```
+GET /              → index.html      (also /index.html)
+GET /static/app.css
+GET /static/i18n.js
+GET /static/renderers.js
+GET /static/app.js
+```
+
+**The shell is the one unauthenticated thing in this server**, and that is a
+consequence rather than a concession: the navigation that loads a webview cannot
+carry a request header, so there is no request in which the document could prove
+who wants it. What is public is five checked-in files that are byte-identical for
+every caller and contain no learner data, no identifier, and no configured value.
+The document that arrives knows nothing; it has to ask, with headers, for
+everything it displays. No route that can return learner data lost a check.
+
+There is **no filename in any URL**. Each path above is a literal route bound to
+a literal file at import time — no `StaticFiles` mount, no path parameter, no
+directory walk — so traversal has nothing to traverse, and slash redirection is
+switched off so the reachable URL space is exactly the declared one. A test
+asserts the allowlist and the directory contents are the same set.
+
+### Nothing generated ever executes
+
+Exercise text is written into the DOM with `textContent` and attributes on
+elements the renderer created. There is no `innerHTML`, no `insertAdjacentHTML`,
+no `document.write`, no `eval`, and no `new Function` anywhere in the shipped
+JavaScript — a test greps for each of them, because the Content-Security-Policy
+cannot stop an injection that goes through the DOM API. `createElement` appears
+exactly once, in one helper.
+
+`code_response` is text on every leg of the journey: displayed in a textarea,
+submitted as a string, stored as a string. Nothing parses, compiles, or runs it,
+and there is no code path here that could.
+
+**A card cannot show what the server did not send.** Renderers read the stored
+learner payload, which has no `answer` and no `evaluation` key to leak, so "do
+not reveal the answer before submission" is an absence rather than a discipline.
+`flashcard` is the visible consequence: there is no *turn over* button, because
+the back of the card is in the evaluator-only half and this app has no way to ask
+for it. What a learner does instead is write down what they remember and rate the
+recall. Tests walk every one of the thirty-one types, with a canary in every
+hidden field of every source component, and assert that none of them appears in
+the DOM, in an attribute, in a prefilled value, or in a submitted response.
+
+### Content-Security-Policy
+
+The document needs to run its own scripts and load Telegram's SDK, which the
+API's `script-src 'none'` forbids. Rather than relax the policy everywhere, the
+**document** carries a wider one and every other response — the JSON routes, the
+images, and the scripts and stylesheet themselves — keeps the strict policy
+unchanged. The distinction is load-bearing: the policy that decides whether a
+script may execute is the *document's*, so a stylesheet served under
+`script-src 'none'` costs nothing, and a mistake in the static layer cannot
+loosen the API.
+
+```
+Content-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none';
+  frame-ancestors https://web.telegram.org https://telegram.org;
+  script-src 'self' https://telegram.org; style-src 'self'; img-src 'self' blob:;
+  connect-src 'self'; font-src 'none'; media-src 'none'; object-src 'none';
+  frame-src 'none'; worker-src 'none'; manifest-src 'none'
+```
+
+No `'unsafe-inline'`, no `'unsafe-eval'`, no wildcard. That is a constraint on
+the frontend rather than a claim about it: the document carries no inline script
+and no `style` attribute, and tests assert both. The SDK is loaded from
+`telegram.org` rather than vendored — a copy in this repository would be a stale
+fork of the one file whose job is to match the client currently running the
+webview.
+
+`blob:` is what makes a managed image displayable at all. `/api/assets/…` needs
+two request headers and an `<img src>` sends neither, so the page fetches the
+bytes and shows an object URL, checking the content type on the way and revoking
+the URL when the card changes. A blob URL can only name data the page already
+holds.
+
+Renderers never build a URL. They are handed a `loadImage(assetRef)` and cannot
+reach the network themselves, so a renderer *cannot* point an `<img>` at an
+arbitrary address — and the manifest has no field that could carry one.
+
+### States
+
+Every failure renders something a person can act on, chosen by HTTP status:
+loading, wrong launch context, failed verification, unauthorised account, expired
+session, missing exercise, conflict, rate limit, server error, and offline. A
+rejected `fetch` and an HTTP error stay separate all the way to the state, because
+"no connection" and "the server said no" are different things to a reader.
+
+The API's own error text is deliberately never displayed. It is written for an
+operator reading a log, and translating the interface only to fall back to English
+on the unhappy path would be a strange kind of half-localized.
+
+Answers are confirmed as **recorded and not marked**, because that is what
+happened. A tick and a chime would imply a judgement nobody made.
+
+### Localization
+
+UI strings live in `i18n.js`, in three complete tables (`en`, `fr`, `es`),
+selected by the manifest's `ui_locale`. Exercise **content** is never translated:
+a French verb drill is in French whoever is doing it, and a `content_locale` is a
+property of the exercise.
+
+Resolution is forgiving in one direction only — `fr-CA` → `fr`, `pt` → `en`, an
+unknown or malformed tag → `en` — and never lands on a partially translated
+table, because a card that is half French and half English is worse than one that
+is honestly English. A missing key falls back to English and then to the key
+itself, which renders as something obviously wrong and obviously findable. Tests
+assert the three tables agree key for key, and that every key the interface asks
+for exists.
+
+There is no plural machinery. The strings avoid count-dependent grammar
+("Words: 12" rather than "12 words"), which is enough for these sentences and
+would not be for a larger interface; `Intl.PluralRules` is the way in when it is
+needed.
+
+### Accessibility
+
+Keyboard-first throughout, and not only as a preference: `keyboard_only` is a
+declarable accommodation, so a renderer that needed a pointer could not honour
+it. Nothing requires a drag — ordering has up/down buttons, matching has a
+`<select>` per row, labeling picks from a bank, and the hotspot takes arrow keys
+as well as a tap, stepping 5% (1% with Shift) in normalised coordinates.
+
+Also: a skip link, a focused card on every change, `role="status"` announcements
+that do not steal focus, a labelled progress bar, an accessible name on every
+field, mandatory `alt` text on every image with a legible fallback when the bytes
+do not arrive, 44px touch targets, `prefers-reduced-motion` honoured in CSS so it
+holds even if the script never runs, a `data-reduced-motion` hook for the
+component-level flag, safe-area insets, Telegram's stable viewport height, and
+wide tables that scroll inside themselves rather than scrolling the page.
+
+Component accessibility metadata is shown rather than stored and forgotten:
+`caption`, `transcript`, `long_description`, and `keyboard_alternative` are all
+rendered.
+
+### The response contract
+
+Each card submits a `response` to `POST /api/session/answer`. Field names mirror
+the component's own answer schema, so a later evaluation runtime compares like
+with like. Nothing is scored yet; this is the wire format that scoring will read.
+
+| Types | Response |
+| --- | --- |
+| `multiple_choice`, `image_choice`, `scenario_choice` | `option_id` |
+| `multi_select` | `option_ids` |
+| `true_false` | `value` (boolean) |
+| `classification` | `assignments` of `{item_id, category_id}` |
+| `categorization` | `assignments` of `{item_id, category_ids}` |
+| `fill_blank` | `blanks` of `{blank_id, text}` |
+| `short_answer`, `typed_recall`, `translation`, `error_correction`, `free_response`, `rubric_response`, `image_observation`, `diagram` | `text` |
+| `code_response` | `code` (a string, never run) |
+| `sentence_order`, `sequence_order`, `timeline`, `process_flow` | `order` of ids |
+| `matching` | `pairs` of `{left_id, right_id}` |
+| `labeling` | `labels` of `{marker_id, label_id}` |
+| `table_grid` | `cells` of `{row_id, column_id, text}` |
+| `hotspot` | `points` of `{x, y}`, normalised to 0–1 |
+| `decision_path` | `decisions` of `{step_id, option_id}` |
+| `case_study`, `reflection`, `self_explanation` | `responses`, one per prompt |
+| `confidence_rating` | `rating` (an integer on the declared scale) |
+| `flashcard` | `text` (the frozen attempt) and `self_rating`, after a reveal |
+
+Every shape stays inside the API's own bounds — depth 4, 100 items per container,
+4000 characters per string — which a test checks by walking each completed card.
+`min_words` on a multi-prompt component is checked against the **total**:
+applying it per field would silently demand forty words twice from somebody told
+forty once.
+
+**One limit contract, derived rather than chosen.** The shortest text containing
+*n* words needs `2n − 1` characters, so a word bound above `(chars + 1) / 2` is a
+requirement nothing could satisfy. The registry used to accept `min_words: 5000`
+against a 4,000-character ceiling: such a component validated, stored, rendered,
+and then refused every possible answer a learner could type. `MAX_WORDS` is now
+`(MAX_RESPONSE_CHARS + 1) // 2` — 2,000 — and a test fails if the two ever drift.
+
+Above the per-string limit sits the request body ceiling
+(`mini_app_max_request_bytes`, 16 KB by default), which is the only *aggregate*
+bound there is: eight prompts can each be inside the character limit and still
+exceed it together. The bootstrap response tells the client both numbers rather
+than the client duplicating them, and the frontend measures the encoded body in
+**bytes** before sending — a `length` check would pass a Japanese answer the
+server then refuses with a 413 the learner could do nothing about.
+
+Ordering cards, `code_response`, and `error_correction` arrive answerable —
+an ordering list is already in *some* order, and the other two are seeded with the
+declared starter code and the passage to be corrected. Every other card refuses an
+empty submission locally, with a localized reason and no request made.
+
+**That order is never the correct one.** An author writes the steps of a
+titration in the order they happen and states the same order under `answer.order`,
+so the visible list *is* the key — and every canonical fixture in this repository
+had exactly that shape. The learner projection therefore rearranges it, using
+`secrets.SystemRandom` rather than a seedable generator, with a guard that rejects
+an arrangement equal to the source so a two-item list is genuinely swapped rather
+than left alone by an unlucky draw. The same applies to `matching.right` and
+`labeling.label_bank`, whose option lists are naturally written parallel to the
+rows they answer.
+
+The shuffle is server-side, in `Component.project()`, and there is no way to ask
+for "no shuffle" — a frontend that received the correct order and was trusted to
+scramble it would be one bug away from displaying the answer, and the bug would be
+invisible. A `timeline` with `show_dates: false` is served without its
+`date_label` at all, for the same reason: a date is an ordering clue, and
+withholding it beats sending it and trusting the client not to render it.
+
+**The forbidden arrangement is reconstructed, never read off the answer.** For
+`matching` and `labeling` the answer is a *set of statements* — `pairs` and
+`labels` mean the same thing whatever order they are written in — so reading the
+arrangement out of their record order produced a list that was often not the
+answer at all. The guard then rejected candidates for matching a phantom and
+settled on the real one; with a two-row card, which has exactly two arrangements,
+that served the answer every single time. The order to exclude is now built the
+way the card is read: map `left_id → right_id`, then walk `content.left`.
+
+**Identifiers are aliased too.** Hiding the order does not hide the names: a
+manifest whose tokens are `t1, t2, t3, t4` spells out its own answer to anyone who
+sorts them, and no registry rule can stop an author writing that. Every identifier
+inside a component's content is replaced with a random one when the projection is
+built, so the card carries names with nothing to read into. The evaluator record
+stores the `alias → canonical` map and canonical inventory, while a separate hidden
+table stores a provenance marker for every evaluator row. Current scheme-3 markers
+also carry a digest binding the exact mapping to the component, owner, experience,
+and learner payload. None of that evidence is served to the learner.
+
+Current scheme-3 translation **fails closed** unless all three records agree. A
+swapped target, a coordinated mapping/inventory rewrite, a missing or altered
+binding, or an identifier the mapping does not cover is refused without advancing
+the exercise. Scheme-2 records predate the exact binding and are also refused for
+identifier-bearing responses; migration cannot invent correspondence evidence that
+was never recorded. The digest is deliberately keyless: it detects partial damage
+or disagreement between the evaluator and binding records, but a writer able to
+alter both records can recompute it or deliberately select a legacy state. It is
+not authentication against a full-database writer. Mapping-only scheme 1 and the
+previous unversioned shape remain an explicitly named `ALIASED_UNVERIFIED`
+compatibility path and never claim the scheme-3 guarantee. Components prepared
+before aliasing existed are identified by
+an intact evaluator record carrying neither alias marker; that is the only state in
+which an identifier passes through unchanged.
+
+A component type this build does not know renders an *unsupported* card naming
+the type, and can be skipped — it submits `{"skipped": true}` — so the exercise
+is not a dead end. A registry the server validates against can legitimately be
+ahead of a frontend nobody updated; a blank screen would be the dishonest
+response.
+
+**Turning a flashcard over.** The one place a learner is ever shown something
+from the evaluator-only half, and the only route that discloses any of it. The
+back of the card is not in the payload, so "turn over" is a *request*:
+
+1. the learner writes what they remember and presses **Turn the card over**;
+2. `POST /api/session/reveal` checks the Telegram account, the allowlist, the
+   session, the profile, the learner, the experience, and that the named
+   component is the one the session is currently on;
+3. the attempt is **frozen** — the first one recorded is the one that counts, so
+   a refresh is safe, and a second call carrying a different recall does not
+   replace it;
+4. the server returns one string: `answer.back`. A mapping in `service.py` names
+   the single field of the single type that may ever be disclosed, and
+   `reveal_component_answer` returns a `str` rather than a record, so no code path
+   there could hand back the rubric, the hints, the feedback, the branches, or the
+   mnemonic sitting beside it in the same object.
+
+Submitting is then checked against the frozen attempt: a flashcard cannot be
+submitted before it has been turned over, and the recall cannot be rewritten
+afterwards. Both are enforced server-side, because the frontend is a convenience
+and anybody can post to the route directly. The recall field visibly becomes
+read-only at the moment of the reveal, so the rule is apparent rather than only
+enforced.
+
+This is what `references/flashcards-and-recall.md` has always asked for — "the
+reveal must be explicit and keyboard-operable" — and what the first version of
+this Mini App did not have.
+
+### What it looks like
+
+| Light, English | Dark, French UI over English content |
+| --- | --- |
+| ![Six cards rendered in the light theme with an English interface](docs/screenshots/cards-light.png) | ![The same interface in the dark theme with a French interface, showing a flashcard's turn-over control and two ordering cards that are not in their correct order](docs/screenshots/cards-dark-fr.png) |
+
+![Three cards whose managed image failed to load, each showing the exercise's own alternative text as readable content](docs/screenshots/image-fallback.png)
+
+Both were captured at a phone viewport from a deterministic gallery that renders
+the shipped renderers and stylesheet against payloads built by the shipped
+validator, so what is pictured is what a learner sees rather than a mock-up:
+
+```bash
+uv run python tools/preview_gallery.py --out dist/preview
+```
+
+Nothing in either image is real. The content comes from the test examples, images
+are a generated placeholder, and no session, server, tunnel, or Telegram account
+is involved — see [docs/screenshots](docs/screenshots/README.md). The two images
+together are the localization point: the interface is French while the exercise
+stays in the language it was written in.
+
+### Testing the frontend
+
+No package manager, no lockfile, and no browser download. The renderers are
+executed under Node's built-in test runner against a small DOM shim
+(`tests/js/dom.mjs`, ~250 lines), loading the shipped files unmodified through
+`node:vm`:
+
+```bash
+uv run python tools/run_frontend_tests.py
+```
+
+That is the whole command, and it is what the Python suite runs too. A bare
+`node --test tests/js/*.test.mjs` does **not** work and is no longer documented as
+though it does: the fixtures have to be generated by Python first and handed over
+by path. Run it that way and the suite fails with a message naming the script,
+rather than passing vacuously.
+
+The component fixtures are generated *by the Python side*, from the real
+component registry through the real `build_component`, so the JavaScript is
+exercised against exactly the learner projection the API returns — canaries
+included. A committed JSON fixture would have started drifting from the registry
+the first time a type changed. If Node is absent the suite skips, except under
+`CI`, where a missing Node fails instead of quietly deleting the frontend's tests.
+
+What the shim does not simulate — layout, paint, native radio grouping, CSP
+enforcement — is covered by `tests/test_mini_app_frontend.py` (source contracts:
+forbidden sinks, client/server route agreement, locale parity, every registry
+type has a renderer) and `tests/test_mini_app_ui.py` (routes, headers, policy),
+and by looking at the thing on a phone.
+
 ## Roadmap
 
 Secure managed image import **is** here: `learning_studio_import_asset`
@@ -934,18 +1283,21 @@ Telegram authentication, session scoping, and the protected API **are** here,
 behind the `web` extra — including managed asset delivery. See
 [Telegram Mini App API](#telegram-mini-app-api).
 
-Deliberately **not** here yet: image-generation providers, the card renderers
-and frontend code, anything that starts or supervises the server process,
-Cloudflare tunnels, slash commands, sending a Telegram launch button,
-launch/status/stop tools, scoring, attempt and score storage, progress
-dashboards, and any scheduler. Each lands in a later PR. The skill describes how
-the agent will use those capabilities and instructs it to fall back to chat
-until they exist.
+The card renderers and the Mini App frontend **are** here: all thirty-one
+component types render, submit, and are keyboard-operable, in three interface
+languages. See [The Mini App interface](#the-mini-app-interface).
 
-An exercise can now be *served* over the API, but it is still not *rendered*:
-there is no client, so the agent continues to deliver exercises in conversation.
-Responses collected by the API are held in the session and are never marked or
-stored.
+Deliberately **not** here yet: image-generation providers, anything that starts
+or supervises the server process, Cloudflare tunnels, slash commands, sending a
+Telegram launch button, launch/status/stop tools, scoring, attempt and score
+storage, progress dashboards, and any scheduler. The skill says which of these
+exist and which do not, and instructs the agent to deliver in conversation until
+the launch tooling lands.
+
+An exercise can now be served *and rendered*, but nothing starts the server, so
+in practice the agent still delivers exercises in conversation until the launch
+tooling lands. Responses collected by the API are held in the session and are
+never marked or stored.
 
 ## Development
 

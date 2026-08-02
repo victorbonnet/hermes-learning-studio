@@ -32,6 +32,16 @@ jobs:
         with:
           enable-cache: true
 
+      # The frontend suite runs under Node's built-in test runner. It needs no
+      # package manager and installs nothing -- but it does need Node, and
+      # `tests/test_frontend_js.py` fails rather than skips when `CI` is set, so
+      # pinning the version here is what keeps that suite from disappearing
+      # quietly if a runner image changes.
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
       # Also the acceptance check that a fresh clone can install dev deps.
       - name: Install the project and dev dependencies
         run: uv sync --python ${{ matrix.python-version }} --extra dev

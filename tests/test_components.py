@@ -114,6 +114,27 @@ def test_the_registry_names_no_subject():
         assert subject not in blob, f"the registry presumes the subject '{subject}'"
 
 
+def _fixed_mint():
+    """Deterministic aliases, for tests that compare two projections.
+
+    Production mints random ones — that is the point of them — so a test wanting
+    to compare has to say which aliases it means, exactly as it has to say which
+    arrangement it means.
+    """
+    counter = iter(range(1, 10_000))
+    return lambda: f"alias{next(counter):04d}"
+
+
+def _reverse(items: list) -> None:
+    """A fixed permutation, for tests that need to name an arrangement.
+
+    Only ever injected. Production uses an unpredictable shuffle, because a fixed
+    transformation is a pattern a learner reads through once and then reads
+    backwards forever.
+    """
+    items.reverse()
+
+
 # ── Parsing and round-tripping ────────────────────────────────────────────
 
 
@@ -127,30 +148,51 @@ def test_a_valid_component_parses(component_type: str):
 
 @pytest.mark.parametrize("component_type", COMPONENT_TYPES)
 def test_a_component_round_trips_through_json(component_type: str):
-    """Everything stored is JSON, so everything validated must serialise."""
+    """Everything stored is JSON, so everything validated must serialise.
+
+    The projection is taken with a fixed permutation. It is deliberately not
+    deterministic in production — the order of an ordering card is part of what
+    must not be guessable — so a test that wanted to compare two projections has
+    to say which arrangement it means.
+    """
     component = build(component_type)
 
-    payload = json.loads(json.dumps(component.learner_payload()))
+    payload = json.loads(
+        json.dumps(component.learner_payload(shuffle=_reverse, mint=_fixed_mint()))
+    )
     hidden = json.loads(json.dumps(component.hidden()))
 
-    assert payload == component.learner_payload()
+    assert payload == component.learner_payload(shuffle=_reverse, mint=_fixed_mint())
     assert hidden == component.hidden()
 
 
 @pytest.mark.parametrize("component_type", COMPONENT_TYPES)
 def test_validation_is_idempotent(component_type: str):
-    """Re-validating a validated component must produce the same component."""
+    """Re-validating a validated component must produce the same component.
+
+    Rebuilt from the *validated* halves rather than from the learner projection,
+    which is the accurate question to ask. The projection is deliberately not a
+    faithful copy any more: it rearranges answer-bearing lists, and it drops a
+    ``date_label`` the component asked not to show. Feeding it back in and
+    demanding equality would be asserting that both of those are no-ops.
+    """
     once = build(component_type)
     twice = build_component(
         {
-            **once.learner_payload(),
+            "id": once.id,
+            "type": once.type,
+            "prompt": once.prompt,
+            **({"content": once.content} if once.content else {}),
+            **({"accessibility": once.accessibility} if once.accessibility else {}),
             **once.hidden(),
         },
         "component",
     )
 
-    assert twice.learner_payload() == once.learner_payload()
     assert twice.hidden() == once.hidden()
+    assert twice.prompt == once.prompt
+    assert twice.accessibility == once.accessibility
+    assert twice.content == once.content
 
 
 # ── The learner payload is safe by construction ───────────────────────────
@@ -209,6 +251,80 @@ def test_an_answer_key_never_appears_in_the_learner_payload(component_type: str)
     ]
     for text in answer_texts:
         assert text.casefold() not in visible
+
+
+# ── Every accepted component has something to answer ──────────────────────
+#
+# A component that validates and stores but renders no response control is worse
+# than one that is rejected: the learner reaches a card with nothing on it, the
+# frontend submits an empty answer, and the exercise advances as though something
+# happened. `self_explanation.prompts` was optional and did exactly that.
+
+
+@pytest.mark.parametrize("component_type", ["self_explanation", "reflection"])
+def test_a_prompt_list_component_needs_at_least_one_prompt(component_type: str):
+    with pytest.raises(ComponentError) as refused:
+        build(component_type, content={"min_words": 20})
+
+    assert "prompts" in str(refused.value)
+
+
+@pytest.mark.parametrize("component_type", ["self_explanation", "reflection"])
+def test_an_empty_prompt_list_is_refused_as_well_as_a_missing_one(component_type: str):
+    """`prompts: []` is the same card with more punctuation."""
+    with pytest.raises(ComponentError):
+        build(component_type, content={"prompts": []})
+
+
+@pytest.mark.parametrize("component_type", ["self_explanation", "reflection"])
+@pytest.mark.parametrize("count", [1, 2, 8])
+def test_a_prompt_list_component_accepts_one_or_many_prompts(component_type: str, count: int):
+    component = build(component_type, content={"prompts": [f"Why {n}?" for n in range(count)]})
+
+    assert len(component.learner_payload()["content"]["prompts"]) == count
+
+
+@pytest.mark.parametrize("component_type", COMPONENT_TYPES)
+def test_no_type_can_validate_with_nothing_for_a_learner_to_do(component_type: str):
+    """The general form of the same rule, across the whole registry.
+
+    Each of these families renders one control per entry in a required list, so an
+    empty or absent list means an empty card. Checked here rather than in the
+    renderer, because the renderer is the wrong place to discover that a stored
+    component was never answerable.
+    """
+    driving_field = {
+        "self_explanation": "prompts",
+        "reflection": "prompts",
+        "case_study": "questions",
+        "multiple_choice": "options",
+        "multi_select": "options",
+        "image_choice": "options",
+        "scenario_choice": "options",
+        "decision_path": "steps",
+        "classification": "items",
+        "categorization": "items",
+        "matching": "left",
+        "sentence_order": "tokens",
+        "sequence_order": "steps",
+        "timeline": "events",
+        "process_flow": "stages",
+        "labeling": "markers",
+        "table_grid": "rows",
+        "fill_blank": "blanks",
+    }.get(component_type)
+    if driving_field is None:
+        # A single-field type: the control exists whatever the content says.
+        return
+
+    spec = SPEC_BY_TYPE[component_type]
+    declared = {field.name: field for field in spec.content}
+    assert declared[driving_field].required, (
+        f"{component_type}.content.{driving_field} drives how many controls are rendered, "
+        "so it cannot be optional"
+    )
+    with pytest.raises(ComponentError):
+        build(component_type, content={**example(component_type)["content"], driving_field: []})
 
 
 # ── Closed at every level ─────────────────────────────────────────────────

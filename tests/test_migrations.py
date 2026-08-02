@@ -169,7 +169,114 @@ def test_migrations_are_contiguous_and_the_version_is_the_last_one():
     versions = [m.version for m in storage.MIGRATIONS]
 
     assert versions == list(range(1, len(versions) + 1))
-    assert storage.SCHEMA_VERSION == versions[-1] == 8
+    assert storage.SCHEMA_VERSION == versions[-1] == 9
+
+
+def test_a_v8_database_upgrades_with_a_separate_alias_binding_store(hermes_home: Path):
+    _build_database_at(8)
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 9
+        columns = _columns(conn, "experience_component_alias_bindings")
+        assert {
+            "component_id",
+            "experience_id",
+            "learner_id",
+            "profile_id",
+            "binding_scheme",
+            "binding_digest",
+            "created_at",
+        } == columns
+
+
+def test_a_v8_alias_record_upgrades_unbound_and_new_records_are_bound(
+    hermes_home: Path,
+):
+    """Migration cannot manufacture exact correspondence for existing mappings."""
+    from learning_studio.service import AliasState
+    from tests.component_examples import example, manifest
+
+    old = service.prepare_experience(
+        principal=LEARNER,
+        manifest=manifest([example("multiple_choice", id="old-question")]),
+    )
+
+    # Migration 9 only introduced the binding store. Recreate the exact physical
+    # v8 shape and evaluator format without asking current write code to operate
+    # against a deliberately incomplete schema.
+    with storage.connect() as conn:
+        conn.execute(
+            "UPDATE experience_component_evaluations"
+            "   SET evaluation = json_set(evaluation, '$.alias_scheme', 2)"
+            " WHERE experience_id = ?",
+            (old["experience_id"],),
+        )
+        conn.execute("DROP TABLE experience_component_alias_bindings")
+        conn.execute("UPDATE schema_version SET version = 8 WHERE id = 1")
+        old_evaluator = conn.execute(
+            "SELECT evaluation FROM experience_component_evaluations WHERE experience_id = ?",
+            (old["experience_id"],),
+        ).fetchone()["evaluation"]
+        assert '"alias_scheme":2' in old_evaluator
+        assert storage.read_schema_version(conn) == 8
+
+    storage.initialize()
+
+    old_aliases = service.component_aliases(
+        principal=LEARNER,
+        experience_id=old["experience_id"],
+        component_key="old-question",
+    )
+    assert old_aliases.state is AliasState.UNRESOLVED
+    assert not old_aliases.translates
+
+    new = service.prepare_experience(
+        principal=LEARNER,
+        manifest=manifest([example("multiple_choice", id="new-question")]),
+    )
+    with storage.connect() as conn:
+        rows = conn.execute(
+            "SELECT c.experience_id, b.binding_scheme, b.binding_digest"
+            "  FROM experience_component_alias_bindings AS b"
+            "  JOIN experience_components AS c ON c.id = b.component_id"
+        ).fetchall()
+
+    assert {
+        (
+            row["experience_id"],
+            row["binding_scheme"],
+            len(row["binding_digest"]) if row["binding_digest"] is not None else None,
+        )
+        for row in rows
+    } == {
+        (old["experience_id"], 2, None),
+        (new["experience_id"], 3, 64),
+    }
+
+
+def test_a_failing_migration_nine_rolls_back_the_binding_store(hermes_home: Path, monkeypatch):
+    _build_database_at(8)
+    real = list(storage.MIGRATIONS)
+    broken_nine = storage.Migration(
+        version=9,
+        statements=(*real[8].statements, "THIS IS NOT SQL"),
+    )
+    monkeypatch.setattr(storage, "MIGRATIONS", [*real[:8], broken_nine])
+
+    with pytest.raises(storage.MigrationError):
+        storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 8
+        assert (
+            conn.execute(
+                "SELECT name FROM sqlite_master"
+                " WHERE type = 'table' AND name = 'experience_component_alias_bindings'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_a_v7_database_upgrades_to_managed_assets_without_rewriting_prior_state(
@@ -188,7 +295,7 @@ def test_a_v7_database_upgrades_to_managed_assets_without_rewriting_prior_state(
     storage.initialize()
 
     with storage.connect() as conn:
-        assert storage.read_schema_version(conn) == 8
+        assert storage.read_schema_version(conn) == 9
         assert (
             conn.execute("SELECT id FROM learners WHERE id = 'L-before-assets'").fetchone()["id"]
             == "L-before-assets"
@@ -689,12 +796,32 @@ def _store_experience_under_v3():
     storage.MIGRATIONS = [m for m in saved if m.version <= 3]
     try:
         storage.initialize()
-        return service.prepare_experience(
+        # Current preparation requires the current binding store. Give the fixture
+        # a disposable writer-side table, then remove it and rewrite the aliased
+        # evaluator to the scheme-2 shape the previous code emitted. The database
+        # handed to migration 4 is therefore still physically version 3.
+        with storage.connect() as conn:
+            conn.execute(
+                "CREATE TABLE experience_component_alias_bindings ("
+                " component_id TEXT PRIMARY KEY, experience_id TEXT NOT NULL,"
+                " learner_id TEXT NOT NULL, profile_id TEXT NOT NULL,"
+                " binding_scheme INTEGER NOT NULL, binding_digest TEXT,"
+                " created_at TEXT NOT NULL)"
+            )
+        prepared = service.prepare_experience(
             principal=LEARNER,
             manifest=manifest(
                 [example("multiple_choice", id="one"), example("short_answer", id="two")]
             ),
         )
+        with storage.connect() as conn:
+            conn.execute(
+                "UPDATE experience_component_evaluations"
+                "   SET evaluation = json_set(evaluation, '$.alias_scheme', 2)"
+                " WHERE json_type(evaluation, '$.aliases') = 'object'"
+            )
+            conn.execute("DROP TABLE experience_component_alias_bindings")
+        return prepared
     finally:
         storage.MIGRATIONS = saved
 
@@ -1199,7 +1326,7 @@ def test_a_v5_database_receives_lifecycle_and_provenance_cleanup(hermes_home: Pa
         ).fetchall()
         version = storage.read_schema_version(conn)
 
-    assert version == 8
+    assert version == 9
     assert [dict(row) for row in rows] == [
         {
             "id": "authority-v5",
@@ -1327,7 +1454,7 @@ def test_a_v6_database_purges_only_legacy_accessibility_data(hermes_home: Path):
         ]
         foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert version == 8
+    assert version == 9
     assert values == ["goal-value"]
     assert revisions == ["goal-revision"]
     assert candidates == ["goal-candidate"]

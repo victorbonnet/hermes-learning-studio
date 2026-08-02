@@ -1,8 +1,13 @@
 """Plugin registration.
 
 The plugin's contract with Hermes: one bundled read-only skill and four typed
-tools for learning context, managed assets, and prepared exercises. The
-dashboard, exercise runtime, and Mini App land in later PRs.
+tools for learning context, managed assets, and prepared exercises.
+
+The Mini App — the API and the renderer that serves a prepared exercise — is not
+part of that contract and deliberately not reachable from here. It lives behind
+the optional ``web`` extra and is started by an operator, never by registration;
+what is still to come is the tooling that launches it. Scoring, durable attempts,
+and a scheduler are not here either.
 
 ``register(ctx)`` runs at every Hermes startup for every enabled plugin, so
 it must not raise. It deliberately does **not** open the database: a

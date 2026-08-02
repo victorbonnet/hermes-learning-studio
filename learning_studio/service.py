@@ -23,6 +23,7 @@ turn a track ID into an oracle for whether another learner exists.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -31,10 +32,12 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import Any
 
 from . import candidates as candidate_rules
 from . import storage
+from .components import content_identifiers
 from .config import LearningStudioConfig, load_config
 from .context import Candidate, candidates_from_config, candidates_from_request, resolve
 from .identity import Principal
@@ -2151,6 +2154,15 @@ def _insert_experience(
 
     experience_id = _new_id()
     now = _now()
+    has_alias_binding_store = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'experience_component_alias_bindings'"
+        ).fetchone()
+        is not None
+    )
+    if not has_alias_binding_store:
+        raise RuntimeError("alias binding store is unavailable after storage initialization")
     conn.execute(
         "INSERT INTO experiences"
         " (id, learner_id, profile_id, track_id, objective_id, manifest_schema_version,"
@@ -2184,7 +2196,8 @@ def _insert_experience(
     )
 
     for position, component in enumerate(manifest.components, start=1):
-        payload = component.learner_payload()
+        projection = component.project()
+        payload = projection.payload
         _assert_payload_is_safe(payload, component)
         component_row_id = _new_id()
         conn.execute(
@@ -2205,12 +2218,64 @@ def _insert_experience(
             ),
         )
         hidden = component.hidden()
+        if projection.aliases:
+            # The alias map belongs with the evaluator's data and nowhere else:
+            # it is the one thing that turns a learner-facing identifier back into
+            # the one an answer key names. Stored under its own key so that
+            # `reveal_component_answer`, which reads `answer`, cannot reach it and
+            # a future reader has to ask for it deliberately.
+            #
+            # The scheme number is what makes translation able to fail *closed*.
+            # Without it, "no mapping" and "a mapping that does not cover this
+            # identifier" are indistinguishable from "this component predates
+            # aliasing", and the only safe reading of the third is the identity —
+            # which would silently store a learner-facing alias as an evaluator
+            # identifier. The marker says which world a component belongs to.
+            hidden = {
+                **hidden,
+                "aliases": projection.aliases,
+                "alias_scheme": ALIAS_SCHEME,
+                # Membership evidence captured from canonical content. Exact
+                # alias-to-canonical correspondence is bound separately below.
+                "canonical_identifiers": sorted(projection.canonical_identifiers),
+            }
         if hidden:
             conn.execute(
                 "INSERT INTO experience_component_evaluations"
                 " (component_id, experience_id, learner_id, profile_id, evaluation, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (component_row_id, experience_id, learner_id, profile, dumps(hidden), now),
+            )
+        if hidden:
+            binding_scheme = ALIAS_SCHEME if projection.aliases else 0
+            digest = (
+                _alias_binding_digest(
+                    component_id=component_row_id,
+                    experience_id=experience_id,
+                    learner_id=learner_id,
+                    profile_id=profile,
+                    component_key=component.id,
+                    component_type=component.type,
+                    learner_payload=payload,
+                    mapping=projection.aliases,
+                )
+                if projection.aliases
+                else None
+            )
+            conn.execute(
+                "INSERT INTO experience_component_alias_bindings"
+                " (component_id, experience_id, learner_id, profile_id,"
+                "  binding_scheme, binding_digest, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    component_row_id,
+                    experience_id,
+                    learner_id,
+                    profile,
+                    binding_scheme,
+                    digest,
+                    now,
+                ),
             )
     return experience_id
 
@@ -2345,6 +2410,462 @@ def _experience_payload(row: sqlite3.Row, components: list[sqlite3.Row]) -> dict
             for component in components
         ],
     }
+
+
+# ── The one authorised read of evaluator-only data ────────────────────────
+
+#: Component types whose hidden half may ever be disclosed to a learner, and the
+#: single answer field each one may disclose.
+#:
+#: This mapping is the whole permission. It is not a filter applied to a general
+#: "read the hidden half" query — there is no such query — it decides which
+#: *field* of which *type* a caller can ask for, and the function below refuses
+#: everything else. A flashcard's ``back`` is here because retrieval practice is
+#: not retrieval practice unless the learner finds out whether they were right;
+#: a rubric, a hint, per-option feedback, a branch, an evaluator note, and every
+#: other type's answer key are not here and cannot be requested.
+REVEALABLE_ANSWER_FIELDS: dict[str, str] = {"flashcard": "back"}
+
+#: Version of the identifier-aliasing scheme a stored component was prepared
+#: under. Recorded per component rather than per database so mapping-only legacy
+#: experiences remain explicitly compatible, while inventory-only scheme 2 is
+#: recognised and refused rather than mistaken for canonical content.
+#:
+#: - **3** — the current format. Stores mapping and inventory in evaluator JSON,
+#:   plus a digest of the exact producer mapping in the separately constrained
+#:   alias-binding table. The digest also binds the learner projection and owner.
+#: - **2** — mapping and canonical inventory in one evaluator record. Membership
+#:   is checkable, but exact alias-to-canonical correspondence is not: permuting
+#:   targets preserves the inventory.
+#: - **1** — mapping only. Syntax and coverage are checkable, but neither
+#:   canonical membership nor correspondence is independently provable.
+ALIAS_SCHEME = 3
+
+#: Older formats retained so their distinct compatibility and refusal semantics
+#: are explicit rather than inferred from missing fields.
+_INVENTORY_ONLY_SCHEME = 2
+_MAPPING_ONLY_SCHEME = 1
+
+#: Said when a reveal is not available. The same message for "no such component",
+#: "not that type", and "nothing stored", for the usual reason: the difference
+#: would turn the route into a description of somebody's exercise.
+NOT_REVEALABLE_MESSAGE = "There is nothing to turn over on this card."
+
+
+#: Alias schemes this code knows how to read. A record naming anything else was
+#: written by a newer version, and the only safe reading of "I do not know how
+#: these identifiers were made" is to refuse.
+SUPPORTED_ALIAS_SCHEMES = frozenset({ALIAS_SCHEME, _INVENTORY_ONLY_SCHEME, _MAPPING_ONLY_SCHEME})
+
+
+class AliasState(Enum):
+    """How a stored component's identifiers relate to what the learner sees.
+
+    The previous version of this returned ``dict | None`` and could not tell four
+    situations apart, which is why it failed open. ``None`` meant, all at once:
+    a component that predates aliasing; a component whose evaluator row is
+    missing; a marker that is malformed; and — after the last release — a record
+    written by the *previous head*, which stored ``aliases`` but no scheme number
+    because that field did not exist yet. Identity translation is right for
+    exactly the first of those and wrong for the rest, so the caller was left
+    guessing and guessed generously.
+
+    The states are now named, and only :data:`CANONICAL` permits an identifier to
+    pass through untranslated.
+    """
+
+    #: The payload was aliased, and the mapping has been **proved** against the
+    #: component: it covers exactly the aliases actually served, its targets are
+    #: exactly the canonical identifiers recorded when the component was prepared,
+    #: and it is a bijection between the two.
+    ALIASED = "aliased"
+    #: The payload was aliased under a scheme that stored no canonical inventory —
+    #: scheme 1, or the previous head's unversioned records. Everything that can
+    #: be proved about such a record *is* proved: syntax, exact coverage of the
+    #: served aliases, cardinality, and injectivity. What cannot be proved is that
+    #: each target is a real identifier of the original component, because nothing
+    #: recorded what those were.
+    #:
+    #: Kept as its own state rather than folded into :data:`ALIASED`, because a
+    #: weaker guarantee wearing the stronger name is how the last defects
+    #: happened. Mapping-only legacy records resolve identifiers for compatibility,
+    #: while a reader can still see exactly what guarantee is missing.
+    ALIASED_UNVERIFIED = "aliased_unverified"
+    #: Positively identified as predating aliasing: the stored evaluator record is
+    #: well-formed and simply has no alias key, so the learner payload names
+    #: canonical identifiers. The one state in which identity translation is
+    #: correct, and it is proved rather than assumed.
+    CANONICAL = "canonical"
+    #: Missing, malformed, or written under a scheme this code does not know.
+    #: Nothing can be resolved and nothing may be assumed.
+    UNRESOLVED = "unresolved"
+
+
+@dataclass(frozen=True)
+class ComponentAliases:
+    """The alias state of one component, and its mapping when it has one."""
+
+    state: AliasState
+    #: ``alias -> canonical``. Only meaningful for :data:`AliasState.ALIASED`.
+    #:
+    #: Built per instance rather than shared: a mutable default on a frozen
+    #: dataclass is the kind of thing that goes wrong once, confusingly.
+    mapping: dict[str, str] = dataclasses.field(default_factory=dict)
+
+    @property
+    def resolvable(self) -> bool:
+        return self.state is not AliasState.UNRESOLVED
+
+    @property
+    def translates(self) -> bool:
+        """True when a response's identifiers go through :attr:`mapping`."""
+        return self.state in {AliasState.ALIASED, AliasState.ALIASED_UNVERIFIED}
+
+
+#: What an evaluator record must contain to count as a component that predates
+#: aliasing rather than one whose record went missing. A row exists, it parsed,
+#: and it carries at least one of the keys the evaluator half is made of — so
+#: "no aliases here" is a statement about an intact record rather than about an
+#: absence nobody can explain.
+_EVALUATOR_KEYS = ("answer", "evaluation")
+
+
+def _scheme_is_readable(stored: dict[str, Any]) -> bool:
+    """Whether this record's alias scheme is one this code can act on.
+
+    Three cases, and the middle one is the compatibility path:
+
+    - the key is **absent** — the previous release wrote records this way. The
+      mapping is parsed as an explicitly unverified compatibility state, never as
+      evidence that the stronger integrity guarantee was proved.
+    - the key is **present and supported** — a known shape. Only the current
+      scheme can subsequently earn verified status.
+    - anything else, ``null`` included — refused. An explicitly null scheme is a
+      damaged record, not the previous format: the previous format has no key.
+      Distinguishing presence from value is the whole point of the ``in`` test.
+    """
+    if "alias_scheme" not in stored:
+        return True
+    scheme = stored["alias_scheme"]
+    if isinstance(scheme, bool) or not isinstance(scheme, int):
+        return False
+    return scheme in SUPPORTED_ALIAS_SCHEMES
+
+
+def _validated_mapping(aliases: dict[Any, Any]) -> dict[str, str] | None:
+    """The mapping if every entry is already a pair of identifiers, else ``None``.
+
+    Validated rather than coerced. ``str()`` accepted anything a JSON document
+    could hold and turned it into something identifier-shaped: ``None`` became
+    ``"None"``, ``42`` became ``"42"``, and a nested object became its ``repr``.
+    Each of those was then stored as a learner's answer — a plausible-looking
+    value naming nothing in the answer key, which is the same class of failure as
+    the identity fallback it replaced, arriving by a different route.
+
+    The check is the registry's own identifier rule, so a mapping that survives it
+    holds identifiers this system could actually have minted.
+    """
+    from .safety import UnsafeContent, safe_identifier
+
+    validated: dict[str, str] = {}
+    for alias, canonical in aliases.items():
+        if not isinstance(alias, str) or not isinstance(canonical, str):
+            return None
+        try:
+            safe_identifier(alias, "alias")
+            safe_identifier(canonical, "canonical identifier")
+        except UnsafeContent:
+            return None
+        if alias in validated:  # pragma: no cover - JSON objects cannot repeat keys
+            return None
+        validated[alias] = canonical
+    return validated
+
+
+def _alias_binding_digest(
+    *,
+    component_id: str,
+    experience_id: str,
+    learner_id: str,
+    profile_id: str,
+    component_key: str,
+    component_type: str,
+    learner_payload: dict[str, Any],
+    mapping: dict[str, str],
+) -> str:
+    """Digest the exact producer binding outside the mutable evaluator record.
+
+    The canonical inventory proves only a target set. This commits to every
+    alias-to-canonical pair and to the projection and ownership row it belongs to,
+    so partial corruption confined to the evaluator record cannot agree with the
+    producer evidence written in the separate binding table. This keyless digest
+    is not protection against an adversary with write access to both records: such
+    an adversary can recompute it or deliberately select the legacy compatibility
+    state.
+    """
+    document = {
+        "scheme": ALIAS_SCHEME,
+        "component_id": component_id,
+        "experience_id": experience_id,
+        "learner_id": learner_id,
+        "profile_id": profile_id,
+        "component_key": component_key,
+        "component_type": component_type,
+        "learner_payload": learner_payload,
+        "mapping": mapping,
+    }
+    encoded = json.dumps(
+        document, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _proved(
+    mapping: dict[str, str],
+    served: set[str],
+    stored: dict[str, Any],
+    *,
+    binding_scheme: Any,
+    binding_digest: Any,
+    component_id: str,
+    experience_id: str,
+    learner_id: str,
+    profile_id: str,
+    component_key: str,
+    component_type: str,
+    learner_payload: dict[str, Any],
+) -> ComponentAliases:
+    """Return a mapping only when independent producer evidence proves it exact."""
+    if set(mapping) != served:
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if len(set(mapping.values())) != len(mapping):
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    declared = stored.get("alias_scheme")
+    carries_inventory = "canonical_identifiers" in stored
+
+    if declared in {None, _MAPPING_ONLY_SCHEME}:
+        if carries_inventory or binding_scheme != _MAPPING_ONLY_SCHEME:
+            return ComponentAliases(AliasState.UNRESOLVED)
+        return ComponentAliases(AliasState.ALIASED_UNVERIFIED, mapping)
+
+    if declared not in {_INVENTORY_ONLY_SCHEME, ALIAS_SCHEME} or not carries_inventory:
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    inventory = stored.get("canonical_identifiers")
+    if not isinstance(inventory, list):
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if not all(isinstance(entry, str) for entry in inventory):
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if len(set(inventory)) != len(inventory):
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if set(mapping.values()) != set(inventory):
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    if declared == _INVENTORY_ONLY_SCHEME:
+        # Scheme 2 can prove membership but not correspondence. A permutation of
+        # mapping values preserves the inventory, so this known-vulnerable format
+        # cannot translate identifiers. Mapping-only scheme 1 remains the explicit
+        # legacy compatibility path above; it never claims verified integrity.
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    if binding_scheme != ALIAS_SCHEME or not isinstance(binding_digest, str):
+        return ComponentAliases(AliasState.UNRESOLVED)
+    expected = _alias_binding_digest(
+        component_id=component_id,
+        experience_id=experience_id,
+        learner_id=learner_id,
+        profile_id=profile_id,
+        component_key=component_key,
+        component_type=component_type,
+        learner_payload=learner_payload,
+        mapping=mapping,
+    )
+    if not hmac.compare_digest(binding_digest, expected):
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    return ComponentAliases(AliasState.ALIASED, mapping)
+
+
+def component_aliases(
+    *,
+    principal: Principal,
+    experience_id: str,
+    component_key: str,
+    config: LearningStudioConfig | None = None,
+) -> ComponentAliases:
+    """How to read one component's learner-facing identifiers.
+
+    Scoped in SQL by profile, learner, experience, and component key, exactly like
+    every other learner-owned read — so a session for one experience cannot obtain
+    the mapping for another, and a component belonging to somebody else is
+    indistinguishable from one that does not exist.
+
+    Returns only the state and the mapping. The row it comes from also holds the
+    answer, the rubric, the hints and the branching; none of that leaves here.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            return ComponentAliases(AliasState.UNRESOLVED)
+
+        row = conn.execute(
+            # The learner payload comes back too: the aliases a response may name
+            # are the ones *served*, and reading them from the payload rather than
+            # from the mapping is what makes coverage a real check instead of the
+            # mapping agreeing with itself.
+            "SELECT e.evaluation, c.id AS stored_component_id, c.experience_id,"
+            " c.component_key, c.component_type, c.learner_payload,"
+            " b.binding_scheme, b.binding_digest"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            "  LEFT JOIN experience_component_alias_bindings AS b"
+            "    ON b.component_id = c.id"
+            "   AND b.experience_id = c.experience_id"
+            "   AND b.profile_id = c.profile_id"
+            "   AND b.learner_id = c.learner_id"
+            " WHERE c.experience_id = ? AND c.component_key = ?"
+            "   AND c.profile_id = ? AND c.learner_id = ?"
+            "   AND e.profile_id = ? AND e.learner_id = ?",
+            (
+                str(experience_id),
+                str(component_key),
+                profile,
+                learner_id,
+                profile,
+                learner_id,
+            ),
+        ).fetchone()
+
+    if row is None:
+        # No evaluator row for this component. That may mean a component with
+        # nothing to hide, a row that was never written, or a component that is
+        # not this learner's. None of those is evidence that the payload names
+        # canonical identifiers, so none of them earns identity translation.
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    try:
+        stored = json.loads(str(row["evaluation"]))
+    except ValueError:
+        return ComponentAliases(AliasState.UNRESOLVED)
+    if not isinstance(stored, dict):
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    aliases = stored.get("aliases")
+    claims_aliasing = "aliases" in stored or "alias_scheme" in stored
+
+    # Migration 9 creates one provenance marker for every evaluator row. Missing
+    # evidence is therefore corruption, not proof that the payload is canonical.
+    if row["binding_scheme"] is None:
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    if isinstance(aliases, dict) and _scheme_is_readable(stored):
+        mapping = _validated_mapping(aliases)
+        if mapping is None:
+            return ComponentAliases(AliasState.UNRESOLVED)
+
+        try:
+            payload = json.loads(str(row["learner_payload"]))
+        except ValueError:
+            return ComponentAliases(AliasState.UNRESOLVED)
+        served = content_identifiers(payload.get("content")) if isinstance(payload, dict) else set()
+        return _proved(
+            mapping,
+            served,
+            stored,
+            binding_scheme=row["binding_scheme"],
+            binding_digest=row["binding_digest"],
+            component_id=str(row["stored_component_id"]),
+            experience_id=str(row["experience_id"]),
+            learner_id=learner_id,
+            profile_id=profile,
+            component_key=str(row["component_key"]),
+            component_type=str(row["component_type"]),
+            learner_payload=payload,
+        )
+
+    if claims_aliasing:
+        # Either key present, but the record cannot be read: a mapping that is not
+        # an object, a scheme this code does not understand, or entries that are
+        # not identifiers. Tested on key *presence* rather than on the value,
+        # because `"aliases": null` and `"alias_scheme": null` are damaged records,
+        # not records that predate aliasing — a pre-alias record has neither key
+        # at all. All of them are refusals.
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    if any(key in stored for key in _EVALUATOR_KEYS):
+        # An intact evaluator record with no alias key is canonical only when the
+        # separate migration marker agrees. A scheme-3 row whose alias fields were
+        # stripped keeps marker 3 and must fail closed.
+        if row["binding_scheme"] == 0:
+            return ComponentAliases(AliasState.CANONICAL)
+        return ComponentAliases(AliasState.UNRESOLVED)
+
+    return ComponentAliases(AliasState.UNRESOLVED)
+
+
+def reveal_component_answer(
+    *,
+    principal: Principal,
+    experience_id: str,
+    component_key: str,
+    config: LearningStudioConfig | None = None,
+) -> str:
+    """Return the one disclosable answer field of one component, or refuse.
+
+    Every scope is in the ``WHERE`` clause rather than in a check around it: the
+    profile, the learner resolved from the authenticated principal, the
+    experience, and the component key. A caller holding a valid session for their
+    own experience cannot reach a component of another, and no argument to this
+    function can widen it.
+
+    What comes back is a *string*, not the hidden record. Returning the row and
+    letting the caller pick a field would make every future caller a chance to
+    return the whole thing by accident; there is no code path here that produces
+    the rubric, the hints, the feedback, or the branching.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            raise NotFoundError(NOT_FOUND_EXPERIENCE_MESSAGE)
+
+        row = conn.execute(
+            "SELECT c.component_type, e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ? AND c.component_key = ?"
+            "   AND c.profile_id = ? AND c.learner_id = ?"
+            "   AND e.profile_id = ? AND e.learner_id = ?",
+            (
+                str(experience_id),
+                str(component_key),
+                profile,
+                learner_id,
+                profile,
+                learner_id,
+            ),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(NOT_REVEALABLE_MESSAGE)
+
+    component_type = str(row["component_type"])
+    field_name = REVEALABLE_ANSWER_FIELDS.get(component_type)
+    if field_name is None:
+        raise ValidationError(NOT_REVEALABLE_MESSAGE)
+
+    hidden = json.loads(str(row["evaluation"]))
+    value = (hidden.get("answer") or {}).get(field_name)
+    if not isinstance(value, str) or not value:
+        raise NotFoundError(NOT_REVEALABLE_MESSAGE)
+    return value
 
 
 # ── Managed asset delivery ────────────────────────────────────────────────

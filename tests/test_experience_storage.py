@@ -679,3 +679,773 @@ def test_deleting_an_experience_cascades_to_both_child_tables(hermes_home: Path)
 
     assert rows("SELECT * FROM experience_components") == []
     assert rows("SELECT * FROM experience_component_evaluations") == []
+
+
+# ── The alias record is versioned, and every other state fails closed ─────
+
+
+def _evaluation_row(experience_id: str, component_key: str):
+    from learning_studio import storage
+    from learning_studio.config import load_config
+
+    with storage.connect(load_config()) as conn:
+        return conn.execute(
+            "SELECT e.component_id, e.evaluation"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            " WHERE c.experience_id = ? AND c.component_key = ?",
+            (experience_id, component_key),
+        ).fetchone()
+
+
+def _rewrite_evaluation(component_id: str, evaluation: dict) -> None:
+    from learning_studio import storage
+    from learning_studio.config import load_config
+
+    with storage.connect(load_config()) as conn:
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            (json.dumps(evaluation), component_id),
+        )
+
+
+def _rewrite_binding_marker(
+    component_id: str, binding_scheme: int, binding_digest: str | None = None
+) -> None:
+    from learning_studio import storage
+    from learning_studio.config import load_config
+
+    with storage.connect(load_config()) as conn:
+        conn.execute(
+            "UPDATE experience_component_alias_bindings"
+            " SET binding_scheme = ?, binding_digest = ? WHERE component_id = ?",
+            (binding_scheme, binding_digest, component_id),
+        )
+
+
+def _aliased_experience(principal: Principal = OWNER) -> str:
+    result = service.prepare_experience(
+        principal=principal, manifest=manifest([example("multiple_choice", id="q-one")])
+    )
+    return result["experience_id"]
+
+
+def _state(experience_id: str, component_key: str = "q-one", principal: Principal = OWNER):
+    return service.component_aliases(
+        principal=principal, experience_id=experience_id, component_key=component_key
+    )
+
+
+def test_a_prepared_component_records_which_alias_scheme_it_used(hermes_home):
+    """The marker is what lets translation fail closed."""
+    from learning_studio.service import ALIAS_SCHEME, AliasState
+
+    experience_id = _aliased_experience()
+    aliases = _state(experience_id)
+
+    assert aliases.state is AliasState.ALIASED
+    assert aliases.mapping, "an aliased component reported no mapping"
+
+    stored = json.loads(_evaluation_row(experience_id, "q-one")["evaluation"])
+    assert stored["alias_scheme"] == ALIAS_SCHEME
+    assert set(stored["aliases"]) == set(aliases.mapping)
+
+
+def test_a_previous_head_record_is_read_as_aliased_not_as_canonical(hermes_home):
+    """The exact upgrade shape, and the reason this model exists.
+
+    The previous release wrote `aliases` but no `alias_scheme` — that field did
+    not exist yet. Reading such a record as "predates aliasing" hands a
+    learner-facing alias straight through, which is the defect being closed. A
+    mapping being present *is* the evidence that the payload was aliased,
+    whatever the record calls itself.
+
+    It resolves as `ALIASED_UNVERIFIED` rather than `ALIASED`: such a record
+    stored no canonical inventory, so "each target is a real identifier of the
+    original component" cannot be proved about it, and a weaker guarantee does not
+    get the stronger name.
+    """
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    stored = json.loads(row["evaluation"])
+    expected = dict(stored["aliases"])
+    del stored["alias_scheme"]
+    del stored["canonical_identifiers"]
+    _rewrite_evaluation(row["component_id"], stored)
+    _rewrite_binding_marker(row["component_id"], 1)
+
+    aliases = _state(experience_id)
+
+    assert aliases.state is AliasState.ALIASED_UNVERIFIED
+    assert aliases.translates
+    assert aliases.mapping == expected
+
+
+def test_stripping_current_alias_fields_cannot_downgrade_to_canonical(hermes_home):
+    """The separate scheme-3 marker makes evaluator-only downgrade fail closed."""
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    stored = json.loads(row["evaluation"])
+    stored.pop("alias_scheme")
+    stored.pop("aliases")
+    stored.pop("canonical_identifiers")
+    _rewrite_evaluation(row["component_id"], stored)
+
+    aliases = _state(experience_id)
+    assert aliases.state is AliasState.UNRESOLVED
+    assert not aliases.translates
+
+
+def test_a_record_with_no_alias_key_at_all_is_positively_canonical(hermes_home):
+    """Prepared before aliasing: an intact evaluator record, no alias key."""
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    stored = json.loads(row["evaluation"])
+    stored.pop("alias_scheme")
+    stored.pop("aliases")
+    assert "answer" in stored, "this fixture no longer proves the record is intact"
+    _rewrite_evaluation(row["component_id"], stored)
+    _rewrite_binding_marker(row["component_id"], 0)
+
+    assert _state(experience_id).state is AliasState.CANONICAL
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param({"alias_scheme": "1"}, id="scheme-not-an-integer"),
+        pytest.param({"alias_scheme": True}, id="scheme-is-a-boolean"),
+        pytest.param({"alias_scheme": 99}, id="scheme-from-the-future"),
+        pytest.param({"alias_scheme": 0}, id="scheme-zero"),
+        pytest.param({"alias_scheme": None, "aliases": None}, id="mapping-not-an-object"),
+        pytest.param({"aliases": ["a", "b"]}, id="mapping-is-a-list"),
+        pytest.param({"aliases": "x"}, id="mapping-is-a-string"),
+        pytest.param({"alias_scheme": None}, id="scheme-explicitly-null"),
+    ],
+)
+def test_a_malformed_alias_record_is_unresolved(hermes_home, damage: dict):
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    stored = json.loads(row["evaluation"])
+    for key, value in damage.items():
+        if value is None and key in stored:
+            stored[key] = None
+        else:
+            stored[key] = value
+    _rewrite_evaluation(row["component_id"], stored)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_a_scheme_with_no_mapping_is_unresolved(hermes_home):
+    """A component claiming to be aliased with nothing to alias with."""
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    stored = json.loads(row["evaluation"])
+    stored.pop("aliases")
+    _rewrite_evaluation(row["component_id"], stored)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_an_unparseable_evaluation_is_unresolved(hermes_home):
+    from learning_studio import storage
+    from learning_studio.config import load_config
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    with storage.connect(load_config()) as conn:
+        conn.execute(
+            "UPDATE experience_component_evaluations SET evaluation = ? WHERE component_id = ?",
+            ("{not json", row["component_id"]),
+        )
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_an_empty_evaluation_object_is_unresolved(hermes_home):
+    """No alias key *and* no evaluator key: nothing proves anything."""
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    _rewrite_evaluation(row["component_id"], {})
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_a_missing_evaluator_row_is_unresolved(hermes_home):
+    """Not evidence that the payload is canonical, so not identity translation."""
+    from learning_studio import storage
+    from learning_studio.config import load_config
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    with storage.connect(load_config()) as conn:
+        conn.execute(
+            "DELETE FROM experience_component_evaluations WHERE component_id = ?",
+            (row["component_id"],),
+        )
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_an_unknown_component_is_unresolved(hermes_home):
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+
+    assert _state(experience_id, component_key="no-such-card").state is AliasState.UNRESOLVED
+
+
+def test_an_unknown_experience_is_unresolved(hermes_home):
+    from learning_studio.service import AliasState
+
+    _aliased_experience()
+
+    assert _state("no-such-experience").state is AliasState.UNRESOLVED
+
+
+@pytest.mark.parametrize(
+    "intruder",
+    [
+        pytest.param(OTHER, id="another-learner"),
+        pytest.param(OTHER_PROFILE, id="another-profile"),
+        pytest.param(SAME_ID_ELSEWHERE, id="same-id-on-another-platform"),
+    ],
+)
+def test_nobody_else_can_read_an_alias_mapping(hermes_home, intruder: Principal):
+    """Scoped in SQL, like every other learner-owned read."""
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    trespass = _state(experience_id, principal=intruder)
+
+    assert trespass.state is AliasState.UNRESOLVED
+    assert trespass.mapping == {}
+
+
+def test_a_mapping_from_one_component_does_not_answer_for_another(hermes_home):
+    """Two components of one experience have different, unrelated aliases."""
+    result = service.prepare_experience(
+        principal=OWNER,
+        manifest=manifest(
+            [example("multiple_choice", id="q-one"), example("multi_select", id="q-two")]
+        ),
+    )
+    one = _state(result["experience_id"], "q-one")
+    two = _state(result["experience_id"], "q-two")
+
+    assert one.mapping and two.mapping
+    assert set(one.mapping) & set(two.mapping) == set()
+
+
+def test_the_mapping_never_carries_evaluator_data(hermes_home):
+    """The row it is read from holds the answer; only the mapping comes back."""
+    experience_id = _aliased_experience()
+    aliases = _state(experience_id)
+
+    rendered = json.dumps(aliases.mapping)
+    assert CANARY not in rendered
+    for forbidden in ("answer", "rubric", "hints", "feedback", "branching"):
+        assert forbidden not in rendered
+
+
+# ── Mapping entries are validated, never coerced ──────────────────────────
+#
+# `str(canonical)` accepted anything a JSON document could hold and made it
+# identifier-shaped: `None` became `"None"`, `42` became `"42"`, a nested object
+# became its `repr`. Each was then stored as a learner's answer — a plausible
+# value naming nothing in the answer key, which is the identity fallback's failure
+# arriving by another route.
+
+
+def _corrupt_first_alias_value(value):
+    def change(stored: dict) -> None:
+        alias = next(iter(stored["aliases"]))
+        stored["aliases"][alias] = value
+
+    return change
+
+
+def _with_damaged_record(change) -> str:
+    experience_id = _aliased_experience()
+    row = _evaluation_row(experience_id, "q-one")
+    stored = json.loads(row["evaluation"])
+    change(stored)
+    _rewrite_evaluation(row["component_id"], stored)
+    return experience_id
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(None, id="null"),
+        pytest.param(42, id="integer"),
+        pytest.param(True, id="boolean"),
+        pytest.param({"nested": "bad"}, id="object"),
+        pytest.param(["a"], id="list"),
+        pytest.param("", id="empty-string"),
+        pytest.param("   ", id="whitespace"),
+        pytest.param("has spaces", id="not-an-identifier"),
+        pytest.param("UPPERCASE", id="wrong-case"),
+        pytest.param("x" * 200, id="too-long"),
+    ],
+)
+def test_a_malformed_canonical_value_makes_the_record_unresolved(hermes_home, value):
+    from learning_studio.service import AliasState
+
+    experience_id = _with_damaged_record(_corrupt_first_alias_value(value))
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("", id="empty-key"),
+        pytest.param("has spaces", id="key-not-an-identifier"),
+        pytest.param("UPPER", id="key-wrong-case"),
+        pytest.param("x" * 200, id="key-too-long"),
+    ],
+)
+def test_a_malformed_alias_key_makes_the_record_unresolved(hermes_home, key):
+    """A key that could never have been minted as an alias."""
+    from learning_studio.service import AliasState
+
+    def change(stored: dict) -> None:
+        canonical = next(iter(stored["aliases"].values()))
+        stored["aliases"] = {key: canonical}
+
+    experience_id = _with_damaged_record(change)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_a_key_that_is_syntactically_fine_but_was_never_served_is_refused(hermes_home):
+    """`"null"` is a legal identifier, so syntax alone cannot reject it.
+
+    Coverage does: the aliases a response may name are the ones the stored learner
+    payload declares, and a mapping keyed by something that was never served
+    cannot be the mapping for this component. Worth stating, because the obvious
+    test to write here asserts a syntax failure and would pass for the wrong
+    reason.
+    """
+    from learning_studio.service import AliasState
+
+    experience_id = _with_damaged_record(
+        lambda stored: stored.__setitem__("aliases", {"null": "matrix"})
+    )
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_one_bad_entry_condemns_the_whole_mapping(hermes_home):
+    """A partially readable mapping is not partially usable."""
+    from learning_studio.service import AliasState
+
+    def change(stored: dict) -> None:
+        stored["aliases"]["xdeadbeefdeadbeef"] = 42
+
+    experience_id = _with_damaged_record(change)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_a_well_formed_mapping_is_returned_unchanged(hermes_home):
+    """The mirror: validation must not reject what this system itself minted."""
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    stored = json.loads(_evaluation_row(experience_id, "q-one")["evaluation"])
+
+    aliases = _state(experience_id)
+
+    assert aliases.state is AliasState.ALIASED
+    assert aliases.mapping == stored["aliases"]
+    assert all(
+        isinstance(key, str) and isinstance(value, str) for key, value in aliases.mapping.items()
+    )
+
+
+def test_an_absent_scheme_is_compatible_but_a_null_one_is_not(hermes_home):
+    """Presence and value are different questions, and only one is compatible."""
+    from learning_studio.service import AliasState
+
+    def previous_head(stored: dict) -> None:
+        stored.pop("alias_scheme")
+        stored.pop("canonical_identifiers")
+
+    absent = _with_damaged_record(previous_head)
+    _rewrite_binding_marker(_evaluation_row(absent, "q-one")["component_id"], 1)
+    assert _state(absent).state is AliasState.ALIASED_UNVERIFIED
+
+    explicit_null = _with_damaged_record(lambda stored: stored.__setitem__("alias_scheme", None))
+    _rewrite_binding_marker(_evaluation_row(explicit_null, "q-one")["component_id"], 1)
+    assert _state(explicit_null).state is AliasState.UNRESOLVED
+
+
+# ── The mapping is proved against the component, not against itself ───────
+#
+# Syntax is not integrity. A mapping whose targets are all `"unknown"`, or which
+# points every alias at one canonical identifier, is made of perfectly legal
+# identifiers — and was accepted. `set(mapping.values())` cannot be the expected
+# target set, because a damaged mapping would then be defining its own answer.
+
+
+def _served_aliases(experience_id: str, component_key: str = "q-one") -> set[str]:
+    """The aliases the stored learner payload actually declares."""
+    from learning_studio import storage
+    from learning_studio.components import content_identifiers
+    from learning_studio.config import load_config
+
+    with storage.connect(load_config()) as conn:
+        row = conn.execute(
+            "SELECT learner_payload FROM experience_components"
+            " WHERE experience_id = ? AND component_key = ?",
+            (experience_id, component_key),
+        ).fetchone()
+    return content_identifiers(json.loads(row["learner_payload"]).get("content"))
+
+
+def test_preparation_refuses_a_missing_alias_binding_store_without_writing_rows(hermes_home):
+    """An impossible partial schema is diagnosed instead of producing unanswerable data."""
+    storage.initialize()
+    with storage.connect() as conn:
+        conn.execute("DROP TABLE experience_component_alias_bindings")
+
+    with pytest.raises(RuntimeError, match="alias binding store is unavailable"):
+        service.prepare_experience(
+            principal=OWNER,
+            manifest=manifest([example("multiple_choice", id="q-one")]),
+        )
+
+    with storage.connect() as conn:
+        for table in (
+            "learners",
+            "experiences",
+            "experience_components",
+            "experience_component_evaluations",
+        ):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_a_prepared_component_stores_independent_exact_binding_evidence(hermes_home):
+    """The producer digest is outside the evaluator record it proves."""
+    from learning_studio.service import ALIAS_SCHEME, AliasState
+
+    experience_id = _aliased_experience()
+    stored = json.loads(_evaluation_row(experience_id, "q-one")["evaluation"])
+    aliases = _state(experience_id)
+    with storage.connect() as conn:
+        binding = conn.execute(
+            "SELECT b.binding_digest"
+            "  FROM experience_component_alias_bindings AS b"
+            "  JOIN experience_components AS c ON c.id = b.component_id"
+            " WHERE c.experience_id = ? AND c.component_key = ?",
+            (experience_id, "q-one"),
+        ).fetchone()
+
+    assert stored["alias_scheme"] == ALIAS_SCHEME == 3
+    assert "binding_digest" not in stored
+    assert len(binding["binding_digest"]) == 64
+    assert sorted(stored["canonical_identifiers"]) == sorted(set(stored["aliases"].values()))
+    assert set(stored["aliases"]) == _served_aliases(experience_id)
+    assert aliases.state is AliasState.ALIASED
+
+
+@pytest.mark.parametrize("damage", ["delete", "replace"])
+def test_missing_or_changed_producer_binding_is_unresolved(hermes_home, damage):
+    from learning_studio.service import AliasState
+
+    experience_id = _aliased_experience()
+    with storage.connect() as conn:
+        component_id = conn.execute(
+            "SELECT id FROM experience_components WHERE experience_id = ? AND component_key = ?",
+            (experience_id, "q-one"),
+        ).fetchone()["id"]
+        if damage == "delete":
+            conn.execute(
+                "DELETE FROM experience_component_alias_bindings WHERE component_id = ?",
+                (component_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE experience_component_alias_bindings"
+                " SET binding_digest = ? WHERE component_id = ?",
+                ("0" * 64, component_id),
+            )
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+@pytest.mark.parametrize(
+    ("name", "change"),
+    [
+        pytest.param(
+            "one-unknown-target",
+            lambda stored: stored["aliases"].__setitem__(next(iter(stored["aliases"])), "unknown"),
+            id="one-canonical-target-unknown",
+        ),
+        pytest.param(
+            "all-unknown-targets",
+            lambda stored: stored.__setitem__(
+                "aliases", {alias: "unknown" for alias in stored["aliases"]}
+            ),
+            id="all-canonical-targets-unknown",
+        ),
+        pytest.param(
+            "two-aliases-one-target",
+            lambda stored: stored["aliases"].__setitem__(
+                list(stored["aliases"])[0], list(stored["aliases"].values())[1]
+            ),
+            id="two-aliases-share-a-target",
+        ),
+        pytest.param(
+            "every-alias-one-target",
+            lambda stored: stored.__setitem__(
+                "aliases",
+                {alias: next(iter(stored["aliases"].values())) for alias in stored["aliases"]},
+            ),
+            id="every-alias-shares-one-target",
+        ),
+        pytest.param(
+            "two-canonical-targets-swapped",
+            lambda stored: stored["aliases"].update(
+                {
+                    list(stored["aliases"])[0]: list(stored["aliases"].values())[1],
+                    list(stored["aliases"])[1]: list(stored["aliases"].values())[0],
+                }
+            ),
+            id="mapping-permutes-valid-canonical-targets",
+        ),
+        pytest.param(
+            "mapping-and-inventory-rewritten-together",
+            lambda stored: (
+                stored.__setitem__(
+                    "aliases",
+                    {
+                        alias: f"invented-{index}"
+                        for index, alias in enumerate(stored["aliases"], start=1)
+                    },
+                ),
+                stored.__setitem__(
+                    "canonical_identifiers",
+                    [f"invented-{index}" for index in range(1, len(stored["aliases"]) + 1)],
+                ),
+            ),
+            id="paired-mapping-and-inventory-corruption",
+        ),
+        pytest.param(
+            "missing-served-alias",
+            lambda stored: stored["aliases"].pop(next(iter(stored["aliases"]))),
+            id="mapping-misses-a-served-alias",
+        ),
+        pytest.param(
+            "extra-unserved-alias",
+            lambda stored: stored["aliases"].__setitem__("xdeadbeefdeadbeef", "matrix"),
+            id="mapping-has-an-unserved-alias",
+        ),
+        pytest.param(
+            "inventory-missing-one",
+            lambda stored: stored["canonical_identifiers"].pop(),
+            id="inventory-missing-an-identifier",
+        ),
+        pytest.param(
+            "inventory-extra-one",
+            lambda stored: stored["canonical_identifiers"].append("extra"),
+            id="inventory-has-an-extra-identifier",
+        ),
+        pytest.param(
+            "inventory-not-a-list",
+            lambda stored: stored.__setitem__("canonical_identifiers", {"a": "b"}),
+            id="inventory-is-not-a-list",
+        ),
+        pytest.param(
+            "inventory-entries-not-strings",
+            lambda stored: stored.__setitem__("canonical_identifiers", [1, 2, 3]),
+            id="inventory-entries-are-not-strings",
+        ),
+        pytest.param(
+            "inventory-repeats",
+            lambda stored: stored.__setitem__(
+                "canonical_identifiers", [stored["canonical_identifiers"][0]] * 3
+            ),
+            id="inventory-repeats-an-identifier",
+        ),
+        pytest.param(
+            "inventory-explicitly-null",
+            lambda stored: stored.__setitem__("canonical_identifiers", None),
+            id="inventory-explicitly-null",
+        ),
+    ],
+)
+def test_a_mapping_that_cannot_be_proved_is_unresolved(hermes_home, name: str, change):
+    from learning_studio.service import AliasState
+
+    experience_id = _with_damaged_record(change)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED, name
+
+
+def test_a_mapping_from_another_component_is_refused(hermes_home):
+    """Valid in itself, and not this component's."""
+    from learning_studio.service import AliasState
+
+    result = service.prepare_experience(
+        principal=OWNER,
+        manifest=manifest(
+            [example("multiple_choice", id="q-one"), example("multi_select", id="q-two")]
+        ),
+    )
+    experience_id = result["experience_id"]
+    other = json.loads(_evaluation_row(experience_id, "q-two")["evaluation"])
+    row = _evaluation_row(experience_id, "q-one")
+    stored = json.loads(row["evaluation"])
+    stored["aliases"] = other["aliases"]
+    _rewrite_evaluation(row["component_id"], stored)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_a_canonical_inventory_from_another_component_is_refused(hermes_home):
+    from learning_studio.service import AliasState
+
+    result = service.prepare_experience(
+        principal=OWNER,
+        manifest=manifest(
+            [example("multiple_choice", id="q-one"), example("multi_select", id="q-two")]
+        ),
+    )
+    experience_id = result["experience_id"]
+    other = json.loads(_evaluation_row(experience_id, "q-two")["evaluation"])
+    row = _evaluation_row(experience_id, "q-one")
+    stored = json.loads(row["evaluation"])
+    stored["canonical_identifiers"] = other["canonical_identifiers"]
+    _rewrite_evaluation(row["component_id"], stored)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_the_inventory_is_not_derived_from_the_mapping(hermes_home):
+    """The property that makes the proof a proof.
+
+    Damaging both halves consistently — a mapping onto invented targets and an
+    inventory that agrees with it — must still be refused, because the aliases no
+    longer cover what was served. If the inventory were read from the mapping,
+    this pair would look perfectly consistent.
+    """
+    from learning_studio.service import AliasState
+
+    def change(stored: dict) -> None:
+        stored["aliases"] = {"xaaaaaaaaaaaaaaaa": "invented"}
+        stored["canonical_identifiers"] = ["invented"]
+
+    experience_id = _with_damaged_record(change)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+# ── Legacy and inventory-only formats are distinguished explicitly ───────
+
+
+def test_a_scheme_one_record_resolves_as_unverified(hermes_home):
+    """Mapping-only compatibility translates without claiming verified integrity."""
+    from learning_studio.service import AliasState
+
+    def change(stored: dict) -> None:
+        stored["alias_scheme"] = 1
+        del stored["canonical_identifiers"]
+
+    experience_id = _with_damaged_record(change)
+    _rewrite_binding_marker(_evaluation_row(experience_id, "q-one")["component_id"], 1)
+    aliases = _state(experience_id)
+
+    assert aliases.state is AliasState.ALIASED_UNVERIFIED
+    assert aliases.translates
+    assert set(aliases.mapping) == _served_aliases(experience_id)
+
+
+def test_a_scheme_two_record_is_unresolved(hermes_home):
+    """An inventory proves membership, not exact alias correspondence."""
+    from learning_studio.service import AliasState
+
+    experience_id = _with_damaged_record(lambda stored: stored.__setitem__("alias_scheme", 2))
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED
+
+
+def test_a_previous_head_record_resolves_as_unverified(hermes_home):
+    """`aliases` present, no scheme, no inventory — the c71466f shape."""
+    from learning_studio.service import AliasState
+
+    def change(stored: dict) -> None:
+        del stored["alias_scheme"]
+        del stored["canonical_identifiers"]
+
+    experience_id = _with_damaged_record(change)
+    _rewrite_binding_marker(_evaluation_row(experience_id, "q-one")["component_id"], 1)
+    aliases = _state(experience_id)
+
+    assert aliases.state is AliasState.ALIASED_UNVERIFIED
+    assert aliases.translates
+
+
+@pytest.mark.parametrize(
+    ("name", "change"),
+    [
+        pytest.param(
+            "coverage",
+            lambda stored: stored["aliases"].pop(next(iter(stored["aliases"]))),
+            id="missing-a-served-alias",
+        ),
+        pytest.param(
+            "injectivity",
+            lambda stored: stored["aliases"].__setitem__(
+                list(stored["aliases"])[0], list(stored["aliases"].values())[1]
+            ),
+            id="two-aliases-share-a-target",
+        ),
+        pytest.param(
+            "syntax",
+            lambda stored: stored["aliases"].__setitem__(next(iter(stored["aliases"])), 42),
+            id="target-is-not-an-identifier",
+        ),
+    ],
+)
+def test_an_older_record_is_still_held_to_every_provable_invariant(hermes_home, name: str, change):
+    """Unverified is not unchecked."""
+    from learning_studio.service import AliasState
+
+    def damage(stored: dict) -> None:
+        del stored["alias_scheme"]
+        del stored["canonical_identifiers"]
+        change(stored)
+
+    experience_id = _with_damaged_record(damage)
+    _rewrite_binding_marker(_evaluation_row(experience_id, "q-one")["component_id"], 1)
+
+    assert _state(experience_id).state is AliasState.UNRESOLVED, name
+
+
+def test_only_the_current_scheme_earns_the_verified_state(hermes_home):
+    """The distinction exists so a weaker guarantee cannot wear a stronger name."""
+    from learning_studio.service import AliasState
+
+    assert _state(_aliased_experience()).state is AliasState.ALIASED
+    assert (
+        _state(_with_damaged_record(lambda stored: stored.__setitem__("alias_scheme", 1))).state
+        is AliasState.UNRESOLVED
+    ), "scheme 1 claiming an inventory it should not have is damaged, not older"
