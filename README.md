@@ -1176,9 +1176,13 @@ swapped target, a coordinated mapping/inventory rewrite, a missing or altered
 binding, or an identifier the mapping does not cover is refused without advancing
 the exercise. Scheme-2 records predate the exact binding and are also refused for
 identifier-bearing responses; migration cannot invent correspondence evidence that
-was never recorded. Mapping-only scheme 1 and the previous unversioned shape remain
-an explicitly named `ALIASED_UNVERIFIED` compatibility path and never claim the
-scheme-3 guarantee. Components prepared before aliasing existed are identified by
+was never recorded. The digest is deliberately keyless: it detects partial damage
+or disagreement between the evaluator and binding records, but a writer able to
+alter both records can recompute it or deliberately select a legacy state. It is
+not authentication against a full-database writer. Mapping-only scheme 1 and the
+previous unversioned shape remain an explicitly named `ALIASED_UNVERIFIED`
+compatibility path and never claim the scheme-3 guarantee. Components prepared
+before aliasing existed are identified by
 an intact evaluator record carrying neither alias marker; that is the only state in
 which an identifier passes through unchanged.
 

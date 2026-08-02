@@ -198,17 +198,23 @@ def test_a_v8_alias_record_upgrades_unbound_and_new_records_are_bound(
     from learning_studio.service import AliasState
     from tests.component_examples import example, manifest
 
-    saved = storage.MIGRATIONS
-    storage.MIGRATIONS = [migration for migration in saved if migration.version <= 8]
-    try:
-        old = service.prepare_experience(
-            principal=LEARNER,
-            manifest=manifest([example("multiple_choice", id="old-question")]),
-        )
-    finally:
-        storage.MIGRATIONS = saved
+    old = service.prepare_experience(
+        principal=LEARNER,
+        manifest=manifest([example("multiple_choice", id="old-question")]),
+    )
 
+    # Migration 9 only introduced the binding store. Recreate the exact physical
+    # v8 shape and evaluator format without asking current write code to operate
+    # against a deliberately incomplete schema.
     with storage.connect() as conn:
+        conn.execute(
+            "UPDATE experience_component_evaluations"
+            "   SET evaluation = json_set(evaluation, '$.alias_scheme', 2)"
+            " WHERE experience_id = ?",
+            (old["experience_id"],),
+        )
+        conn.execute("DROP TABLE experience_component_alias_bindings")
+        conn.execute("UPDATE schema_version SET version = 8 WHERE id = 1")
         old_evaluator = conn.execute(
             "SELECT evaluation FROM experience_component_evaluations WHERE experience_id = ?",
             (old["experience_id"],),
@@ -790,12 +796,32 @@ def _store_experience_under_v3():
     storage.MIGRATIONS = [m for m in saved if m.version <= 3]
     try:
         storage.initialize()
-        return service.prepare_experience(
+        # Current preparation requires the current binding store. Give the fixture
+        # a disposable writer-side table, then remove it and rewrite the aliased
+        # evaluator to the scheme-2 shape the previous code emitted. The database
+        # handed to migration 4 is therefore still physically version 3.
+        with storage.connect() as conn:
+            conn.execute(
+                "CREATE TABLE experience_component_alias_bindings ("
+                " component_id TEXT PRIMARY KEY, experience_id TEXT NOT NULL,"
+                " learner_id TEXT NOT NULL, profile_id TEXT NOT NULL,"
+                " binding_scheme INTEGER NOT NULL, binding_digest TEXT,"
+                " created_at TEXT NOT NULL)"
+            )
+        prepared = service.prepare_experience(
             principal=LEARNER,
             manifest=manifest(
                 [example("multiple_choice", id="one"), example("short_answer", id="two")]
             ),
         )
+        with storage.connect() as conn:
+            conn.execute(
+                "UPDATE experience_component_evaluations"
+                "   SET evaluation = json_set(evaluation, '$.alias_scheme', 2)"
+                " WHERE json_type(evaluation, '$.aliases') = 'object'"
+            )
+            conn.execute("DROP TABLE experience_component_alias_bindings")
+        return prepared
     finally:
         storage.MIGRATIONS = saved
 

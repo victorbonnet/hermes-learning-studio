@@ -2161,6 +2161,8 @@ def _insert_experience(
         ).fetchone()
         is not None
     )
+    if not has_alias_binding_store:
+        raise RuntimeError("alias binding store is unavailable after storage initialization")
     conn.execute(
         "INSERT INTO experiences"
         " (id, learner_id, profile_id, track_id, objective_id, manifest_schema_version,"
@@ -2232,9 +2234,7 @@ def _insert_experience(
             hidden = {
                 **hidden,
                 "aliases": projection.aliases,
-                "alias_scheme": (
-                    ALIAS_SCHEME if has_alias_binding_store else _INVENTORY_ONLY_SCHEME
-                ),
+                "alias_scheme": ALIAS_SCHEME,
                 # Membership evidence captured from canonical content. Exact
                 # alias-to-canonical correspondence is bound separately below.
                 "canonical_identifiers": sorted(projection.canonical_identifiers),
@@ -2246,7 +2246,7 @@ def _insert_experience(
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (component_row_id, experience_id, learner_id, profile, dumps(hidden), now),
             )
-        if hidden and has_alias_binding_store:
+        if hidden:
             binding_scheme = ALIAS_SCHEME if projection.aliases else 0
             digest = (
                 _alias_binding_digest(
@@ -2597,9 +2597,11 @@ def _alias_binding_digest(
 
     The canonical inventory proves only a target set. This commits to every
     alias-to-canonical pair and to the projection and ownership row it belongs to,
-    so permuting targets, moving a map to another component, or rewriting mapping
-    and inventory together cannot agree with the producer evidence written in the
-    separate binding table.
+    so partial corruption confined to the evaluator record cannot agree with the
+    producer evidence written in the separate binding table. This keyless digest
+    is not protection against an adversary with write access to both records: such
+    an adversary can recompute it or deliberately select the legacy compatibility
+    state.
     """
     document = {
         "scheme": ALIAS_SCHEME,

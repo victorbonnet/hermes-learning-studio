@@ -1120,6 +1120,28 @@ def _served_aliases(experience_id: str, component_key: str = "q-one") -> set[str
     return content_identifiers(json.loads(row["learner_payload"]).get("content"))
 
 
+def test_preparation_refuses_a_missing_alias_binding_store_without_writing_rows(hermes_home):
+    """An impossible partial schema is diagnosed instead of producing unanswerable data."""
+    storage.initialize()
+    with storage.connect() as conn:
+        conn.execute("DROP TABLE experience_component_alias_bindings")
+
+    with pytest.raises(RuntimeError, match="alias binding store is unavailable"):
+        service.prepare_experience(
+            principal=OWNER,
+            manifest=manifest([example("multiple_choice", id="q-one")]),
+        )
+
+    with storage.connect() as conn:
+        for table in (
+            "learners",
+            "experiences",
+            "experience_components",
+            "experience_component_evaluations",
+        ):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
 def test_a_prepared_component_stores_independent_exact_binding_evidence(hermes_home):
     """The producer digest is outside the evaluator record it proves."""
     from learning_studio.service import ALIAS_SCHEME, AliasState
