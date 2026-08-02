@@ -596,23 +596,28 @@ def test_results_reflect_a_session_that_was_actually_opened(
 # ── The shipped delivery seam ─────────────────────────────────────────────
 
 
-def test_the_default_delivery_refuses_rather_than_pretending(hermes_home):
-    """Until a sender exists, a launch must fail closed and say nothing arrived."""
+def test_the_shipped_delivery_is_the_telegram_sender(hermes_home, monkeypatch):
+    """No test injects it, so this is what proves the default is wired at all."""
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        "learning_studio.telegram_launch.deliver_web_app_button",
+        lambda **kwargs: sent.append(kwargs),
+    )
+
+    launch_module._default_deliver(destination=None, url=TUNNEL_URL, label="x", title="y")
+
+    assert sent and sent[0]["url"] == TUNNEL_URL
+
+
+def test_a_launch_with_no_bot_token_rolls_everything_back(
+    runtime, telegram_session, principal, experience_id, monkeypatch
+):
+    """The credential is absent, so the message cannot be sent — and is not faked."""
     from learning_studio.runtime.errors import LaunchRefused
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
 
     with pytest.raises(LaunchRefused) as caught:
-        launch_module._default_deliver(destination=None, url=TUNNEL_URL, label="x", title="y")
-
-    assert caught.value.reason == "delivery_unavailable"
-    assert "do not tell them to tap anything" in caught.value.message.lower()
-
-
-def test_a_launch_with_the_shipped_default_rolls_everything_back(
-    runtime, telegram_session, principal, experience_id
-):
-    from learning_studio.runtime.errors import LaunchRefused
-
-    with pytest.raises(LaunchRefused):
         launch_module.launch_experience(
             principal=principal,
             experience_id=experience_id,
@@ -621,6 +626,8 @@ def test_a_launch_with_the_shipped_default_rolls_everything_back(
             ledger=ConsentLedger(),
         )
 
+    assert caught.value.reason == "bot_token_absent"
+    assert "do not tell them to tap anything" in caught.value.message.lower()
     assert runtime.store.admit(telegram_user_id="1001", experience_id=experience_id) is None
 
 

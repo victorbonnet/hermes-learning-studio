@@ -281,7 +281,7 @@ OPTIONAL_MODULES = ("fastapi", "starlette", "uvicorn", "PIL", "telegram", "telet
 #: diff that adds a module able to start a process is also the diff that adds
 #: it here.
 _URLLIB_PARSE_ONLY = ("telegram_auth.py", "runtime/tunnel.py")
-_TELEGRAM_SENDER: tuple[str, ...] = ()
+_TELEGRAM_SENDER = ("telegram_launch.py",)
 _LOOPBACK_HTTP = ("runtime/ownership.py",)
 _PROCESS_STARTERS = (
     "runtime/bootstrap.py",

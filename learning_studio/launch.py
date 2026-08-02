@@ -57,7 +57,7 @@ from . import service
 from .config import LearningStudioConfig, load_config
 from .identity import Principal
 from .runtime import manager, ownership, supervisor
-from .runtime.errors import DELIVERY_FAILED, TUNNEL_FAILED, LaunchRefused, RuntimeUnavailable
+from .runtime.errors import TUNNEL_FAILED, RuntimeUnavailable
 from .runtime.state import ProfileLock
 
 logger = logging.getLogger(__name__)
@@ -277,15 +277,16 @@ class _suppressed:
 
 
 def _default_deliver(**kwargs: Any) -> None:
-    """Send the button. Replaced by the Telegram sender in the next change.
+    """Send the button, through the one module that holds a bot token.
 
-    Until then a launch cannot complete: it creates a grant, fails here, revokes
-    the grant, stops the runtime it started, and reports that nothing reached
-    the learner. That is the correct behaviour for a build with no way to
-    deliver — the alternative is a tunnel nobody was told about.
+    Imported here rather than at this module's scope so that the single file
+    able to reach a remote host is loaded only on the path that actually sends
+    something — reading a launch's ownership and consent logic does not need to
+    drag in a network client.
     """
-    del kwargs
-    raise LaunchRefused(DELIVERY_FAILED, reason="delivery_unavailable")
+    from .telegram_launch import deliver_web_app_button
+
+    deliver_web_app_button(**kwargs)
 
 
 def launch_results(
