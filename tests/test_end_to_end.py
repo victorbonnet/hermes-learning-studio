@@ -61,16 +61,60 @@ class Sent:
     url: str
     label: str
     title: str
+    launch_id: str
 
 
 class Telegram:
-    """The narrowest possible stand-in: one function, recording one message."""
+    """A stand-in for the transport, not for the message.
+
+    It builds the **real** Bot API payload — the same
+    ``telegram_launch.build_payload`` a live send uses, with the same
+    ``button_url`` — and keeps it. So the tests below can take the exact
+    ``web_app.url`` a learner would receive and open *that*, rather than an
+    address the test made up.
+
+    Only the HTTP request is replaced. Everything that decides what the button
+    says and where it points is the shipped code.
+    """
 
     def __init__(self) -> None:
         self.messages: list[Sent] = []
+        self.payloads: list[dict] = []
 
-    def __call__(self, *, destination, url, label, title):
-        self.messages.append(Sent(destination.chat_id, url, label, title))
+    def __call__(self, *, destination, url, label, title, launch_id):
+        from learning_studio.telegram_launch import build_payload, button_url
+
+        self.payloads.append(
+            build_payload(
+                chat_id=destination.chat_id,
+                url=button_url(url, launch_id),
+                label=label,
+                title=title,
+            )
+        )
+        self.messages.append(Sent(destination.chat_id, url, label, title, launch_id))
+
+    @property
+    def button_url(self) -> str:
+        """The address in the message, exactly as Telegram would deliver it."""
+        return self.payloads[-1]["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"]
+
+
+def selector_from(button: str) -> str:
+    """Read the launch id out of a button URL the way the frontend does.
+
+    Deliberately not "remember what we passed in": the point of these tests is
+    that the thing the learner receives is the thing that opens the exercise,
+    so the selector has to come back out of the URL.
+    """
+    from learning_studio.telegram_launch import LAUNCH_FRAGMENT_KEY
+
+    fragment = button.partition("#")[2]
+    for part in fragment.split("&"):
+        name, _, value = part.partition("=")
+        if name == LAUNCH_FRAGMENT_KEY:
+            return value
+    raise AssertionError(f"no {LAUNCH_FRAGMENT_KEY} in the button URL")
 
 
 @pytest.fixture
@@ -298,8 +342,16 @@ def test_a_learner_asks_to_practise_and_gets_a_working_exercise(
     # The address the learner was sent never reaches the agent.
     assert "trycloudflare" not in json.dumps(launched)
 
-    # 5. The learner taps it. Real initData, real HMAC, real session.
-    opened = webview.post("/api/session", headers=auth(), json={"experience_id": experience_id})
+    # 5. The learner taps it. The selector comes out of the URL in the message
+    #    — nothing is injected — and the server derives the exercise from the
+    #    grant it names. Real initData, real HMAC, real session.
+    assert telegram.button_url.startswith(TUNNEL_URL)
+    assert experience_id not in telegram.button_url, "the button named an exercise"
+    opened = webview.post(
+        "/api/session",
+        headers=auth(),
+        json={"launch_id": selector_from(telegram.button_url)},
+    )
     assert opened.status_code == 201
     token = opened.json()["session_token"]
     assert opened.json()["experience"]["component_count"] == 2
@@ -349,17 +401,20 @@ def test_the_agent_is_never_told_what_the_learner_wrote(
         config=config,
     )
     experience_id = prepared["experience_id"]
+    telegram = Telegram()
     launch_module.launch_experience(
         principal=principal,
         experience_id=experience_id,
         initiation="learner_request",
         learner_quote=LEARNER_QUOTE,
         config=config,
-        deliver=Telegram(),
+        deliver=telegram,
     )
 
     token = webview.post(
-        "/api/session", headers=auth(), json={"experience_id": experience_id}
+        "/api/session",
+        headers=auth(),
+        json={"launch_id": selector_from(telegram.button_url)},
     ).json()["session_token"]
     component = webview.get(
         "/api/session/component", headers={**auth(), SESSION_HEADER: token}
@@ -408,9 +463,12 @@ def test_the_tunnel_address_alone_opens_nothing(
         config=config,
     )["experience_id"]
 
-    refused = webview.post("/api/session", headers=auth(), json={"experience_id": experience_id})
+    # No launch happened, so there is no selector — and naming the exercise
+    # directly is not authority on a runtime this plugin started.
+    for payload in ({"experience_id": experience_id}, {"launch_id": "Kx7vQm2ZpL9dR4sT"}, {}):
+        refused = webview.post("/api/session", headers=auth(), json=payload)
+        assert refused.status_code == 404, payload
 
-    assert refused.status_code == 404
     assert len(grants) == 0
 
 
@@ -424,6 +482,14 @@ def test_a_revoked_launch_cannot_be_opened(
         config=config,
     )["experience_id"]
 
+    captured: list[str] = []
+
+    def deliver_then_fail(*, destination, url, label, title, launch_id):
+        from learning_studio.telegram_launch import button_url
+
+        captured.append(button_url(url, launch_id))
+        raise RuntimeError("telegram is unreachable")
+
     with pytest.raises(RuntimeError):
         launch_module.launch_experience(
             principal=principal,
@@ -431,16 +497,15 @@ def test_a_revoked_launch_cannot_be_opened(
             initiation="learner_request",
             learner_quote=LEARNER_QUOTE,
             config=config,
-            deliver=_failing_telegram,
+            deliver=deliver_then_fail,
         )
 
-    refused = webview.post("/api/session", headers=auth(), json={"experience_id": experience_id})
+    # The URL was built, so a copy of it could exist. It opens nothing.
+    refused = webview.post(
+        "/api/session", headers=auth(), json={"launch_id": selector_from(captured[0])}
+    )
 
     assert refused.status_code == 404
-
-
-def _failing_telegram(**_kwargs):
-    raise RuntimeError("telegram is unreachable")
 
 
 def test_another_account_cannot_use_this_learners_launch(
@@ -451,17 +516,21 @@ def test_another_account_cannot_use_this_learners_launch(
         manifest=manifest([example("true_false", id="q-one")]),
         config=config,
     )["experience_id"]
+    telegram = Telegram()
     launch_module.launch_experience(
         principal=principal,
         experience_id=experience_id,
         initiation="learner_request",
         learner_quote=LEARNER_QUOTE,
         config=config,
-        deliver=Telegram(),
+        deliver=telegram,
     )
 
+    # The whole URL, copied. It is a selector, not a credential.
     intruder = webview.post(
-        "/api/session", headers=auth(user_id=OTHER_USER_ID), json={"experience_id": experience_id}
+        "/api/session",
+        headers=auth(user_id=OTHER_USER_ID),
+        json={"launch_id": selector_from(telegram.button_url)},
     )
 
     # 403 at the allowlist, or 404 at the grant — either way, not in.

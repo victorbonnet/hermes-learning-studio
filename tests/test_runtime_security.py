@@ -269,12 +269,54 @@ def test_one_profile_cannot_see_or_stop_another(tmp_path, monkeypatch):
 
 
 def test_a_grant_admits_only_the_account_it_was_created_for():
+    """A copied button URL, in somebody else's hands, opens nothing."""
     store = grants.GrantStore(profile="default", generation=1, clock=lambda: 0.0)
-    store.create({"telegram_user_id": "1001", "learner_id": "learner-a", "experience_id": "exp-1"})
+    created = store.create(
+        {"telegram_user_id": "1001", "learner_id": "learner-a", "experience_id": "exp-1"}
+    )
+    selector = created["launch_id"]
 
-    assert store.admit(telegram_user_id="2002", experience_id="exp-1") is None
-    assert store.admit(telegram_user_id="1001", experience_id="exp-2") is None
-    assert store.admit(telegram_user_id="1001", experience_id="exp-1") is not None
+    assert store.admit(launch_id=selector, telegram_user_id="2002") is None
+    assert store.admit(launch_id="Zz" + "0" * 20, telegram_user_id="1001") is None
+    assert store.admit(launch_id=selector, telegram_user_id="1001") is not None
+
+
+@pytest.mark.parametrize(
+    "selector", ["", "short", "../../etc", "x" * 200, "has spaces here at all", None]
+)
+def test_a_malformed_selector_admits_nothing(selector):
+    store = grants.GrantStore(profile="default", generation=1, clock=lambda: 0.0)
+    store.create({"telegram_user_id": "1001", "learner_id": "l", "experience_id": "e"})
+
+    assert store.admit(launch_id=selector, telegram_user_id="1001") is None
+
+
+def test_a_selector_from_another_generation_admits_nothing():
+    """A runtime that was replaced must not honour the old one's buttons."""
+    first = grants.GrantStore(profile="default", generation=4, clock=lambda: 0.0)
+    created = first.create({"telegram_user_id": "1001", "learner_id": "l", "experience_id": "e"})
+    second = grants.GrantStore(profile="default", generation=5, clock=lambda: 0.0)
+
+    assert second.admit(launch_id=created["launch_id"], telegram_user_id="1001") is None
+
+
+def test_an_expired_selector_admits_nothing():
+    clock = {"now": 0.0}
+    store = grants.GrantStore(profile="default", generation=1, clock=lambda: clock["now"])
+    created = store.create({"telegram_user_id": "1001", "learner_id": "l", "experience_id": "e"})
+
+    clock["now"] = grants.DEFAULT_GRANT_TTL_SECONDS + 1
+
+    assert store.admit(launch_id=created["launch_id"], telegram_user_id="1001") is None
+
+
+def test_a_revoked_selector_admits_nothing():
+    store = grants.GrantStore(profile="default", generation=1, clock=lambda: 0.0)
+    created = store.create({"telegram_user_id": "1001", "learner_id": "l", "experience_id": "e"})
+
+    store.revoke(created["launch_id"])
+
+    assert store.admit(launch_id=created["launch_id"], telegram_user_id="1001") is None
 
 
 def test_progress_cannot_be_read_for_another_account():

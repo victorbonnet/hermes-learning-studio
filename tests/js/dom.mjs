@@ -265,7 +265,15 @@ export function createWindow(overrides = {}) {
 
   const win = {
     document,
-    location: { search: "" },
+    // The launch selector arrives in the fragment, so the shim has to have
+    // one -- and a `history` for the page to strip it with.
+    location: { search: "", hash: "", pathname: "/" },
+    history: {
+      replaced: [],
+      replaceState(state, title, url) {
+        this.replaced.push(url);
+      },
+    },
     URLSearchParams,
     URL: {
       createObjectURL(blob) {

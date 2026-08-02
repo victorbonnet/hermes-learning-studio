@@ -111,9 +111,15 @@ class Deliveries:
         self.fails = fails
         self.sent: list[dict] = []
 
-    def __call__(self, *, destination, url, label, title):
+    def __call__(self, *, destination, url, label, title, launch_id):
         self.sent.append(
-            {"chat_id": destination.chat_id, "url": url, "label": label, "title": title}
+            {
+                "chat_id": destination.chat_id,
+                "url": url,
+                "label": label,
+                "title": title,
+                "launch_id": launch_id,
+            }
         )
         if self.fails:
             raise self.fails
@@ -293,12 +299,10 @@ def test_the_result_says_nothing_is_scored(runtime, telegram_session, principal,
     assert "no attempt, score, mastery" in result["notice"]
 
 
-def test_a_grant_is_created_and_bound_to_the_learner(
-    runtime, telegram_session, principal, experience_id
-):
-    launch(principal, experience_id, deliver=Deliveries())
+def test_a_grant_is_created_and_bound_to_the_learner(runtime, spoken, principal, experience_id):
+    result = launch(principal, experience_id, deliver=Deliveries())
 
-    granted = runtime.store.admit(telegram_user_id="1001", experience_id=experience_id)
+    granted = runtime.store.admit(launch_id=result["launch_id"], telegram_user_id="1001")
 
     assert granted is not None
     assert granted.experience_id == experience_id
@@ -518,7 +522,7 @@ def test_a_failed_delivery_leaves_no_grant_behind(
             deliver=Deliveries(fails=RuntimeError("telegram is down")),
         )
 
-    assert runtime.store.admit(telegram_user_id="1001", experience_id=experience_id) is None
+    assert len(runtime.store) == 0
 
 
 def test_a_failed_delivery_does_not_stop_a_runtime_it_reused(
@@ -651,16 +655,19 @@ def test_results_reflect_a_session_that_was_actually_opened(
     runtime, telegram_session, principal, experience_id
 ):
     """Progress is read from the live session, never from a second copy of it."""
-    launch(principal, experience_id, deliver=Deliveries())
-    granted = runtime.store.admit(telegram_user_id="1001", experience_id=experience_id)
+    result = launch(principal, experience_id, deliver=Deliveries())
+    granted = runtime.store.admit(launch_id=result["launch_id"], telegram_user_id="1001")
 
     class Session:
         position = 1
         component_count = 3
         answers = {"q-one": {}}
+        revealed: dict = {}
         completed = False
+        completed_at = None
+        expires_at = 1e12
 
-    runtime.store.bind_session(granted, Session())
+    runtime.store.admit_session(granted, lambda: ("token", Session()))
 
     result = launch_module.launch_results(
         principal=principal, experience_id=experience_id, config=config()
@@ -708,7 +715,7 @@ def test_a_launch_with_no_bot_token_rolls_everything_back(
 
     assert caught.value.reason == "bot_token_absent"
     assert "do not tell them to tap anything" in caught.value.message.lower()
-    assert runtime.store.admit(telegram_user_id="1001", experience_id=experience_id) is None
+    assert len(runtime.store) == 0
 
 
 # ── Destination ───────────────────────────────────────────────────────────

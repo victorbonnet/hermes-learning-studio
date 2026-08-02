@@ -196,6 +196,10 @@ def _launch_within(
             url=public_url,
             label=settings.launch_button_label,
             title=str(experience["title"]),
+            # The selector the button carries. Without it the page has nothing
+            # to open: an inline web_app button produces no start_param, which
+            # is what made the first version of this launch nothing at all.
+            launch_id=launch_id,
         )
     except BaseException:
         # The learner has no button, so they must not have a grant either.

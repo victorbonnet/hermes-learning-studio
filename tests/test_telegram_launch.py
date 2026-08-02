@@ -20,6 +20,8 @@ from learning_studio.runtime.errors import LaunchRefused
 
 TOKEN = "123456789:AAHfakeTokenForTestsOnly_notARealSecret"
 URL = "https://calm-forest-1234.trycloudflare.com"
+LAUNCH_ID = "Kx7vQm2ZpL9dR4sT"
+BUTTON_URL = f"{URL}/#launch={LAUNCH_ID}"
 
 
 @dataclass
@@ -45,12 +47,20 @@ class Opener:
         return self.response
 
 
-def send(opener, *, token: str = TOKEN, url: str = URL, label: str = "Open Learning Studio"):
+def send(
+    opener,
+    *,
+    token: str = TOKEN,
+    url: str = URL,
+    label: str = "Open Learning Studio",
+    launch_id: str = LAUNCH_ID,
+):
     telegram_launch.deliver_web_app_button(
         destination=Destination(),
         url=url,
         label=label,
         title="Photosynthesis, five questions",
+        launch_id=launch_id,
         bot_token=token,
         opener=opener,
     )
@@ -67,7 +77,7 @@ def test_a_web_app_button_is_sent_to_the_derived_chat():
     body = json.loads(opener.body)
     assert body["chat_id"] == "1001"
     button = body["reply_markup"]["inline_keyboard"][0][0]
-    assert button["web_app"]["url"] == URL
+    assert button["web_app"]["url"] == BUTTON_URL
     assert button["text"] == "Open Learning Studio"
 
 
@@ -87,9 +97,37 @@ def test_the_body_carries_no_session_token_identifier_or_query_string():
 
     body = json.loads(opener.body)
     flattened = json.dumps(body)
-    assert "?" not in body["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"]
+    url = body["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"]
+    assert "?" not in url, "a query string would reach the server and its logs"
     for forbidden in ("session", "experience_id", "initData", "token", "learner"):
         assert forbidden not in flattened
+
+
+def test_the_selector_travels_in_the_fragment_and_nowhere_else():
+    """A fragment is never sent to the server, so it is in no log or Referer."""
+    opener = Opener()
+
+    send(opener)
+
+    url = json.loads(opener.body)["reply_markup"]["inline_keyboard"][0][0]["web_app"]["url"]
+    origin, _, fragment = url.partition("#")
+
+    assert origin == URL + "/"
+    assert fragment == f"launch={LAUNCH_ID}"
+    assert LAUNCH_ID not in origin
+
+
+@pytest.mark.parametrize(
+    "selector", ["", "short", "../../etc/passwd", "has spaces", "x" * 200, None]
+)
+def test_a_malformed_selector_is_never_sent(selector):
+    opener = Opener()
+
+    with pytest.raises(LaunchRefused) as caught:
+        send(opener, launch_id=selector)
+
+    assert caught.value.reason == "launch_selector_malformed"
+    assert opener.endpoint is None
 
 
 def test_the_button_label_is_bounded_to_what_telegram_accepts():
@@ -219,7 +257,12 @@ def test_the_token_is_read_from_the_environment_hermes_already_uses(monkeypatch)
     opener = Opener()
 
     telegram_launch.deliver_web_app_button(
-        destination=Destination(), url=URL, label="Open", title="Title", opener=opener
+        destination=Destination(),
+        url=URL,
+        label="Open",
+        title="Title",
+        launch_id=LAUNCH_ID,
+        opener=opener,
     )
 
     assert TOKEN in opener.endpoint

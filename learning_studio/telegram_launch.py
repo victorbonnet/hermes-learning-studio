@@ -19,11 +19,16 @@ What the message contains
 -------------------------
 
 A short line of text and a single inline button whose ``web_app.url`` is the
-validated tunnel address. There is no session token, no experience identifier,
-no learner name, and no query string. The address behind the button is not a
-credential on its own: opening it still requires the learner's Telegram account
-to verify, to be on the profile's allowlist, and to hold an unexpired launch
-grant.
+validated tunnel origin plus ``#launch=<launch id>``.
+
+The selector is in the fragment on purpose: browsers never send a fragment to
+the server, so it appears in no request line, no access log, and no ``Referer``
+— and the page strips it from history as soon as it has read it. There is no
+session token, no experience identifier, no learner name, and no query string.
+
+**The URL is not a credential.** The selector says only which launch is meant;
+opening it still requires the learner's Telegram account to verify, to be on
+the profile's allowlist, to own the exercise, and to hold that unexpired grant.
 
 The token
 ---------
@@ -63,6 +68,10 @@ TELEGRAM_API_ORIGIN = "https://api.telegram.org"
 
 SEND_MESSAGE_METHOD = "sendMessage"
 
+#: The fragment key the frontend reads the launch selector from. One name, used
+#: by the sender and by ``app.js``, so the two cannot drift apart.
+LAUNCH_FRAGMENT_KEY = "launch"
+
 #: A send either works quickly or is not worth waiting for: the learner is
 #: watching a conversation, and a tool call that hangs is worse than one that
 #: says it could not send.
@@ -78,12 +87,33 @@ MAX_RESPONSE_BYTES = 64 * 1024
 MESSAGE_TEMPLATE = "{title}"
 
 
+def button_url(origin: str, launch_id: str) -> str:
+    """The address behind the button: a validated origin and a selector.
+
+    The selector goes in the **fragment**. Browsers do not send a fragment to
+    the server — it is absent from the request line and from ``Referer`` — so
+    the launch id stays out of the tunnel operator's logs and out of any
+    intermediary's, while still reaching the page that needs it.
+
+    The origin is validated *without* the fragment, by the same rule that
+    refuses a fragment in a tunnel address: what cloudflared printed must be a
+    bare Quick Tunnel origin, and the only thing allowed to add anything to it
+    is this function.
+    """
+    from .runtime.grants import LAUNCH_ID_PATTERN
+
+    if not LAUNCH_ID_PATTERN.match(str(launch_id or "")):
+        raise LaunchRefused(DELIVERY_FAILED, reason="launch_selector_malformed")
+    return f"{origin}/#{LAUNCH_FRAGMENT_KEY}={launch_id}"
+
+
 def deliver_web_app_button(
     *,
     destination,
     url: str,
     label: str,
     title: str,
+    launch_id: str,
     bot_token: str | None = None,
     opener=None,
 ) -> None:
@@ -112,7 +142,12 @@ def deliver_web_app_button(
     except TunnelError as exc:
         raise LaunchRefused(DELIVERY_FAILED, reason=f"delivery_{exc.reason}") from exc
 
-    payload = build_payload(chat_id=destination.chat_id, url=safe_url, label=label, title=title)
+    payload = build_payload(
+        chat_id=destination.chat_id,
+        url=button_url(safe_url, launch_id),
+        label=label,
+        title=title,
+    )
     _post(token, payload, opener=opener)
 
 

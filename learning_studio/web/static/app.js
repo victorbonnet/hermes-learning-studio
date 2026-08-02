@@ -53,7 +53,10 @@
   //: shape before putting it in a request body is not authorisation -- the
   //: server owns that -- it just turns a mangled deep link into an honest
   //: "not found" card instead of a pointless round trip.
-  var EXPERIENCE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+  // The launch selector, in exactly the shape the runtime issues. Anchored, so
+  // a fragment carrying anything else is not sent at all.
+  var LAUNCH_ID = /^[A-Za-z0-9_-]{16,64}$/;
+  var LAUNCH_FRAGMENT_KEY = "launch";
 
   //: Telegram theme values are colours, and this is what a CSS hex colour may
   //: look like: exactly 3, 4, 6, or 8 digits. Custom properties accept almost
@@ -90,6 +93,10 @@
 
     var t = I18n.translator(I18n.FALLBACK_LOCALE);
     var sessionToken = "";
+    // Read from the URL fragment once and kept, because the fragment is
+    // removed from history immediately afterwards and a restart still needs to
+    // know which launch this page is.
+    var launchId = "";
     var experience = null;
     var progress = null;
     var currentCard = null;
@@ -462,34 +469,64 @@
     // ── Flow ────────────────────────────────────────────────────────────
 
     /**
-     * Which exercise to open.
+     * Which launch to open.
      *
-     * Preferred source is the signed `initData`: `start_param` is inside the
-     * payload the server verifies, so a tampered deep link invalidates the
-     * signature rather than silently redirecting the launch. `initDataUnsafe`
-     * and the query string are fallbacks for clients that expose one and not
-     * the other, and are safe as fallbacks because the identifier is not a
-     * capability -- the server authorises ownership regardless of how it
-     * arrived.
+     * The button's URL carries `#launch=<launch id>`. A fragment is read by
+     * the page and never sent to the server, so the selector appears in no
+     * request line, no access log and no `Referer` -- and it is removed from
+     * the visible history as soon as it has been read, so a screenshot or a
+     * shared history entry does not carry it either.
+     *
+     * It is a *selector*, not a capability: it says which launch is meant, and
+     * the server still requires verified `initData`, an allowlisted account
+     * that owns the exercise, and a grant issued to that same account. So
+     * sending one that is not ours is refused rather than dangerous, and there
+     * is nothing here that has to be kept secret.
+     *
+     * `start_param` is deliberately not consulted. An inline `web_app` button
+     * does not produce one -- that is a property of `t.me` deep links -- so
+     * relying on it meant the page had nothing to open at all.
      */
-    function resolveExperienceId() {
-      var candidates = [];
-      if (telegram && telegram.initData && global.URLSearchParams) {
-        candidates.push(new global.URLSearchParams(telegram.initData).get("start_param"));
+    function resolveLaunchId() {
+      var raw = "";
+      if (locationRef && typeof locationRef.hash === "string") {
+        raw = locationRef.hash;
       }
-      if (telegram && telegram.initDataUnsafe) {
-        candidates.push(telegram.initDataUnsafe.start_param);
-      }
-      if (locationRef && locationRef.search && global.URLSearchParams) {
-        candidates.push(new global.URLSearchParams(locationRef.search).get("experience_id"));
-      }
-      for (var index = 0; index < candidates.length; index += 1) {
-        var candidate = candidates[index];
-        if (typeof candidate === "string" && EXPERIENCE_ID.test(candidate)) {
-          return candidate;
+      var fragment = raw.charAt(0) === "#" ? raw.slice(1) : raw;
+      var found = "";
+      var parts = fragment.split("&");
+      for (var index = 0; index < parts.length; index += 1) {
+        var pair = parts[index].split("=");
+        if (pair[0] === LAUNCH_FRAGMENT_KEY && pair.length > 1) {
+          found = pair.slice(1).join("=");
+          break;
         }
       }
-      return "";
+      if (!LAUNCH_ID.test(found)) {
+        return "";
+      }
+      forgetFragment();
+      return found;
+    }
+
+    /**
+     * Drop the selector from the address bar and from history.
+     *
+     * Best effort by design: an environment without `history.replaceState` is
+     * not a reason to refuse to open the exercise, because the selector is not
+     * a secret. It is removed because there is no reason to leave it lying
+     * around, not because leaving it would be unsafe.
+     */
+    function forgetFragment() {
+      try {
+        if (global.history && typeof global.history.replaceState === "function") {
+          var path = (locationRef && locationRef.pathname) || "/";
+          var search = (locationRef && locationRef.search) || "";
+          global.history.replaceState(null, "", path + search);
+        }
+      } catch (error) {
+        // An environment that refuses the rewrite changes nothing about safety.
+      }
     }
 
     function restart() {
@@ -498,12 +535,17 @@
     }
 
     function openSession() {
-      var experienceId = resolveExperienceId();
+      // Read once, at the first open. A restart must not depend on the
+      // fragment still being there -- it has been removed from history by
+      // then -- so the selector is remembered for the life of the page.
+      if (!launchId) {
+        launchId = resolveLaunchId();
+      }
       showState("loading");
-      if (!experienceId) {
+      if (!launchId) {
         return Promise.resolve(showState("notfound"));
       }
-      return request("POST", API.session, { experience_id: experienceId }, false).then(
+      return request("POST", API.session, { launch_id: launchId }, false).then(
         function (result) {
           if (!result.ok) {
             return fail(result, "bootstrap");
