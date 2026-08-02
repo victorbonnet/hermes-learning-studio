@@ -269,6 +269,19 @@ def install_control_routes(app, state: RuntimeState, *, clock=time.time) -> None
             return JSONResponse({"error": "bad request"}, status_code=400)
         return JSONResponse(granted)
 
+    @app.post("/internal/grant/activate", include_in_schema=False)
+    async def activate_grant(request: Request):
+        if not authorised(request):
+            return refused()
+        if state.grants is None:
+            return JSONResponse({"error": "grants unavailable"}, status_code=409)
+        try:
+            payload = await _control_body(request)
+            activated = state.grants.activate(str(payload.get("launch_id", "")))
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "bad request"}, status_code=400)
+        return JSONResponse({"activated": activated})
+
     @app.post("/internal/grant/revoke", include_in_schema=False)
     async def revoke_grant(request: Request):
         if not authorised(request):

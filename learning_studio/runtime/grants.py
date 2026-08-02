@@ -107,6 +107,14 @@ class LaunchGrant:
     created_at: float
     expires_at: float
     revoked: bool = False
+    #: False until the button has actually been delivered.
+    #:
+    #: A grant is created *before* the message is sent, because the selector
+    #: has to exist in order to go in it. Until delivery succeeds it admits
+    #: nobody: otherwise a send that failed would leave a working entrance
+    #: behind whose address the learner never received but which is live all
+    #: the same.
+    activated: bool = False
     #: The one live session, or ``None``. Held as the object rather than as an
     #: identifier so that reporting progress is a read of live state and cannot
     #: become a second, drifting copy of it.
@@ -127,7 +135,7 @@ class LaunchGrant:
         governs, so a learner working through an exercise is not thrown out
         because the *invitation* went stale mid-question.
         """
-        if self.revoked:
+        if self.revoked or not self.activated:
             return False
         if self.session is not None:
             return True
@@ -136,6 +144,8 @@ class LaunchGrant:
     def state(self, now: float) -> str:
         if self.revoked:
             return "revoked"
+        if not self.activated:
+            return "pending"
         session = self.session
         if session is not None:
             return "completed" if getattr(session, "completed", False) else "opened"
@@ -215,6 +225,22 @@ class GrantStore:
             )
             self._grants[grant.launch_id] = grant
             return {"reused": False, "created": True, **self._describe(grant, now)}
+
+    def activate(self, launch_id: str) -> bool:
+        """Commit a launch: from here it admits its learner.
+
+        Called once the button has actually been delivered, which is the only
+        moment at which an entrance somebody can reach should start existing.
+        Returns False for a launch this store no longer has — a caller that
+        sent a message and then could not commit is in an indeterminate state
+        and has to say so rather than report success.
+        """
+        with self._lock:
+            grant = self._grants.get(str(launch_id))
+            if grant is None or grant.revoked:
+                return False
+            grant.activated = True
+            return True
 
     def revoke(self, launch_id: str) -> bool:
         """Withdraw a grant, and end **every** session it ever minted.
@@ -319,7 +345,10 @@ class GrantStore:
         stale = [
             launch_id
             for launch_id, grant in self._grants.items()
-            if not grant.admissible(now) or _finished(grant, now)
+            # A pending grant is kept: it is mid-transaction, and the caller
+            # that created it is about to activate or revoke it. Everything
+            # else that cannot admit anybody goes.
+            if (grant.activated and not grant.admissible(now)) or _finished(grant, now)
         ]
         for launch_id in stale:
             self._retire_all(self._grants.pop(launch_id))

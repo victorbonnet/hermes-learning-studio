@@ -82,6 +82,26 @@ DELIVERY_FAILED = (
     "tell them to tap anything. Continue the exercise in conversation."
 )
 
+#: Said when the button went out but the launch could not be committed.
+#:
+#: The only honest answer here is "I do not know". Claiming success would tell
+#: a learner to tap something that may admit nobody; claiming failure would say
+#: nothing was sent when a message is sitting in their chat.
+DELIVERY_INDETERMINATE = (
+    "The Learning Studio sent the button but could not finish opening the exercise, so it "
+    "cannot tell whether the learner can use it. A message may have arrived. Do not promise "
+    "them it works and do not launch it again - ask whether they see a button, and offer to "
+    "carry on in conversation."
+)
+
+#: Said when a failed launch could not be fully undone.
+CLEANUP_INDETERMINATE = (
+    "The Learning Studio could not send the button, and could not confirm it undid what it "
+    "had already set up. Nothing is waiting for the learner as far as it can tell, but it "
+    "cannot promise that. Do not tell them to tap anything; continue in conversation. "
+    "Anything left over expires on its own."
+)
+
 #: Said when another start or stop is already in flight for this profile.
 BUSY = (
     "The Learning Studio runtime is being started or stopped by another request right "

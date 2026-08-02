@@ -430,3 +430,65 @@ def test_registration_imports_no_runtime_machinery(ctx, reimportable_package):
     }, reached
     assert "learning_studio.runtime.server" not in sys.modules
     assert "learning_studio.runtime.supervisor" not in sys.modules
+
+
+# ── CI has to actually exercise the launch path ───────────────────────────
+
+
+def test_ci_installs_every_extra_the_suite_needs(repo_root: Path):
+    """A skip and a pass look identical in a summary line.
+
+    CI installed only the ``dev`` extra for a while, so the tests that start a
+    real runtime skipped — and a green run said nothing about whether an
+    exercise could be opened at all.
+    """
+    workflow = (repo_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "--extra dev --extra web --extra media" in workflow
+    assert "tools/check_no_runtime_skips.py" in workflow
+    assert "tools/run_frontend_tests.py" in workflow
+
+
+def test_the_skip_gate_names_the_suites_that_prove_launching_works(repo_root: Path):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_skip_gate", repo_root / "tools" / "check_no_runtime_skips.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    for required in (
+        "tests/test_end_to_end.py",
+        "tests/test_launch.py",
+        "tests/test_runtime_supervisor.py",
+        "tests/test_consent_evidence.py",
+    ):
+        assert required in module.REQUIRED
+    for name in module.REQUIRED:
+        assert (repo_root / name).is_file(), name
+
+
+def test_the_skip_gate_actually_detects_a_skip(repo_root: Path, tmp_path: Path):
+    """Proves the gate discriminates rather than passing vacuously."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_skip_gate_detect", repo_root / "tools" / "check_no_runtime_skips.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    report = tmp_path / "report.xml"
+    report.write_text(
+        "<testsuites><testsuite>"
+        '<testcase classname="tests.test_launch" name="test_one"/>'
+        '<testcase classname="tests.test_launch" name="test_two"><skipped/></testcase>'
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+
+    assert module._skipped(report) == ["tests.test_launch::test_two"]
+    assert module._skipped(tmp_path / "absent.xml") == ["<no report was written>"]

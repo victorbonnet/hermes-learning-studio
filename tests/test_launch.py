@@ -97,6 +97,8 @@ class FakeRuntime:
             return {}
         if path == ownership.GRANT_PATH:
             return self.store.create(body or {})
+        if path == ownership.GRANT_ACTIVATE_PATH:
+            return {"activated": self.store.activate(str((body or {}).get("launch_id", "")))}
         if path == ownership.GRANT_REVOKE_PATH:
             return {"revoked": self.store.revoke(str((body or {}).get("launch_id", "")))}
         if path == ownership.LAUNCH_PATH:
@@ -640,15 +642,25 @@ def test_results_never_invent_a_score_or_return_an_answer(
         assert invented not in result, invented
 
 
-def test_results_with_no_runtime_say_so_without_guessing(
+def test_results_with_no_runtime_say_unknown_rather_than_no(
     hermes_home, telegram_session, principal, experience_id, monkeypatch
 ):
+    """`False` is a finding; this is an absence of evidence, and says so.
+
+    The runtime that would have held the answer is gone. Reporting `opened:
+    false` would state as fact something merely unobservable, and an agent
+    reading it would tell the learner they had ignored an exercise nobody can
+    show they ever saw.
+    """
     result = launch_module.launch_results(
         principal=principal, experience_id=experience_id, config=config()
     )
 
+    assert result["availability"] == "unavailable"
     assert result["state"] == "not_running"
-    assert result["opened"] is False
+    assert result["opened"] is None
+    assert result["completed"] is None
+    assert "cannot be determined" in result["message"]
 
 
 def test_results_reflect_a_session_that_was_actually_opened(
@@ -855,3 +867,93 @@ def test_the_destination_is_never_taken_from_a_payload():
     assert "chat_id" not in LAUNCH_SCHEMA["parameters"]["properties"]
     assert 'args["chat_id"]' not in source
     assert 'args.get("chat_id")' not in source
+
+
+# ── The transaction, and what it is allowed to claim ──────────────────────
+
+
+def test_a_commit_failure_after_delivery_is_reported_as_unknown(
+    runtime, spoken, principal, experience_id, monkeypatch
+):
+    """The message went out and the launch could not be committed.
+
+    Claiming success would tell the learner to tap something that may admit
+    nobody; claiming failure would say nothing was sent while a message sits in
+    their chat. The only honest answer is that it is not known.
+    """
+    deliver = Deliveries()
+    monkeypatch.setattr(launch_module, "_activate", lambda handle, launch_id: False)
+
+    with pytest.raises(RuntimeUnavailable) as caught:
+        launch(principal, experience_id, deliver=deliver, evidence=spoken)
+
+    assert caught.value.reason == "commit_indeterminate"
+    assert "cannot tell" in caught.value.message
+    assert len(deliver.sent) == 1
+
+
+def test_a_rollback_failure_is_reported_rather_than_claiming_nothing_was_saved(
+    runtime, spoken, principal, experience_id, monkeypatch
+):
+    monkeypatch.setattr(launch_module, "_revoke", lambda handle, launch_id: False)
+
+    with pytest.raises(RuntimeUnavailable) as caught:
+        launch(
+            principal,
+            experience_id,
+            deliver=Deliveries(fails=RuntimeError("telegram is down")),
+            evidence=spoken,
+        )
+
+    assert caught.value.reason == "rollback_indeterminate"
+    assert "could not confirm" in caught.value.message
+
+
+def test_a_grant_admits_nobody_until_the_button_has_been_delivered(
+    runtime, spoken, principal, experience_id
+):
+    """The window between "a selector exists" and "somebody was told about it"."""
+    captured: list[str] = []
+
+    def deliver_then_fail(*, destination, url, label, title, launch_id):
+        captured.append(launch_id)
+        # At this instant the grant exists. It must admit nobody.
+        assert runtime.store.admit(launch_id=launch_id, telegram_user_id="1001") is None
+        raise RuntimeError("telegram is down")
+
+    with pytest.raises(RuntimeError):
+        launch(principal, experience_id, deliver=deliver_then_fail, evidence=spoken)
+
+    assert captured, "the delivery seam was never reached"
+    assert runtime.store.admit(launch_id=captured[0], telegram_user_id="1001") is None
+
+
+def test_a_committed_launch_admits_its_learner(runtime, spoken, principal, experience_id):
+    result = launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
+
+    admitted = runtime.store.admit(launch_id=result["launch_id"], telegram_user_id="1001")
+
+    assert admitted is not None
+    assert admitted.activated is True
+
+
+def test_a_failed_commit_does_not_spend_the_learner_message(
+    runtime, spoken, principal, experience_id, monkeypatch
+):
+    """An indeterminate launch must not also cost them their words."""
+    working = {"value": False}
+    real = launch_module._activate
+
+    def sometimes(handle, launch_id):
+        return real(handle, launch_id) if working["value"] else False
+
+    monkeypatch.setattr(launch_module, "_activate", sometimes)
+
+    with pytest.raises(RuntimeUnavailable):
+        launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
+
+    # A later, working attempt still has consent to spend.
+    working["value"] = True
+    result = launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
+
+    assert result["button_delivered"] is True

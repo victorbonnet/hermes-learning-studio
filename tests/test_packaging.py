@@ -73,6 +73,7 @@ def wheel_names() -> set[str]:
         "tools/run_frontend_tests.py",
         "tools/preview_gallery.py",
         "tools/bootstrap_runtime.py",
+        "tools/check_no_runtime_skips.py",
         "tests/js/dom.mjs",
         "tests/js/harness.mjs",
         "tests/js/renderers.test.mjs",

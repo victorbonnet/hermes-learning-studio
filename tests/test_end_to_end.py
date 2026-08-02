@@ -207,6 +207,8 @@ def runtime(clock, grants, monkeypatch, hermes_home, config):
             return {}
         if path == ownership.GRANT_PATH:
             return grants.create(body or {})
+        if path == ownership.GRANT_ACTIVATE_PATH:
+            return {"activated": grants.activate(str((body or {}).get("launch_id", "")))}
         if path == ownership.GRANT_REVOKE_PATH:
             return {"revoked": grants.revoke(str((body or {}).get("launch_id", "")))}
         if path == ownership.LAUNCH_PATH:

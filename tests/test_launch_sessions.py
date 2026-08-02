@@ -52,9 +52,16 @@ def scope(user: str = "1001", experience: str = "exp-1") -> SessionScope:
 
 
 def granted(store, *, user: str = "1001", experience: str = "exp-1"):
+    """A grant that has been delivered — created, then activated.
+
+    Creation alone leaves it *pending* and admitting nobody, which is what
+    stops a send that failed from leaving a working entrance behind. Every test
+    here is about what happens after the button actually arrived.
+    """
     created = store.create(
         {"telegram_user_id": user, "learner_id": "learner-" + user, "experience_id": experience}
     )
+    store.activate(created["launch_id"])
     return store.admit(launch_id=created["launch_id"], telegram_user_id=user)
 
 

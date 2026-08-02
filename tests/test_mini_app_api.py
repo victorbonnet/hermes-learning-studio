@@ -1868,6 +1868,10 @@ def launched(deps, clock, hermes_home, experience_id, principal):
             "experience_id": experience_id,
         }
     )
+    # A launch activates the grant once the button has actually been
+    # delivered. Until then it is pending and admits nobody, which is what
+    # stops a failed send from leaving a working entrance behind.
+    grants.activate(created["launch_id"])
     return dataclasses.replace(deps, grants=grants), created["launch_id"], grants
 
 

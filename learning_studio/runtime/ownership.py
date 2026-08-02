@@ -66,6 +66,7 @@ CONTROL_HEADER = "X-Learning-Studio-Control"
 STATUS_PATH = "/internal/runtime"
 SHUTDOWN_PATH = "/internal/shutdown"
 GRANT_PATH = "/internal/grant"
+GRANT_ACTIVATE_PATH = "/internal/grant/activate"
 GRANT_REVOKE_PATH = "/internal/grant/revoke"
 LAUNCH_PATH = "/internal/launch"
 

@@ -59,7 +59,12 @@ from . import service
 from .config import LearningStudioConfig, load_config
 from .identity import Principal
 from .runtime import manager, ownership, supervisor
-from .runtime.errors import TUNNEL_FAILED, RuntimeUnavailable
+from .runtime.errors import (
+    CLEANUP_INDETERMINATE,
+    DELIVERY_INDETERMINATE,
+    TUNNEL_FAILED,
+    RuntimeUnavailable,
+)
 from .runtime.state import ProfileLock
 
 logger = logging.getLogger(__name__)
@@ -153,7 +158,25 @@ def _launch_within(
     evidence,
     send,
 ) -> dict[str, Any]:
-    """Steps 6 to 9, with the grant as the thing that gets rolled back."""
+    """Steps 5 to 9, as a transaction with one commit point.
+
+    The states, in order, and what each one means for the learner:
+
+    ``pending``  a grant exists and admits nobody. The selector has to exist
+                 before the message can carry it, so this is the gap between
+                 "we have decided to launch" and "they can open it".
+    ``delivered`` the button reached Telegram.
+    ``open``     the grant is activated and the learner's message is spent.
+                 This is the commit, and the only state a success is reported
+                 from.
+    ``indeterminate`` the message went out and the commit did not finish, or a
+                 rollback could not be confirmed. Reported as unknown, because
+                 it is.
+
+    The previous version created a grant that was live from the moment it
+    existed, sent the message, and then spent consent — so a failure after the
+    send left a usable entrance while the caller was told the launch had failed.
+    """
     public_url = handle.public_url
     if not public_url:
         raise RuntimeUnavailable(NO_PUBLIC_ADDRESS, reason="tunnel_not_ready")
@@ -165,9 +188,9 @@ def _launch_within(
             "telegram_user_id": destination.telegram_user_id,
             "learner_id": bundle.learner_id,
             "experience_id": str(experience["experience_id"]),
-            # When consent has already been spent, this call may report the
-            # launch that exists and may not become a second one. Enforced in
-            # the runtime rather than here, so nothing is created and then undone.
+            # When the learner's message has already been spent, this call may
+            # report the launch that exists and may not become a second one.
+            # Enforced in the runtime, so nothing is created and then undone.
             "reuse_only": not decision.may_create,
         },
     )
@@ -202,10 +225,24 @@ def _launch_within(
             launch_id=launch_id,
         )
     except BaseException:
-        # The learner has no button, so they must not have a grant either.
-        with _suppressed("revoking a grant after a failed delivery"):
-            ownership.call(handle.record, ownership.GRANT_REVOKE_PATH, {"launch_id": launch_id})
+        # Nothing reached the learner, so the pending grant must go. If it will
+        # not go, that is reported as *indeterminate* rather than swallowed:
+        # the original failure is still what the agent needs, but "nothing was
+        # saved" would be a claim this call cannot make.
+        if not _revoke(handle, launch_id):
+            raise RuntimeUnavailable(
+                CLEANUP_INDETERMINATE, reason="rollback_indeterminate"
+            ) from None
         raise
+
+    # Delivered. Commit: the grant starts admitting its learner and the message
+    # that authorised it is spent, in that order, so a failure between them
+    # leaves an entrance nobody was told about rather than a spent message with
+    # no entrance.
+    if not _activate(handle, launch_id):
+        with _suppressed("revoking a grant that could not be committed"):
+            _revoke(handle, launch_id)
+        raise RuntimeUnavailable(DELIVERY_INDETERMINATE, reason="commit_indeterminate")
 
     # Spent only now, and only once. A failure anywhere above leaves the
     # learner's words intact so the next attempt does not need a second ask;
@@ -216,6 +253,28 @@ def _launch_within(
     return _result(
         experience=experience, granted=granted, decision=decision, delivered=True, reused=False
     )
+
+
+def _activate(handle, launch_id: str) -> bool:
+    """Commit the grant, or report that it could not be committed."""
+    try:
+        reply = ownership.call(
+            handle.record, ownership.GRANT_ACTIVATE_PATH, {"launch_id": launch_id}
+        )
+    except Exception as exc:
+        logger.warning("a launch could not be committed: %s", type(exc).__name__)
+        return False
+    return bool(reply.get("activated"))
+
+
+def _revoke(handle, launch_id: str) -> bool:
+    """Undo a grant, or report that the undo could not be confirmed."""
+    try:
+        reply = ownership.call(handle.record, ownership.GRANT_REVOKE_PATH, {"launch_id": launch_id})
+    except Exception as exc:
+        logger.warning("a launch could not be rolled back: %s", type(exc).__name__)
+        return False
+    return bool(reply.get("revoked"))
 
 
 def _result(
@@ -327,18 +386,18 @@ def launch_results(
 
     handle = supervisor.current(settings)
     if handle is None:
-        return {
-            "ok": True,
-            "experience_id": experience["experience_id"],
-            "title": experience["title"],
-            "state": "not_running",
-            "opened": False,
-            "message": (
-                "No Learning Studio runtime is open for this profile, so there is nothing "
-                "in progress. Nothing was recorded while it was."
+        # Not "they did not open it" — *this cannot be known*. The runtime that
+        # would have held that answer is gone, and reporting `opened: false`
+        # here would state as a finding something that was merely unobservable.
+        return _unknown(
+            experience,
+            state="not_running",
+            message=(
+                "No Learning Studio runtime is open for this profile, so whether the learner "
+                "ever opened this exercise cannot be determined. Nothing was recorded while "
+                "it was running either way."
             ),
-            **_honest_scoring(),
-        }
+        )
 
     try:
         progress = ownership.call(
@@ -350,23 +409,31 @@ def launch_results(
             },
         )
     except ownership.ControlError:
-        progress = {"found": False}
+        return _unknown(
+            experience,
+            state="unavailable",
+            message=(
+                "The Learning Studio runtime did not answer, so what happened to this "
+                "exercise cannot be determined right now."
+            ),
+        )
 
     if not progress.get("found"):
-        return {
-            "ok": True,
-            "experience_id": experience["experience_id"],
-            "title": experience["title"],
-            "state": "not_launched",
-            "opened": False,
-            "message": "This exercise has not been opened for this learner in the current runtime.",
-            **_honest_scoring(),
-        }
+        return _unknown(
+            experience,
+            state="not_launched",
+            message=(
+                "The current Learning Studio runtime has no record of this exercise being "
+                "opened for this learner. An earlier runtime may have; that is not something "
+                "this can see."
+            ),
+        )
 
     return {
         "ok": True,
         "experience_id": experience["experience_id"],
         "title": experience["title"],
+        "availability": "known",
         "state": progress.get("state"),
         "opened": bool(progress.get("opened")),
         "position": progress.get("position"),
@@ -389,5 +456,33 @@ def launch_results(
             "recorded to draw a conclusion from. Propose durable facts through "
             "learning_studio_save_context, from what the learner actually told you."
         ),
+        **_honest_scoring(),
+    }
+
+
+def _unknown(experience: dict[str, Any], *, state: str, message: str) -> dict[str, Any]:
+    """A result that says "I cannot tell", and says which kind of cannot.
+
+    ``opened`` is ``None`` rather than ``False`` throughout. The distinction is
+    the whole point of this shape: ``False`` is a finding — the learner did not
+    open it — and this plugin is only entitled to that when a runtime told it
+    so. Everywhere else the honest answer is that the evidence is not available,
+    and an agent that reads ``False`` as "they ignored it" would be repeating a
+    conclusion nobody reached.
+    """
+    return {
+        "ok": True,
+        "experience_id": experience["experience_id"],
+        "title": experience["title"],
+        "availability": "unavailable",
+        "state": state,
+        "opened": None,
+        "position": None,
+        "component_count": len(experience["components"]),
+        "answered": None,
+        "completed": None,
+        "responses_returned": False,
+        "memory_candidates": [],
+        "message": message,
         **_honest_scoring(),
     }
