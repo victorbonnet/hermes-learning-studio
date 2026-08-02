@@ -345,10 +345,15 @@ class GrantStore:
         stale = [
             launch_id
             for launch_id, grant in self._grants.items()
-            # A pending grant is kept: it is mid-transaction, and the caller
-            # that created it is about to activate or revoke it. Everything
-            # else that cannot admit anybody goes.
-            if (grant.activated and not grant.admissible(now)) or _finished(grant, now)
+            # A pending grant is kept while the transaction that created it is
+            # still plausibly running, and dropped once its own window has
+            # passed. Keeping it unconditionally would leak: a launch killed
+            # between "create" and "activate or revoke" leaves one behind that
+            # nothing will ever resolve, and it would count against capacity
+            # for the life of the runtime.
+            if _abandoned(grant, now)
+            or (grant.activated and not grant.admissible(now))
+            or _finished(grant, now)
         ]
         for launch_id in stale:
             self._retire_all(self._grants.pop(launch_id))
@@ -423,6 +428,11 @@ class GrantStore:
             # Stated in the payload rather than left to a reader's assumption.
             "scored": False,
         }
+
+
+def _abandoned(grant: LaunchGrant, now: float) -> bool:
+    """A pending grant whose transaction never finished either way."""
+    return not grant.activated and grant.expired(now)
 
 
 def _finished(grant: LaunchGrant, now: float) -> bool:

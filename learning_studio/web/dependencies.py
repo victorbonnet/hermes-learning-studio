@@ -34,6 +34,12 @@ from ..sessions import SessionStore
 #: Where Hermes already keeps the bot token. Read on demand, never copied into
 #: configuration, a database row, a response, a log line, or a process
 #: argument; the only thing it is ever used for is deriving the HMAC key.
+#:
+#: Read from ``os.environ`` here, and that is correct *in this process*: this
+#: module runs inside the runtime child, whose entire environment the
+#: supervisor built from the active profile's secret scope before spawning it.
+#: The profile-scoped resolution happens in the parent — see
+#: :mod:`learning_studio.secrets` — because that is where Hermes is.
 BOT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 
 #: Per-process key for pseudonymising user IDs in logs. Random per start, held

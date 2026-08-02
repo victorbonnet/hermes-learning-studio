@@ -56,24 +56,34 @@ cost of hijacking someone's attention.
 `learning_studio_launch` asks you to say which rule applies, because it cannot
 work it out and neither can anything else after the fact.
 
-- **Rule 1** — `initiation: "learner_request"`. Nothing else is needed. The
-  request *was* the agreement.
+- **Rule 1** — `initiation: "learner_request"`, plus `learner_quote`.
 - **Rule 2** — `initiation: "agent_suggestion"`, plus `learner_confirmed: true`
-  and `confirmation_quote` set to what the learner actually said. Their words,
-  not your summary of them.
+  and `learner_quote`.
 
-Two things follow from that, and both are enforced rather than advised:
+**Both need the quotation, and the quotation is checked.** The Studio holds the
+message the platform delivered for the turn you are answering, and looks for
+your words inside it. So:
 
-- **One agreement, one launch.** If the first exercise expired unopened, their
-  earlier yes does not open a second one. Ask again. This is what stops a retry
-  loop from repeatedly opening a public address on somebody's behalf.
-- **An agreement goes stale.** A yes from much earlier in the conversation is
-  refused. Ask again rather than arguing with the refusal.
+- copy, do not paraphrase — a summary will not be found;
+- quote the message you are *replying to*, not an earlier one;
+- a turn with no incoming learner message — a scheduled job, a background task
+  — cannot launch at all, and will say so.
 
-Nothing here can verify that the learner agreed — you are the one writing
-`learner_confirmed`, in the same call as everything else. What the rule buys is
-that you have to say, once, that a specific person agreed to a specific thing,
-and cannot spend that statement twice.
+Three things follow, and all are enforced rather than advised:
+
+- **One message, one launch.** If the exercise expired unopened, that same
+  message does not open a second one. Ask again, and quote their new reply.
+  This is what stops a retry loop from repeatedly opening a public address on
+  somebody's behalf.
+- **A spent message stays spent.** Waiting does not make it usable again.
+- **Concurrency is arbitrated.** Two launches racing on one message do not both
+  succeed.
+
+What this does *not* establish is what the learner meant. You are the one
+reading "go on then" as agreement, and the response says so in those terms — it
+reports that your quotation was found in their current message, not that the
+learner agreed. Do not repeat it back to them as though the Studio had
+confirmed their intent.
 
 ## Launching honestly
 

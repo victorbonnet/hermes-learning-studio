@@ -510,10 +510,12 @@ or open a UI.
 ### `learning_studio_launch`
 
 Opens a prepared exercise on the learner's screen. Takes an opaque
-`experience_id`, an `initiation` of `learner_request` or `agent_suggestion`,
-and — for a suggestion — `learner_confirmed` and `confirmation_quote`. Nothing
-else. See [Opening an exercise](#opening-an-exercise) for the whole sequence
-and [Consent to launch](#consent-to-launch) for the policy.
+`experience_id`, an `initiation` of `learner_request` or `agent_suggestion`, a
+`learner_quote` copied from the learner's current message, and — for a
+suggestion — `learner_confirmed`. Nothing else. The quotation is checked
+against the message the platform actually delivered. See
+[Opening an exercise](#opening-an-exercise) for the whole sequence and
+[Consent to launch](#consent-to-launch) for the policy.
 
 ### `learning_studio_status`
 
@@ -530,6 +532,14 @@ component they reached, how many they answered, and whether they finished.
 estimate, no durable attempt and no review schedule, and the response says so
 rather than omitting the fields and letting a reader assume. It does not return
 the learner's answers.
+
+The answer is explicitly **tri-state**. `availability` is `known` only when a
+runtime actually told it something; otherwise `opened` is `null`, not `false`.
+That distinction matters: `false` is a finding — the learner did not open it —
+and it is only reported when something observed that. With no runtime, or an
+unreachable one, or one with no record of the launch, the honest answer is that
+the evidence is gone, and an agent reading `false` there would tell somebody
+they had ignored an exercise nobody can show they ever saw.
 
 ### `learning_studio_stop`
 
@@ -593,41 +603,111 @@ wondering.
 ### Consent to launch
 
 Opening an exercise creates a temporary public address and sends somebody a
-message, so the tool asks which of two things happened.
+message, so the authority to do it comes from two places, not one.
+
+**The words come from the platform.** The plugin registers Hermes'
+`pre_gateway_dispatch` hook, which fires with the real incoming `MessageEvent`
+before the agent runs, and records it keyed by exactly which message it was.
+`learning_studio_launch` then requires `learner_quote` to appear in *that*
+message — the one the current turn is answering. So an exercise cannot be
+opened on words nobody wrote.
+
+**The meaning comes from the model.** Whether "go on then" is agreement is a
+judgement, and the agent is the right thing to make it. `initiation` says which
+of the two rules applies:
 
 - **`learner_request`** — they asked to practise, revise, be quizzed, or open
   the exercise. That request *is* the agreement; a second ask is friction.
-- **`agent_suggestion`** — the agent proposed it. Requires
-  `learner_confirmed: true` and `confirmation_quote` set to what the learner
-  actually said.
+- **`agent_suggestion`** — the agent proposed it. Additionally requires
+  `learner_confirmed: true`.
 
-An agreement opens one exercise once. A repeat call returns the launch that is
-already open and sends no second button; a *new* launch on the strength of a
-spent agreement is refused, and so is one on an agreement from much earlier in
-the conversation.
+Both require a quotation. The schema encodes the conditional requirement too,
+so a provider that validates before dispatch refuses the same payloads the
+handler would.
 
-Nothing here can verify that the learner agreed — the model writes
-`learner_confirmed` in the same call as everything else, exactly as it writes
-`track.confirmed`. What the rule buys is that an agent has to state, once, that
-a specific person agreed to a specific thing, and cannot spend that statement
-twice.
+**One message opens one exercise once.** A repeat call reports the launch that
+is already open and sends no second button. A *new* launch on a message that
+has already been spent is refused, and a spent message stays spent — expiry
+leaves a tombstone that outlives the evidence, so "stale" is a terminal state
+rather than a step back to "new".
+
+What this does not do is read minds. It establishes that a specific person
+wrote specific words in the turn being answered; whether they meant "open an
+exercise" is the agent's reading, and the response says so in those terms
+rather than reporting "the learner agreed" as a finding.
+
+**Privacy.** The learner's message text is held in memory, in the process that
+already had it, for a short bounded window, and is never written to disk,
+returned, or logged. Only the current message is kept; there is no history.
+
+### Where a launch can happen
+
+A Telegram **direct message**, and nowhere else. Hermes normalises Telegram's
+`private` chat type to its own canonical `dm`, so that is the value the plugin
+accepts (along with `private` and `sender`, which are unambiguous). `group`,
+`forum`, `channel` and anything unrecognised are refused: an exercise is one
+person's, and a button in a room is an invitation to whoever is in the room.
+
+The destination is derived from the session — never from a tool argument — and
+the chat id must equal the sender's user id, which is an independent check that
+holds even where `chat_type` is absent.
+
+### Credentials belong to the profile, not the process
+
+Hermes can multiplex several profiles through one process, and there the bot
+token and Telegram allowlists in `os.environ` may belong to a *different*
+profile than the turn being served. Both are resolved through Hermes'
+`agent.secret_scope.get_secret`, at the parent boundary, before the runtime
+child is spawned — so a launch for one profile is never delivered by another's
+bot. The host's own single-profile fallback is preserved; an unscoped read
+under multiplexing is treated as an absent credential and refuses.
 
 ### The button is not a credential
 
-The message carries the tunnel address and nothing else: no session token, no
-experience id, no query string. That is deliberate — a URL in a chat goes into
-Telegram's servers, the webview's history, and any screenshot of the
-conversation.
+The button's URL is the validated tunnel origin plus `#launch=<launch id>`.
 
-What makes it safe to send is the **launch grant**. On a runtime this plugin
-started, `POST /api/session` requires all of: verified `initData`, an account on
-the effective allowlist, ownership of the exercise in SQL, *and* an unexpired
-grant for that account and that exercise. Somebody who finds the address opens
+The selector is in the **fragment** because browsers never send a fragment to
+the server: it is absent from the request line, from access logs, and from
+`Referer`, and the page removes it from history as soon as it has read it. It
+carries no session token, no experience id, and no query string.
+
+**It is a selector, not a capability.** Presenting it says only *which* launch
+is meant. Opening still requires all of: verified `initData`, an account on the
+effective allowlist, ownership of the exercise in SQL, and a grant that is
+activated, unexpired, unrevoked, issued to that same account, and from this
+runtime generation. Somebody who copies the whole URL out of a screenshot opens
 nothing.
 
-An operator running the API themselves has no grant store and gets exactly the
-behaviour they had before; there is no setting that clears one on a runtime this
-plugin launched.
+On a launched runtime the client may **not** name an exercise of its own. The
+server derives it from the grant, because owning an exercise is not the same as
+having been invited to open it. An operator running the API themselves has no
+grant store and keeps the contract they had; there is no setting that removes
+one from a runtime this plugin launched.
+
+### One launch, one live session
+
+A grant has at most one live session. Re-admission — a webview reload, a retry —
+carries the learner's position, answers and reveals onto a new token and expires
+the old one, so a reload resumes rather than restarts and there is never a
+second token that still works. Revoking a launch expires every session it ever
+minted, not just the newest.
+
+### What a launch actually does, step by step
+
+| State | Meaning |
+| --- | --- |
+| `pending` | A grant exists and admits nobody. The selector has to exist before a message can carry it. |
+| delivered | Telegram accepted the message. |
+| `open` | The grant is activated and the learner's message is spent. This is the commit. |
+| indeterminate | The message went out and the commit did not finish, or a rollback could not be confirmed. |
+
+The last row is the one worth reading twice. If the button was sent and the
+launch could not be committed, `learning_studio_launch` reports that it **does
+not know** whether the exercise is usable — because claiming success would tell
+the learner to tap something that may admit nobody, and claiming failure would
+say nothing was sent while a message sits in their chat. The same applies to a
+rollback that could not be confirmed: "nothing was saved" is a claim, and it is
+not made unless it is true.
 
 ### Lifetime
 
@@ -661,10 +741,22 @@ id, generation, process id and interpreter path must all match the record.
 
 - A process that inherited the pid cannot produce the secret.
 - A runtime that has died cannot answer, and a dead runtime is never signalled.
-- Stopping asks over that authenticated channel first; signals are the
-  escalation, they go to the runtime's own process *group* (it is started in a
-  new session, so that group holds it and its descendants and nothing else),
-  and ownership is re-proved immediately before each one.
+- Stopping asks over that authenticated channel first. That is the path that
+  actually stops a runtime, and it needs no signal at all.
+
+**Escalation needs more than a proof.** A userspace check followed by a signal
+to a *number* is a race: the runtime can exit between the two and the operating
+system can hand that number to something else. So a signal is only ever sent
+through a pid file descriptor, which pins the identity — while it is open the
+pid cannot be recycled, and neither can the process group id, because the
+runtime leads its own session. The sequence is pin, re-prove against the pinned
+identity, then signal the group.
+
+**Where an identity cannot be pinned, escalation refuses.** `pidfd_open` is
+Linux. On macOS and anything else without it, a wedged runtime is left to the
+deadline it enforces on itself and `learning_studio_stop` reports that it could
+not be confirmed stopped. That is worse than killing it, and much better than
+killing something else.
 - A recorded runtime that cannot be proved is **left alone** and its record
   cleared. From outside, one that died and one that is wedged are the same
   observation, and the safe response to both is to touch neither. It stops
@@ -689,11 +781,25 @@ almost nothing it prints is accepted. A candidate must survive, in order:
 6. a second reading by `urlsplit`, whose opinion of the scheme, host, port and
    userinfo must agree with the pattern's.
 
+Extraction hands the validator a **complete token** — everything from
+`https://` to whitespace or a box-drawing character. That matters more than it
+sounds: an earlier version cut the candidate at the first `@`, `:` or `/`, so
+`https://victim.trycloudflare.com@evil.test` arrived as the harmless-looking
+prefix and the rules above were never asked about the rest of it.
+
 So `https://trycloudflare.com@evil.test`, `https://eviltrycloudflare.com`,
 `https://a.trycloudflare.com.evil.test`, a Cyrillic lookalike and an explicit
 `:443` are each refused by a different rule. Output is bounded in lines and
 bytes, and two *different* valid addresses from one process is a refusal rather
 than a choice.
+
+Two *different* addresses from one process is a refusal, and that is checked
+across lines as well as within one: after the first address the reader keeps
+going for a short bounded window, because a check that returned on the first
+match could only ever have seen one line.
+
+Readiness also requires the tunnel process to still be running. A process that
+printed a hostname and exited has published nothing.
 
 Cloudflared's own output is never relayed to the model or the learner.
 
@@ -717,7 +823,11 @@ Custom domains and permanent named tunnels are deliberately out of scope.
 | "not authorised to use the Learning Studio here" | The account is outside the intersection of Hermes' Telegram gates and this plugin's optional narrowing. |
 | A group chat refuses | An exercise is one person's. Offer it in a direct message. |
 | "could not confirm the recorded runtime was its own" | A runtime this plugin cannot verify. It was left alone and stops itself at its maximum lifetime; `learning_studio_status` reports `stale_record`. |
-| The learner says the button does nothing | The runtime has probably expired. Launch again — the button is not a permanent link. |
+| The learner says the button does nothing | The runtime or the launch has probably expired. Launch again from a fresh message — the button is not a permanent link. |
+| "could not finish opening the exercise" | The message went out and the launch could not be committed. Its state is genuinely unknown: ask whether a button arrived, and carry on in conversation. Do not relaunch. |
+| "the words you quoted are not in the learner's current message" | The quotation has to be the learner's own words from the message being answered. |
+| "there is no current learner message to launch from" | The turn carries no incoming message — a scheduled job, a background task. Offer the exercise next time they write. |
+| A stop reports it could not confirm | Escalation needs a pinned process identity, which is Linux-only. The runtime stops itself at its own deadline. |
 
 ## Exercise manifests
 

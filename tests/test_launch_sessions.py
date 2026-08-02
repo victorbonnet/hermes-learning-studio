@@ -258,3 +258,45 @@ def test_capacity_first_reclaims_launches_nobody_is_using(clock, sessions):
 
     assert created["created"] is True
     assert len(store) == 1
+
+
+def test_a_pending_grant_that_was_never_resolved_does_not_leak(clock):
+    """A launch killed between create and commit must not hold capacity forever.
+
+    A pending grant is kept while its transaction is plausibly still running —
+    otherwise a crash mid-launch would leave one nothing can resolve, counting
+    against the runtime's capacity until it restarts.
+    """
+    store = grants_module.GrantStore(profile="default", generation=1, clock=clock)
+    store.create(
+        {"telegram_user_id": "1001", "learner_id": "learner-1001", "experience_id": "exp-1"}
+    )
+    assert len(store) == 1
+
+    clock.advance(grants_module.DEFAULT_GRANT_TTL_SECONDS + 1)
+    store.purge()
+
+    assert len(store) == 0
+
+
+def test_a_pending_grant_is_kept_while_its_launch_is_still_running(clock):
+    store = grants_module.GrantStore(profile="default", generation=1, clock=clock)
+    store.create(
+        {"telegram_user_id": "1001", "learner_id": "learner-1001", "experience_id": "exp-1"}
+    )
+
+    clock.advance(1)
+    store.purge()
+
+    assert len(store) == 1
+
+
+def test_a_pending_grant_admits_nobody(clock):
+    """The window between "a selector exists" and "somebody was told about it"."""
+    store = grants_module.GrantStore(profile="default", generation=1, clock=clock)
+    created = store.create(
+        {"telegram_user_id": "1001", "learner_id": "learner-1001", "experience_id": "exp-1"}
+    )
+
+    assert store.admit(launch_id=created["launch_id"], telegram_user_id="1001") is None
+    assert created["state"] == "pending"

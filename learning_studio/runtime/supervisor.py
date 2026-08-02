@@ -442,7 +442,20 @@ def _roll_back(child, record: RuntimeRecord, handshake: Path, config) -> None:
 
 
 def _terminate_held_child(child, graceful_seconds: int) -> None:
-    """Stop a child this process is still holding, group and all."""
+    """Stop a child this process is still holding, group and all.
+
+    This is the one place a signal is sent without the control challenge, and
+    the identity is stable for a different reason: the child has not been
+    reaped. A ``Popen`` whose ``poll()`` still returns ``None`` holds an
+    unreaped child, and an unreaped child's pid is not recycled by the kernel —
+    so ``pid`` here names this process and can name nothing else.
+
+    That property is fragile in one specific way, so the order below preserves
+    it: ``wait(timeout=...)`` raising ``TimeoutExpired`` does **not** reap, and
+    the escalation only happens on that path. A successful ``wait`` returns
+    immediately, before any second signal, because after a successful reap the
+    number would be free again.
+    """
     pid = child.pid
     with contextlib.suppress(OSError, ProcessLookupError):
         if os.getpgid(pid) == pid:

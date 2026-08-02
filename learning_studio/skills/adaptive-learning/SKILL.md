@@ -28,7 +28,7 @@ about putting it on the learner's screen.
 | `learning_studio_import_asset` | Validate a real host image and return an opaque managed asset id |
 | `learning_studio_launch` | Open a prepared exercise on the learner's screen |
 | `learning_studio_status` | Whether an exercise can be opened here, and why not |
-| `learning_studio_results` | Whether they opened it and how far they got — nothing more |
+| `learning_studio_results` | Whether they opened it and how far they got — nothing more, and `null` when even that is unknown |
 | `learning_studio_stop` | Close the runtime early |
 
 **Exercises can now be opened.** `learning_studio_prepare` stores a validated
@@ -51,6 +51,11 @@ back later, launch again.
 history, no review schedule. `learning_studio_results` tells you whether they
 opened it and how far through they got, and that is the whole of what exists.
 Say so plainly rather than implying a report card is coming.
+
+And read that result carefully: `opened` can be `null`, which means *nobody
+knows* — the runtime that held the answer has gone. That is not "they did not
+open it". Do not tell somebody they ignored an exercise when the honest answer
+is that the evidence is no longer there.
 
 **It can be unavailable, and the reason matters to the learner.** Opening an
 exercise needs two things an operator sets up once: a prepared runtime
@@ -403,10 +408,17 @@ Wrong practice material teaches the wrong thing and is worse than no exercise:
 
 ### 6. Activate
 
+**Always quote the learner.** Every launch takes `learner_quote`: a few words
+copied exactly from the message you are replying to. This is checked — the
+Studio holds the message the platform actually delivered and looks for your
+quotation in it. So paraphrasing fails, quoting an earlier message fails, and
+an exercise cannot be opened on words nobody wrote. Copy, do not summarise.
+
 **An explicit learner request may launch immediately.** If they asked for
 practice, and the tools exist, prepare and start the exercise without asking
 for further confirmation — a confirmation step there is friction, not consent.
-Call `learning_studio_launch` with `initiation: "learner_request"`.
+Call `learning_studio_launch` with `initiation: "learner_request"` and their
+words in `learner_quote`.
 
 The learner never has to name a tool, a skill, or a command; working out that
 "can we revise photosynthesis?" means preparing an exercise and opening it is
@@ -414,21 +426,30 @@ your job, not theirs. Nobody should ever have to say "Mini App", "Learning
 Studio", or the name of anything in your tool list.
 
 **Practice you propose yourself needs a yes.** When you suggest an exercise the
-learner did not ask for, describe it in one line and wait for them to confirm.
+learner did not ask for, describe it in one line and wait for them to answer.
 Then call `learning_studio_launch` with `initiation: "agent_suggestion"`,
-`learner_confirmed: true`, and `confirmation_quote` set to what they actually
-said. That quote is a record, not a formality: one agreement opens one exercise
-once, and a later launch needs a fresh one. The full rule, including the
-ambiguous cases, is in
+`learner_confirmed: true`, and `learner_quote` set to what they wrote when they
+agreed. One message opens one exercise once; a later launch needs a newer
+message. The full rule, including the ambiguous cases, is in
 [activation-policy](references/activation-policy.md).
 
-**Reading the result.** A launch either reports `button_delivered: true`, in
-which case tell the learner the button is in the chat, or it refuses with a
-reason. A refusal is not something to retry or work around — run the exercise
-in conversation and say that is what you are doing. Calling launch again for
-the same exercise returns the launch that is already open rather than sending a
-second button; that is correct, and it means "they say it isn't there" is not
-solved by launching again.
+You are reading what the words *mean* — that is your job and nothing else can
+do it. What you are not doing is supplying the words.
+
+**Reading the result.** A launch reports one of three things.
+
+- `button_delivered: true` — tell the learner the button is in the chat.
+- A refusal, with a reason. Not something to retry or work around: run the
+  exercise in conversation and say that is what you are doing.
+- **It could not tell.** If the message went out but the launch could not be
+  finished, you will be told exactly that. Do not promise the learner it works
+  and do not launch again — ask whether they can see a button, and offer to
+  carry on in conversation either way. Saying "it's ready!" here is the one
+  mistake this whole tool is arranged to prevent.
+
+Calling launch again for the same exercise returns the launch that is already
+open rather than sending a second button; that is correct, and it means "they
+say it isn't there" is not solved by launching again.
 
 Either way, if there is no tool to launch, run the exercise in chat and say
 that is what you are doing.

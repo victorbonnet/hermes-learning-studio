@@ -43,10 +43,21 @@ Constraints this project holds itself to:
   lock path, chat, account, or profile. Those come from the operator's
   `config.yaml` and from Hermes' own session context, and there is no property
   in any schema through which one could be supplied.
-- **No process is signalled without proof.** A process id is not identity.
-  Ownership is a challenge answered over a loopback control endpoint using a
-  secret passed in the child's environment; a recycled pid cannot answer it, and
-  a runtime that cannot be proved is left strictly alone.
+- **No process is signalled without proof, and no signal is sent to a bare
+  number.** Ownership is a challenge answered over a loopback control endpoint
+  using a secret passed in the child's environment; a recycled pid cannot answer
+  it, and a runtime that cannot be proved is left strictly alone. Escalation
+  additionally holds a pid file descriptor across the proof and the signal, so
+  the identity cannot be recycled in between — and where no such handle exists
+  (macOS), escalation refuses rather than signalling a number.
+- **Launch authority comes from the platform, not the model.** The agent may
+  read what a learner meant; it cannot supply their words. A launch requires a
+  quotation that appears in the message Hermes actually delivered for the
+  current turn, recorded before the model ran, and one message authorises one
+  launch once.
+- **Credentials are resolved per profile.** The bot token and Telegram
+  allowlists come from Hermes' profile-scoped secret API, not `os.environ`,
+  because a multiplexed process may hold another profile's.
 - **No shell, ever.** Every child process is started from an argument array.
   `os.system`, `os.popen`, the `exec`/`fork` family and `shell=True` appear
   nowhere in the package, and a source-scanning test names the four files
@@ -87,8 +98,10 @@ than none:
     the profile's allowlist, and all but the bootstrap require a session token
     minted for that same Telegram account;
   - on a runtime this plugin launched, opening a session **additionally**
-    requires an unexpired launch grant for that account and that exercise — so
-    knowing the public address is not enough to open anything;
+    requires an activated, unexpired launch grant issued to that account in this
+    runtime generation, named by a selector the button carried in its URL
+    fragment — so knowing the public address is not enough to open anything, and
+    a client cannot name an exercise of its own;
   - the five static frontend files are public, because a webview cannot attach a
     header to the navigation that loads a page. They are byte-identical for every
     caller and contain no learner data;
