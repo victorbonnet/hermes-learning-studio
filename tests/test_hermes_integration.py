@@ -453,9 +453,21 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
     assert sorted(registered) == [
         "learning_studio_get_context",
         "learning_studio_import_asset",
+        "learning_studio_launch",
         "learning_studio_prepare",
+        "learning_studio_results",
         "learning_studio_save_context",
+        "learning_studio_status",
+        "learning_studio_stop",
     ]
+
+    # The real registry stores `check_fn`, and gates the tool on it. Checked
+    # here rather than only against the fake context, because "Hermes accepts a
+    # check_fn" is a claim about somebody else's code.
+    from learning_studio.plugin import RUNTIME_TOOLS
+
+    gated = {name for name, entry in registered.items() if entry.check_fn is not None}
+    assert gated == set(RUNTIME_TOOLS)
 
     session_context = _load_session_context(src)
 

@@ -367,7 +367,11 @@ def launch_results(
         "state": progress.get("state"),
         "opened": bool(progress.get("opened")),
         "position": progress.get("position"),
-        "component_count": progress.get("component_count"),
+        # From the stored exercise, not from the session. A launch nobody has
+        # opened yet has no session, and reporting "0 of 0" for an exercise
+        # with five questions in it reads as an answer rather than as an
+        # absence. How many there are is known; how far they got is not.
+        "component_count": len(experience["components"]),
         "answered": progress.get("answered"),
         "completed": bool(progress.get("completed")),
         "responses_returned": False,

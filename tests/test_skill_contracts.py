@@ -481,48 +481,76 @@ def test_ui_reference_examples_span_unrelated_subjects(references: dict[str, str
     )
 
 
-# ── The renderer exists; nothing launches it ───────────────────────────────
+# ── An exercise can be opened, and only a real result says it was ─────────
 #
-# Both halves matter, and the guidance was wrong about the first for a whole PR:
-# it told the agent there was no card renderer and no Mini App, which had stopped
-# being true. A skill that understates what exists routes work to chat that had a
-# better destination; one that overstates it describes a screen nobody can see.
+# Both halves matter, and the guidance has been wrong about each of them in
+# turn. It once said there was no card renderer, which had stopped being true.
+# It then said nothing could launch one, which has now stopped being true too.
+# A skill that understates what exists routes work to chat that had a better
+# destination; one that overstates it describes a screen nobody can see.
 
 
-def test_the_skill_says_a_trusted_renderer_exists(skill_md: str):
+def test_the_skill_says_exercises_can_be_opened(skill_md: str):
     assert_states(
         skill_md,
         (
-            r"(trusted )?card renderer now exists|mini app that renders",
-            r"every component type|thirty-one|31 component",
+            r"exercises can now be opened|learning_studio_launch",
+            r"sends the learner a button|button in the private telegram",
         ),
-        "renderer availability",
+        "launch availability",
     )
 
 
-def test_the_skill_still_says_nothing_launches_it(skill_md: str):
+def test_the_skill_says_a_launch_is_only_real_when_the_result_says_so(skill_md: str):
     """The half that keeps the agent honest about what the learner can see."""
     assert_states(
         skill_md,
         (
-            r"nothing in this release\s+starts the server|no launch tool",
-            r"deliver exercises in conversation|delivered? .{0,20}in conversation",
+            r"unless\s+`?learning_studio_launch`? returned a result saying `?button_delivered",
+            r"do not tell the learner to tap anything|nothing there to tap",
         ),
-        "launch scope",
+        "launch honesty",
     )
 
 
-def test_the_skill_does_not_claim_the_renderer_is_missing(skill_md: str):
+def test_the_skill_keeps_the_conversational_fallback_mandatory(skill_md: str):
+    """Chat is a complete way to run a session, not a degraded one."""
+    assert_states(
+        skill_md,
+        (
+            r"continue that part of the session in\s+chat",
+            r"run the exercise in chat and say\s+that is what you are doing",
+        ),
+        "chat fallback",
+    )
+
+
+def test_the_skill_says_running_an_exercise_records_nothing(skill_md: str):
+    """The single most tempting thing to imply once a screen exists."""
+    assert_states(
+        skill_md,
+        (
+            r"nothing they do is recorded|attempts and scores are not stored",
+            r"no score, no mark, no attempt|no review schedule",
+        ),
+        "nothing recorded",
+    )
+
+
+def test_the_skill_does_not_claim_the_runtime_is_missing(skill_md: str):
     """The specific stale sentences, so they cannot come back by copy-paste."""
     stale = (
         "no card renderer",
         "no mini app",
         "there is still no delivery runtime",
+        "there is no launch tool yet",
+        "nothing in this release starts the server",
+        "until the launch tooling lands",
     )
     body = normalize(skill_md)
 
     present = [phrase for phrase in stale if phrase in body]
-    assert present == [], f"the skill still claims the renderer is absent: {present}"
+    assert present == [], f"the skill still claims the runtime is absent: {present}"
 
 
 def test_the_skill_says_the_agent_writes_manifests_not_frontend_code(skill_md: str):

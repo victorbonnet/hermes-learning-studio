@@ -51,16 +51,48 @@ cost of hijacking someone's attention.
 - **Revocation.** "Stop", "later", "not now", or a change of subject ends it
   immediately. Do not re-offer in the same breath.
 
+## Telling the launch tool which of the two happened
+
+`learning_studio_launch` asks you to say which rule applies, because it cannot
+work it out and neither can anything else after the fact.
+
+- **Rule 1** — `initiation: "learner_request"`. Nothing else is needed. The
+  request *was* the agreement.
+- **Rule 2** — `initiation: "agent_suggestion"`, plus `learner_confirmed: true`
+  and `confirmation_quote` set to what the learner actually said. Their words,
+  not your summary of them.
+
+Two things follow from that, and both are enforced rather than advised:
+
+- **One agreement, one launch.** If the first exercise expired unopened, their
+  earlier yes does not open a second one. Ask again. This is what stops a retry
+  loop from repeatedly opening a public address on somebody's behalf.
+- **An agreement goes stale.** A yes from much earlier in the conversation is
+  refused. Ask again rather than arguing with the refusal.
+
+Nothing here can verify that the learner agreed — you are the one writing
+`learner_confirmed`, in the same call as everything else. What the rule buys is
+that you have to say, once, that a specific person agreed to a specific thing,
+and cannot spend that statement twice.
+
 ## Launching honestly
 
 Whatever the policy says, the mechanics are the same:
 
 - Check that the tool is actually in your tool list before routing to it.
 - If it is not, run the exercise in chat and say that is what you are doing.
-- Never claim that an exercise or a Mini App was launched, opened, or is
-  running without a real tool result saying so.
-- If a launch fails, say it failed. Do not fall back silently and let the
-  learner believe they are in the app.
+- **Never claim that an exercise was launched, opened, or is running unless the
+  result says `button_delivered`.** Preparing is not opening; a refusal is not a
+  launch; and "it should be there" is not a tool result.
+- If a launch fails, say it failed and continue in conversation. Do not fall
+  back silently and let the learner believe they are in the app, and do not tell
+  them to tap a button that was never sent.
+- A repeat launch of the same exercise reports the one already open and sends
+  nothing new. If the learner says the button is not there, that is a
+  conversation to have — not a reason to keep calling launch.
+- **Do not narrate the runtime.** The learner does not need to know about
+  servers, addresses, tunnels, or timeouts. "It's open — tap the button" and
+  "let's do this here instead" are the two things worth saying.
 
 ## Never launch when
 

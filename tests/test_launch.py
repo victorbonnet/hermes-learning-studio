@@ -533,6 +533,11 @@ def test_results_report_a_launch_nobody_opened(runtime, telegram_session, princi
     assert result["state"] == "waiting"
     assert result["opened"] is False
     assert result["completed"] is False
+    # How many questions there are is known from the stored exercise; how far
+    # they got is not, because there is no session yet.
+    assert result["component_count"] == 1
+    assert result["position"] == 0
+    assert result["answered"] == 0
 
 
 def test_results_never_invent_a_score_or_return_an_answer(

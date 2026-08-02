@@ -1,0 +1,515 @@
+"""The adversarial pass over the launch feature, as one file.
+
+Each section below is a claim the pull request makes. Several of them are also
+checked where the behaviour lives; they are restated here so that the whole set
+can be read in one sitting, and so that a change which quietly weakened one of
+them fails a test named after the promise rather than after the function.
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from learning_studio import consent, launch, telegram_launch
+from learning_studio.config import LearningStudioConfig
+from learning_studio.runtime import (
+    bootstrap,
+    environment,
+    grants,
+    manager,
+    ownership,
+    state,
+    supervisor,
+    tunnel,
+)
+from learning_studio.schemas import TOOL_SCHEMAS
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix", reason="the runtime owns processes through POSIX primitives only"
+)
+
+PACKAGE = Path(__file__).resolve().parent.parent / "learning_studio"
+
+RUNTIME_TOOLS = (
+    "learning_studio_launch",
+    "learning_studio_status",
+    "learning_studio_results",
+    "learning_studio_stop",
+)
+
+
+def sources() -> list[Path]:
+    return sorted(PACKAGE.rglob("*.py"))
+
+
+def relative(path: Path) -> str:
+    return path.relative_to(PACKAGE).as_posix()
+
+
+# ── The model controls nothing that matters ───────────────────────────────
+
+
+def test_no_tool_schema_anywhere_names_a_machine_or_a_person():
+    """Across all eight tools, not just the new ones."""
+    forbidden = {
+        "host",
+        "port",
+        "url",
+        "executable",
+        "command",
+        "argv",
+        "pid",
+        "signal",
+        "env",
+        "environment",
+        "timeout",
+        "lock_path",
+        "chat_id",
+        "telegram_user_id",
+        "user_id",
+        "learner_key",
+        "learner_id",
+        "bot_token",
+        "token",
+        "profile",
+    }
+
+    offenders = []
+    for name, schema in TOOL_SCHEMAS.items():
+        for field in schema["parameters"].get("properties", {}):
+            if field in forbidden:
+                offenders.append(f"{name}.{field}")
+
+    assert offenders == [], offenders
+
+
+def test_the_launch_orchestration_reads_no_argument_for_a_destination():
+    source = Path(launch.__file__).read_text(encoding="utf-8")
+
+    for reached in ("chat_id", "telegram_user_id", "bot_token"):
+        assert f'args["{reached}"]' not in source
+        assert f'args.get("{reached}")' not in source
+
+
+def test_the_launch_signature_accepts_nothing_a_model_should_not_supply():
+    parameters = set(inspect.signature(launch.launch_experience).parameters)
+
+    assert parameters == {
+        "principal",
+        "experience_id",
+        "initiation",
+        "learner_confirmed",
+        "confirmation_quote",
+        "config",
+        "deliver",
+        "ledger",
+    }
+
+
+# ── No shell, anywhere ────────────────────────────────────────────────────
+
+
+def test_no_module_passes_shell_true_or_builds_a_command_string():
+    offenders: list[str] = []
+    for path in sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "shell":
+                    continue
+                if not (isinstance(keyword.value, ast.Constant) and keyword.value.value is False):
+                    offenders.append(f"{relative(path)}:{node.lineno}")
+
+    assert offenders == [], offenders
+
+
+def test_every_command_this_plugin_builds_is_a_list_of_strings():
+    built = tunnel.command("/usr/bin/cloudflared", "http://127.0.0.1:1")
+
+    assert isinstance(built, list)
+    assert all(isinstance(part, str) for part in built)
+    assert not any(" " in part and part.startswith("-") for part in built)
+
+
+# ── Nothing unprovable is signalled ───────────────────────────────────────
+
+
+def record(**overrides) -> state.RuntimeRecord:
+    fields = {
+        "runtime_id": "r",
+        "generation": 1,
+        "profile": "default",
+        "pid": 4242,
+        "host": "127.0.0.1",
+        "port": 40404,
+        "control_token": "token",
+        "executable": "/x/python",
+        "started_at": 0.0,
+        "idle_timeout_seconds": 60,
+        "max_lifetime_seconds": 300,
+    }
+    fields.update(overrides)
+    return state.RuntimeRecord(**fields)
+
+
+def test_a_recycled_process_id_is_never_signalled(monkeypatch):
+    """The nastiest realistic failure, stated as one test.
+
+    The runtime died; the operating system gave its number to somebody's
+    database. The database cannot answer a challenge it was never told about,
+    so it is not signalled, and the record is simply forgotten.
+    """
+    stranger = record()
+    monkeypatch.setattr(
+        ownership,
+        "_request",
+        lambda *a, **k: (_ for _ in ()).throw(ownership.ControlError("control_unreachable")),
+    )
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    outcome = ownership.stop_owned(stranger, graceful_seconds=1)
+
+    assert outcome.result == "not_running"
+    assert killed == []
+
+
+def test_a_process_that_knows_the_secret_but_is_not_ours_is_not_signalled(monkeypatch):
+    """Every identifying field has to agree, not just the one that authenticates."""
+    ours = record()
+    monkeypatch.setattr(
+        ownership,
+        "_request",
+        lambda rec, *a, **k: {
+            "runtime_id": rec.runtime_id,
+            "generation": rec.generation,
+            "pid": rec.pid + 1,  # something else is answering for us
+            "executable": rec.executable,
+            "started_at": 0.0,
+            "idle_seconds": None,
+            "server_state": "ready",
+            "tunnel_state": "ready",
+            "tunnel_ready": False,
+            "tunnel_url": "",
+        },
+    )
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+
+    assert ownership.stop_owned(ours, graceful_seconds=1).result == "not_running"
+    assert killed == []
+
+
+def test_signalling_goes_to_a_group_the_runtime_leads(monkeypatch):
+    """A group led by somebody else would take strangers down with it."""
+    source = Path(ownership.__file__).read_text(encoding="utf-8")
+
+    assert "os.getpgid(record.pid) != record.pid" in source
+    assert "os.killpg" in source
+    assert "os.kill(" not in source
+
+
+# ── Corrupt state fails closed ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "",
+        "{",
+        "[]",
+        json.dumps({"schema": 1}),
+        json.dumps({"schema": 2, "pid": 1}),
+        json.dumps({"schema": 1, "pid": "1"}),
+    ],
+)
+def test_a_malformed_record_is_no_runtime_at_all(hermes_home, payload: str):
+    state.runtime_dir()
+    state.record_path().write_text(payload, encoding="utf-8")
+
+    assert state.read_record() is None
+
+
+def test_a_malformed_record_leaves_status_saying_nothing_is_running(hermes_home):
+    state.runtime_dir()
+    state.record_path().write_text("{not json", encoding="utf-8")
+
+    reported = manager.status(LearningStudioConfig())
+
+    assert reported["running"] is False
+    assert reported["stale_record"] is False
+
+
+# ── Profile and learner isolation ─────────────────────────────────────────
+
+
+def test_one_profile_cannot_see_or_stop_another(tmp_path, monkeypatch):
+    first, second = tmp_path / "a", tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(first))
+    state.write_record(record(runtime_id="a-runtime"))
+
+    monkeypatch.setenv("HERMES_HOME", str(second))
+    assert state.read_record() is None
+    assert manager.stop(LearningStudioConfig())["state"] == "not_running"
+
+    monkeypatch.setenv("HERMES_HOME", str(first))
+    assert state.read_record() is not None
+
+
+def test_a_grant_admits_only_the_account_it_was_created_for():
+    store = grants.GrantStore(profile="default", generation=1, clock=lambda: 0.0)
+    store.create({"telegram_user_id": "1001", "learner_id": "learner-a", "experience_id": "exp-1"})
+
+    assert store.admit(telegram_user_id="2002", experience_id="exp-1") is None
+    assert store.admit(telegram_user_id="1001", experience_id="exp-2") is None
+    assert store.admit(telegram_user_id="1001", experience_id="exp-1") is not None
+
+
+def test_progress_cannot_be_read_for_another_account():
+    store = grants.GrantStore(profile="default", generation=1, clock=lambda: 0.0)
+    store.create({"telegram_user_id": "1001", "learner_id": "learner-a", "experience_id": "exp-1"})
+
+    theirs = store.progress({"telegram_user_id": "2002", "experience_id": "exp-1"})
+
+    assert theirs == {"found": False}
+
+
+def test_a_grant_is_bound_to_one_runtime_generation():
+    """A grant from generation 4 must not be honoured by generation 5."""
+    store = grants.GrantStore(profile="default", generation=4, clock=lambda: 0.0)
+
+    created = store.create({"telegram_user_id": "1001", "learner_id": "l", "experience_id": "e"})
+
+    assert created["generation"] == 4
+
+
+# ── Nothing leaks ─────────────────────────────────────────────────────────
+
+
+def test_the_runtime_record_summary_carries_no_secret_or_locator():
+    described = json.dumps(record(control_token="s3cret").describe())
+
+    for forbidden in ("s3cret", "127.0.0.1", "40404", "/x/python", "4242"):
+        assert forbidden not in described, forbidden
+
+
+def test_no_error_message_shown_to_an_agent_contains_a_locator():
+    from learning_studio.runtime import errors
+
+    messages = [
+        value for name, value in vars(errors).items() if name.isupper() and isinstance(value, str)
+    ]
+
+    assert messages
+    for message in messages:
+        for forbidden in ("http://", "https://", "/Users", "/home", "127.0.0.1", "TOKEN", ".env"):
+            assert forbidden not in message, message
+
+
+def test_a_bot_token_shaped_string_is_removed_by_the_redactor():
+    token = "7654321:AAEabcdefghijklmnopqrstuvwxyz0123456"
+
+    cleaned = telegram_launch.redact(f"POST /bot{token}/sendMessage failed for 7654321", token)
+
+    assert token not in cleaned
+    assert "7654321" not in cleaned
+
+
+def test_the_control_secret_travels_in_the_environment_and_not_an_argument(hermes_home):
+    """The process table is readable by every user on the machine.
+
+    Checked by building both halves rather than by reading the source: the
+    command is what `ps` would show, and the environment is what it would not.
+    """
+    secret = "a-very-secret-control-token"
+    child = supervisor.child_environment(
+        record(control_token=secret),
+        handshake=Path("/tmp/handshake.json"),
+        cloudflared="/usr/bin/cloudflared",
+        source={},
+    )
+    command = [str(bootstrap.runtime_python()), str(supervisor.LAUNCHER)]
+
+    assert child[environment.CONTROL_TOKEN] == secret
+    assert secret not in " ".join(command)
+    assert len(command) == 2
+
+
+def test_the_tunnel_child_is_given_neither_credential_nor_profile():
+    assert "TELEGRAM_BOT_TOKEN" not in environment.TUNNEL_INHERITED
+    assert "HERMES_HOME" not in environment.TUNNEL_INHERITED
+    assert set(environment.TUNNEL_INHERITED) < set(environment.INHERITED)
+
+
+def test_the_child_environment_is_an_allowlist_not_a_copy():
+    """A copy-and-delete list passes tomorrow's credential straight through."""
+    child = supervisor.child_environment(
+        record(),
+        handshake=Path("/tmp/h.json"),
+        cloudflared="",
+        source={"ANTHROPIC_API_KEY": "sk-x", "AWS_SESSION_TOKEN": "y", "HOME": "/home/x"},
+    )
+
+    assert "ANTHROPIC_API_KEY" not in child
+    assert "AWS_SESSION_TOKEN" not in child
+    assert child["HOME"] == "/home/x"
+
+
+# ── Tunnel validation resists look-alikes ─────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "https://trycloudflare.com.attacker.test",
+        "https://eviltrycloudflare.com",
+        "https://a.trycloudflare.com.evil.test",
+        "https://a.trycloudflare.com@evil.test",
+        "https://a.trycloudflare.com:8443",
+        "http://a.trycloudflare.com",
+        "https://аbc.trycloudflare.com",
+        "https://a.trycloudflare.com/../x",
+    ],
+)
+def test_a_look_alike_address_is_never_accepted(candidate: str):
+    with pytest.raises(tunnel.TunnelError):
+        tunnel.validate_quick_tunnel_url(candidate)
+
+
+def test_a_runtime_reporting_a_look_alike_is_not_believed(monkeypatch):
+    monkeypatch.setattr(
+        ownership,
+        "_request",
+        lambda rec, *a, **k: {
+            "runtime_id": rec.runtime_id,
+            "generation": rec.generation,
+            "pid": rec.pid,
+            "executable": rec.executable,
+            "started_at": 0.0,
+            "idle_seconds": None,
+            "server_state": "ready",
+            "tunnel_state": "ready",
+            "tunnel_ready": True,
+            "tunnel_url": "https://a.trycloudflare.com.evil.test",
+        },
+    )
+
+    with pytest.raises(ownership.ControlError):
+        ownership.query(record())
+
+
+# ── Consent cannot be spent twice ─────────────────────────────────────────
+
+
+def test_an_agreement_opens_one_exercise_once():
+    ledger = consent.ConsentLedger(clock=lambda: 0.0)
+    ask = {
+        "profile": "default",
+        "learner_scope": "telegram\x001001",
+        "experience_id": "exp-1",
+        "initiation": consent.AGENT_SUGGESTION,
+        "learner_confirmed": True,
+        "confirmation_quote": "yes",
+    }
+
+    assert ledger.decide(**ask).may_create is True
+    ledger.spend(
+        profile="default", learner_scope="telegram\x001001", experience_id="exp-1", quote="yes"
+    )
+
+    assert ledger.decide(**ask).may_create is False
+
+
+def test_a_learner_request_never_needs_an_agreement():
+    ledger = consent.ConsentLedger(clock=lambda: 0.0)
+
+    decided = ledger.decide(
+        profile="default",
+        learner_scope="telegram\x001001",
+        experience_id="exp-1",
+        initiation=consent.LEARNER_REQUEST,
+        learner_confirmed=False,
+        confirmation_quote=None,
+    )
+
+    assert decided.may_create is True
+
+
+def test_one_learner_agreement_does_not_authorise_another_learner():
+    ledger = consent.ConsentLedger(clock=lambda: 0.0)
+    ledger.spend(
+        profile="default", learner_scope="telegram\x001001", experience_id="exp-1", quote="yes"
+    )
+
+    decided = ledger.decide(
+        profile="default",
+        learner_scope="telegram\x002002",
+        experience_id="exp-1",
+        initiation=consent.AGENT_SUGGESTION,
+        learner_confirmed=True,
+        confirmation_quote="yes",
+    )
+
+    assert decided.may_create is True, "a second learner was refused on the first one's ledger"
+
+
+# ── The rest of the plugin is unchanged ───────────────────────────────────
+
+
+def test_the_plugin_still_writes_no_hermes_memory():
+    for path in sources():
+        body = path.read_text(encoding="utf-8")
+        assert "memory_tool" not in body, relative(path)
+        assert "MEMORY.md" not in body, relative(path)
+
+
+def test_results_propose_no_durable_memory_from_running_an_exercise():
+    """A one-off event is not a fact that stays true."""
+    source = Path(launch.__file__).read_text(encoding="utf-8")
+
+    assert '"memory_candidates": []' in source
+
+
+def test_nothing_downloads_or_installs_anything():
+    for path in sources():
+        body = path.read_text(encoding="utf-8").lower()
+        for forbidden in ("urlretrieve", "wget ", "curl -", "apt-get", "brew install"):
+            assert forbidden not in body, f"{relative(path)} mentions {forbidden}"
+
+
+def test_the_bootstrap_is_never_run_automatically():
+    """A launch reports a missing environment; it does not build one."""
+    for path in sources():
+        if relative(path) in ("runtime/bootstrap.py",):
+            continue
+        body = path.read_text(encoding="utf-8")
+        assert "bootstrap.bootstrap(" not in body, relative(path)
+
+
+def test_the_bootstrap_never_asks_for_privilege():
+    body = Path(bootstrap.__file__).read_text(encoding="utf-8")
+
+    for forbidden in ("sudo", "setuid", "os.setuid", "--break-system-packages"):
+        assert forbidden not in body, forbidden
+
+
+def test_registration_is_still_free_of_side_effects(ctx, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fresh"))
+    from learning_studio import register
+
+    register(ctx)
+
+    assert not (tmp_path / "fresh").exists(), "registration created state on disk"
+    assert len(ctx.tools) == 8
