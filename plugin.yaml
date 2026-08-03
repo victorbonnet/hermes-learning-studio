@@ -11,15 +11,27 @@ author: Victor Bonnet
 kind: standalone
 
 # The tools this plugin registers, in the `plugin_learning_studio` toolset.
-# Hooks and slash commands arrive in later PRs and will be declared here when
-# they exist.
+# Hooks and slash commands are still not among them.
 provides_tools:
   - learning_studio_get_context
   - learning_studio_save_context
   - learning_studio_prepare
   - learning_studio_import_asset
-provides_hooks: []
+  - learning_studio_launch
+  - learning_studio_status
+  - learning_studio_results
+  - learning_studio_stop
+# One hook, and it only observes. `pre_gateway_dispatch` fires with the real
+# incoming MessageEvent before the agent runs, which is how launching learns
+# what the learner actually said rather than taking the model's word for it.
+# The callback records and returns None: it never skips or rewrites a message.
+provides_hooks:
+  - pre_gateway_dispatch
 
-# No credentials are needed. A non-empty `requires_env` would gate the plugin
-# off entirely when the variable is unset.
+# Deliberately empty, even though launching a Mini App needs a Telegram bot
+# token. A non-empty `requires_env` gates the *whole plugin* off when the
+# variable is unset — so declaring the token here would take the context,
+# manifest, and asset tools away from every profile that never launches
+# anything, which is most of them. The launch path reads the token where Hermes
+# already keeps it and refuses with an explanation when it is absent.
 requires_env: []

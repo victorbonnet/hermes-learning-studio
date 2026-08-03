@@ -249,3 +249,121 @@ def test_load_config_returns_defaults_outside_a_hermes_process():
     from learning_studio.config import load_config
 
     assert isinstance(load_config(), LearningStudioConfig)
+
+
+# ── The on-demand runtime ─────────────────────────────────────────────────
+
+
+def test_the_runtime_defaults_bind_loopback_and_bound_their_own_lifetime():
+    config = LearningStudioConfig.from_mapping({})
+
+    assert config.runtime_host == "127.0.0.1"
+    assert config.runtime_port == 0
+    assert config.runtime_idle_timeout_seconds == 1800
+    assert config.runtime_max_lifetime_seconds == 7200
+    assert config.cloudflared_path == ""
+    assert config.launch_button_label == "Open Learning Studio"
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "::1"])
+def test_a_loopback_address_is_accepted(host: str):
+    assert _config(runtime_host=host).runtime_host
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "0.0.0.0",
+        "192.168.1.10",
+        "10.0.0.1",
+        "::",
+        "localhost",
+        "example.com",
+        "",
+        "   ",
+        127,
+        None,
+    ],
+)
+def test_a_non_loopback_or_unresolvable_bind_address_is_refused(host):
+    """A hostname is refused too: what it resolves to is not this plugin's call."""
+    with pytest.raises(ConfigError):
+        _config(runtime_host=host)
+
+
+@pytest.mark.parametrize("port", [0, 1024, 8080, 65535])
+def test_a_usable_runtime_port_is_accepted(port: int):
+    assert _config(runtime_port=port).runtime_port == port
+
+
+@pytest.mark.parametrize("port", [-1, 80, 443, 1023, 65536, "8080", True, 1.5])
+def test_a_privileged_or_malformed_runtime_port_is_refused(port):
+    with pytest.raises(ConfigError):
+        _config(runtime_port=port)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("runtime_readiness_timeout_seconds", 4),
+        ("runtime_readiness_timeout_seconds", 601),
+        ("runtime_idle_timeout_seconds", 59),
+        ("runtime_idle_timeout_seconds", 86_401),
+        ("runtime_max_lifetime_seconds", 299),
+        ("runtime_max_lifetime_seconds", 86_401),
+        ("runtime_graceful_stop_seconds", 0),
+        ("runtime_graceful_stop_seconds", 121),
+        ("tunnel_readiness_timeout_seconds", 4),
+        ("tunnel_readiness_timeout_seconds", 601),
+    ],
+)
+def test_an_out_of_range_runtime_timeout_is_refused(key: str, value: int):
+    with pytest.raises(ConfigError):
+        _config(**{key: value})
+
+
+def test_an_idle_timeout_longer_than_the_maximum_lifetime_is_refused():
+    """Individually valid, jointly meaningless: the idle timer could never fire."""
+    with pytest.raises(ConfigError):
+        _config(runtime_idle_timeout_seconds=7200, runtime_max_lifetime_seconds=3600)
+
+
+def test_an_absolute_cloudflared_path_is_accepted():
+    assert _config(cloudflared_path="/usr/local/bin/cloudflared").cloudflared_path == (
+        "/usr/local/bin/cloudflared"
+    )
+
+
+def test_an_empty_cloudflared_path_means_search_the_path():
+    assert _config(cloudflared_path="  ").cloudflared_path == ""
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["cloudflared", "./cloudflared", "../../usr/bin/cloudflared", "~/bin/cloudflared", 5, ["/x"]],
+)
+def test_a_relative_or_malformed_cloudflared_path_is_refused(value):
+    """A relative path resolves against a working directory nobody chose."""
+    with pytest.raises(ConfigError):
+        _config(cloudflared_path=value)
+
+
+def test_an_operator_may_brand_the_button():
+    """`Open Aula Lola` is a configuration example, never a built-in assumption."""
+    assert _config(launch_button_label="Open Aula Lola").launch_button_label == "Open Aula Lola"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "   ", "x" * 65, "<b>Open</b>", "Open https://example.com", 42, None],
+)
+def test_an_unusable_button_label_is_refused(value):
+    with pytest.raises(ConfigError):
+        _config(launch_button_label=value)
+
+
+def test_the_default_button_label_names_no_product_or_profile():
+    from learning_studio.config import DEFAULT_BUTTON_LABEL
+
+    assert DEFAULT_BUTTON_LABEL == "Open Learning Studio"
+    assert "Lola" not in DEFAULT_BUTTON_LABEL

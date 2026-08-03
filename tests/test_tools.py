@@ -24,12 +24,12 @@ def _call(handler, **params) -> dict:
 # ── Registration ──────────────────────────────────────────────────────────
 
 
-def test_exactly_four_tools_are_registered(ctx):
+def test_exactly_eight_tools_are_registered(ctx):
     from learning_studio import register
 
     register(ctx)
 
-    assert len(ctx.tools) == 4
+    assert len(ctx.tools) == 8
 
 
 def test_the_tool_names_are_the_agreed_ones(ctx):
@@ -40,8 +40,12 @@ def test_the_tool_names_are_the_agreed_ones(ctx):
     assert sorted(tool.name for tool in ctx.tools) == [
         "learning_studio_get_context",
         "learning_studio_import_asset",
+        "learning_studio_launch",
         "learning_studio_prepare",
+        "learning_studio_results",
         "learning_studio_save_context",
+        "learning_studio_status",
+        "learning_studio_stop",
     ]
 
 
@@ -75,15 +79,28 @@ def test_handlers_tolerate_the_kwargs_hermes_passes(ctx, hermes_home, gateway_se
     #: tools take none; preparing an exercise needs the exercise.
     required = {"learning_studio_prepare": {"manifest": manifest()}}
 
+    #: Tools that cannot succeed in a bare test environment, and are exercised
+    #: for the same property elsewhere. Launching and reporting name an exercise
+    #: that does not exist here; stopping is covered by its own idempotence
+    #: tests. What matters here is that the *dispatch* survives Hermes' extra
+    #: keyword arguments, which the loop below still proves for them —
+    #: a handler that rejected `session_id=` would raise rather than return a
+    #: refusal.
+    refuses_without_setup = {
+        "learning_studio_import_asset",
+        "learning_studio_launch",
+        "learning_studio_results",
+        "learning_studio_stop",
+    }
+
     for tool in ctx.tools:
-        # The media tool has its own successful real-image dispatch test,
-        # including Hermes' extra keyword arguments.  Keeping it out of this
-        # no-argument loop also lets the base suite run without Pillow.
-        if tool.name == "learning_studio_import_asset":
-            continue
         args = required.get(tool.name, {})
         result = tool.handler(args, session_id="abc", task_id="def", agent=object())
-        assert json.loads(result)["ok"] is True, result
+        payload = json.loads(result)
+        assert isinstance(payload, dict), result
+        if tool.name in refuses_without_setup:
+            continue
+        assert payload["ok"] is True, result
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────

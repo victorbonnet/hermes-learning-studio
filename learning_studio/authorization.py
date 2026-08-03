@@ -103,7 +103,6 @@ read raises rather than resolving to "empty" (see
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -169,14 +168,30 @@ def _identifiers(raw: Any) -> set[str]:
     return out
 
 
-def _env_value(env: Mapping[str, str], name: str) -> str:
-    return str(env.get(name, "") or "").strip()
+def _env_value(env: Mapping[str, str] | None, name: str) -> str:
+    """One allowlist value, for the profile actually being served.
+
+    ``env=None`` means "ask the host", and the host is asked through
+    :mod:`learning_studio.secrets` rather than through ``os.environ``. That
+    distinction is the whole point: Hermes can multiplex several profiles
+    through one process, and an allowlist read from the process environment
+    there may be a *different* profile's — which would authorise somebody this
+    profile has never heard of, or deny somebody it has.
+
+    An explicit mapping is used as given. That is what the tests pass, and it
+    is what a caller that has already resolved the values passes.
+    """
+    if env is not None:
+        return str(env.get(name, "") or "").strip()
+
+    from .secrets import get_secret
+
+    return get_secret(name)
 
 
 def any_env_allowlist_configured(env: Mapping[str, str] | None = None) -> bool:
     """True when the runner gate bounds a DM by the environment allowlists."""
-    environment = os.environ if env is None else env
-    return any(_env_value(environment, name) for name in ENV_ALLOWLISTS)
+    return any(_env_value(env, name) for name in ENV_ALLOWLISTS)
 
 
 def _telegram_platform_config(host_config: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -245,12 +260,11 @@ def configured_allow_from(host_config: Mapping[str, Any] | None) -> AllowFrom:
 
 def env_allowed_users(env: Mapping[str, str] | None = None) -> frozenset[str] | None:
     """The runner gate's DM allowlist, or ``None`` when it imposes no bound."""
-    environment = os.environ if env is None else env
-    if not any_env_allowlist_configured(environment):
+    if not any_env_allowlist_configured(env):
         return None
     allowed: set[str] = set()
     for name in _ENV_DM_ALLOWLISTS:
-        allowed |= _identifiers(_env_value(environment, name))
+        allowed |= _identifiers(_env_value(env, name))
     return frozenset(allowed)
 
 

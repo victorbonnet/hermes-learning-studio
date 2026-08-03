@@ -28,7 +28,15 @@ const INIT_DATA_HEADER = "X-Telegram-Init-Data";
 const SESSION_HEADER = "X-Learning-Studio-Session";
 
 const EXPERIENCE_ID = "exp-abc123";
-const INIT_DATA = `auth_date=1800000000&start_param=${EXPERIENCE_ID}&hash=deadbeef`;
+// The selector the runtime issues and the button carries. Shaped exactly as
+// `LAUNCH_ID_PATTERN` in `learning_studio/runtime/grants.py`.
+const LAUNCH_ID = "Kx7vQm2ZpL9dR4sT";
+const INIT_DATA = `auth_date=1800000000&hash=deadbeef`;
+
+/** The address the real button opens, as the sender builds it. */
+function buttonLocation(launchId = LAUNCH_ID) {
+  return { search: "", pathname: "/", hash: `#launch=${launchId}` };
+}
 
 function telegramStub(overrides = {}) {
   const calls = {
@@ -42,7 +50,7 @@ function telegramStub(overrides = {}) {
   return Object.assign(
     {
       initData: INIT_DATA,
-      initDataUnsafe: { start_param: EXPERIENCE_ID },
+      initDataUnsafe: {},
       colorScheme: "light",
       themeParams: { bg_color: "#101010", text_color: "#f0f0f0" },
       calls,
@@ -224,7 +232,11 @@ function fakeApi({
 async function boot(options = {}) {
   const api = fakeApi(options);
   const telegram = options.telegram === null ? null : telegramStub(options.telegram);
-  const { win, booted } = loadApp({ telegram, fetch: api.fetchImpl });
+  const { win, booted } = loadApp({
+    telegram,
+    fetch: api.fetchImpl,
+    location: options.location === undefined ? buttonLocation() : options.location,
+  });
   await booted;
   await settle(20);
   return { win, api, telegram, node: (id) => win.document.getElementById(id) };
@@ -272,7 +284,11 @@ test("a launch from Telegram opens a session and shows the first card", async ()
   assert.deepEqual(context.telegram.calls.events, ["themeChanged"]);
 
   assert.equal(context.api.log[0].path, "/api/session");
-  assert.equal(JSON.parse(context.api.log[0].body).experience_id, EXPERIENCE_ID);
+  // The selector from the button's fragment, and nothing else. The page never
+  // names an experience: the server derives that from the grant.
+  const bootstrap = JSON.parse(context.api.log[0].body);
+  assert.equal(bootstrap.launch_id, LAUNCH_ID);
+  assert.equal(bootstrap.experience_id, undefined);
   assert.equal(context.node("exercise-title").textContent, "A short practice set");
   assert.match(context.node("progress-text").textContent, /Card 1 of 2/);
   assert.equal(
@@ -417,7 +433,11 @@ test("a response that is not an image is refused rather than shown", async () =>
     }
     return original(path, init);
   };
-  const { win, booted } = loadApp({ telegram: telegramStub(), fetch: fetchImpl });
+  const { win, booted } = loadApp({
+    telegram: telegramStub(),
+    fetch: fetchImpl,
+    location: buttonLocation(),
+  });
   await booted;
   await settle(20);
 
@@ -459,7 +479,11 @@ test("the error clears once the card is answered", async () => {
 
 test("a launch outside Telegram says so and asks for nothing", async () => {
   const api = fakeApi();
-  const { win, booted } = loadApp({ telegram: null, fetch: api.fetchImpl });
+  const { win, booted } = loadApp({
+    telegram: null,
+    fetch: api.fetchImpl,
+    location: buttonLocation(),
+  });
   await booted;
   await settle();
 
@@ -473,6 +497,7 @@ test("a Telegram launch with no initData is the same refusal", async () => {
   const { win, booted } = loadApp({
     telegram: telegramStub({ initData: "" }),
     fetch: api.fetchImpl,
+    location: buttonLocation(),
   });
   await booted;
   await settle();
@@ -481,11 +506,12 @@ test("a Telegram launch with no initData is the same refusal", async () => {
   assert.equal(api.log.length, 0);
 });
 
-test("a deep link with no experience id ends in not-found, not a blank screen", async () => {
+test("an address with no launch selector ends in not-found, not a blank screen", async () => {
   const api = fakeApi();
   const { win, booted } = loadApp({
-    telegram: telegramStub({ initData: "auth_date=1&hash=x", initDataUnsafe: {} }),
+    telegram: telegramStub(),
     fetch: api.fetchImpl,
+    location: { search: "", pathname: "/", hash: "" },
   });
   await booted;
   await settle();
@@ -494,20 +520,73 @@ test("a deep link with no experience id ends in not-found, not a blank screen", 
   assert.equal(api.log.length, 0);
 });
 
-test("a malformed experience id is not sent to the server", async () => {
+test("a malformed launch selector is not sent to the server", async () => {
+  for (const hostile of [
+    "#launch=../../etc/passwd",
+    "#launch=short",
+    "#launch=" + "x".repeat(200),
+    "#launch=has spaces here at all",
+    "#experience_id=exp-abc123",
+    "#launch=",
+  ]) {
+    const api = fakeApi();
+    const { win, booted } = loadApp({
+      telegram: telegramStub(),
+      fetch: api.fetchImpl,
+      location: { search: "", pathname: "/", hash: hostile },
+    });
+    await booted;
+    await settle();
+
+    assert.equal(stateOf(win), "notfound", hostile);
+    assert.equal(api.log.length, 0, hostile);
+  }
+});
+
+test("the page never sends an experience id of its own choosing", async () => {
+  // A query string naming an experience must not become launch authority: on a
+  // launched runtime the server derives the exercise from the grant, and a
+  // page that could name one would be back to the design this replaced.
   const api = fakeApi();
   const { win, booted } = loadApp({
-    telegram: telegramStub({
-      initData: "auth_date=1&start_param=../../etc/passwd&hash=x",
-      initDataUnsafe: { start_param: "../../etc/passwd" },
-    }),
+    telegram: telegramStub(),
     fetch: api.fetchImpl,
+    location: { search: "?experience_id=exp-abc123", pathname: "/", hash: "" },
   });
   await booted;
   await settle();
 
   assert.equal(stateOf(win), "notfound");
   assert.equal(api.log.length, 0);
+});
+
+test("the launch selector is removed from history as soon as it is read", async () => {
+  const context = await boot({ types: ["multiple_choice"] });
+
+  assert.deepEqual(context.win.history.replaced, ["/"]);
+  assert.equal(JSON.parse(context.api.log[0].body).launch_id, LAUNCH_ID);
+});
+
+test("a reopen reuses the selector after the fragment has been stripped", async () => {
+  // The page removes the fragment as soon as it reads it, so anything that
+  // opens a session again -- an expired session, a retry -- must not depend on
+  // it still being in the address bar.
+  const context = await boot({
+    types: ["multiple_choice"],
+    // The next component request fails as an expired session, which is what
+    // puts the reopen action on the screen.
+    failWith: { "/api/session/component": 401 },
+  });
+  context.win.location.hash = "";
+
+  click(context.node("primary-action"));
+  await settle(20);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  const opens = context.api.log.filter((entry) => entry.path === "/api/session");
+  assert.ok(opens.length >= 2, "the session was never reopened");
+  assert.equal(JSON.parse(opens[opens.length - 1].body).launch_id, LAUNCH_ID);
 });
 
 const FAILURES = [
@@ -699,7 +778,11 @@ test("an unsupported card can be skipped so the exercise is not a dead end", asy
     type: "some_future_type",
     payload: { prompt: "Something new" },
   };
-  const { win, booted } = loadApp({ telegram: telegramStub(), fetch: api.fetchImpl });
+  const { win, booted } = loadApp({
+    telegram: telegramStub(),
+    fetch: api.fetchImpl,
+    location: buttonLocation(),
+  });
   await booted;
   await settle(20);
 
@@ -888,7 +971,11 @@ function eightPromptCard() {
 }
 
 async function bootWith(api) {
-  const { win, booted } = loadApp({ telegram: telegramStub(), fetch: api.fetchImpl });
+  const { win, booted } = loadApp({
+    telegram: telegramStub(),
+    fetch: api.fetchImpl,
+    location: buttonLocation(),
+  });
   await booted;
   await settle(20);
   return { win, api, node: (id) => win.document.getElementById(id) };

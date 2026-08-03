@@ -185,3 +185,40 @@ def test_node_is_available_wherever_the_suite_is_expected_to_run():
     """
     if os.environ.get("CI"):
         assert NODE is not None, "CI must run the frontend suite, and node is missing"
+
+
+def test_the_frontend_and_the_runtime_agree_on_the_selector_shape():
+    """Two implementations of one rule, kept honest against each other.
+
+    The runtime issues launch ids and refuses anything else; the page refuses
+    to *send* anything else. If the two patterns drift, either valid launches
+    stop opening or the page starts posting strings the runtime will not read.
+    """
+    from pathlib import Path
+
+    from learning_studio.runtime.grants import LAUNCH_ID_PATTERN
+    from learning_studio.telegram_launch import LAUNCH_FRAGMENT_KEY
+
+    app_js = (
+        Path(__file__).resolve().parent.parent / "learning_studio" / "web" / "static" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert f'LAUNCH_FRAGMENT_KEY = "{LAUNCH_FRAGMENT_KEY}"' in app_js
+    # The Python pattern, written the way JavaScript spells it.
+    assert "/^[A-Za-z0-9_-]{16,64}$/" in app_js
+    assert LAUNCH_ID_PATTERN.pattern == r"\A[A-Za-z0-9_-]{16,64}\Z"
+
+
+def test_the_page_never_posts_an_experience_id():
+    """On a launched runtime the server derives the exercise from the grant."""
+    from pathlib import Path
+
+    app_js = (
+        Path(__file__).resolve().parent.parent / "learning_studio" / "web" / "static" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    # Checked against what the code *reads*, not what the comments mention:
+    # the docstring names `start_param` in order to explain why it is not used,
+    # and a substring scan would read that explanation as a violation.
+    for reader in ('get("start_param")', ".start_param", "experience_id:"):
+        assert reader not in app_js, reader

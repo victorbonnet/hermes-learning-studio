@@ -24,6 +24,14 @@ from .models import MAX_VALUE_CHARS
 #: profile's configuration is inspected.
 CONFIG_SECTION = "learning_studio"
 
+#: Telegram's own ceiling for an inline button caption is 64 characters; a
+#: longer one is rejected by the Bot API, so it is rejected here instead.
+BUTTON_LABEL_MAX_CHARS = 64
+
+#: The caption on the Web App button, when the operator sets none. Generic on
+#: purpose: this plugin ships no product name and assumes no profile.
+DEFAULT_BUTTON_LABEL = "Open Learning Studio"
+
 
 class ConfigError(ValueError):
     """Raised when the ``learning_studio`` config section is malformed."""
@@ -72,6 +80,98 @@ def _telegram_user_ids(raw: Any, key: str) -> tuple[str, ...]:
             )
         out.append(str(int(text)))
     return tuple(dict.fromkeys(out))
+
+
+def _loopback_host(raw: Any, key: str) -> str:
+    """Validate the address the local runtime binds to.
+
+    Only a loopback *IP literal* is accepted. A hostname is refused even when
+    it usually resolves to loopback: what ``localhost`` means is decided by
+    ``/etc/hosts``, NSS, and a resolver this plugin does not control, and the
+    one failure mode that matters here — binding a learner's exercises to an
+    interface the whole network can reach — is exactly what a surprising
+    resolution produces.
+    """
+    import ipaddress
+
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError(f"{CONFIG_SECTION}.{key} must be a loopback IP address")
+    text = raw.strip()
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{CONFIG_SECTION}.{key} must be a loopback IP address such as 127.0.0.1, "
+            f"not a hostname. Got {text!r}."
+        ) from exc
+    if not address.is_loopback:
+        raise ConfigError(
+            f"{CONFIG_SECTION}.{key} must be a loopback address; {text!r} is reachable "
+            "from outside this machine and was refused."
+        )
+    return str(address)
+
+
+def _runtime_port(raw: Any, key: str) -> int:
+    """Validate a fixed listen port, or ``0`` for an ephemeral one.
+
+    Zero is the default and the better answer: an operator-pinned port is a
+    stable target on the loopback interface for every other process on the
+    machine, while an ephemeral one changes on every start. Ports below 1024
+    are refused outright because binding one needs privilege this plugin must
+    never have.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConfigError(f"{CONFIG_SECTION}.{key} must be an integer, got {type(raw).__name__}")
+    if raw == 0:
+        return 0
+    if not 1024 <= raw <= 65535:
+        raise ConfigError(
+            f"{CONFIG_SECTION}.{key} must be 0 (choose an ephemeral port) or between "
+            f"1024 and 65535, got {raw}"
+        )
+    return raw
+
+
+def _executable_path(raw: Any, key: str) -> str:
+    """Validate the operator's chosen ``cloudflared`` binary.
+
+    Empty means "find it on ``PATH``". A non-empty value must be an absolute
+    path: a relative one is resolved against a working directory neither the
+    operator nor this plugin controls, which is how "run the cloudflared I
+    installed" becomes "run whatever is in the directory Hermes happened to
+    start in".
+    """
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ConfigError(f"{CONFIG_SECTION}.{key} must be a string path")
+    text = raw.strip()
+    if not text:
+        return ""
+    if not text.startswith("/"):
+        raise ConfigError(
+            f"{CONFIG_SECTION}.{key} must be an absolute path to the cloudflared "
+            "executable, or omitted so it is found on PATH."
+        )
+    if "\x00" in text or len(text) > 4096:
+        raise ConfigError(f"{CONFIG_SECTION}.{key} is not a usable path")
+    return text
+
+
+def _button_label(raw: Any, key: str) -> str:
+    """Validate the Telegram button caption an operator may customise.
+
+    Runs the same content-safety rules as every other stored string, so a
+    label cannot smuggle markup or a locator into the one message this plugin
+    sends on a learner's behalf.
+    """
+    from .safety import UnsafeContent, safe_text
+
+    try:
+        return safe_text(raw, f"{CONFIG_SECTION}.{key}", max_chars=BUTTON_LABEL_MAX_CHARS)
+    except UnsafeContent as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _context_mapping(raw: Any, key: str) -> dict[str, Any]:
@@ -166,6 +266,51 @@ class LearningStudioConfig:
     #: not already allow.
     mini_app_allowed_telegram_users: tuple[str, ...] = ()
 
+    # ── The on-demand runtime ─────────────────────────────────────────────
+    #
+    # Everything the launch path is allowed to decide is here, which is the
+    # point of putting it here: the model supplies none of it. A tool payload
+    # carries an opaque experience id and a confirmation, and no field of it
+    # reaches an address, a port, a process, a timeout, or an executable.
+
+    #: The interface the local server binds. Loopback only, validated as an IP
+    #: literal — see :func:`_loopback_host`.
+    runtime_host: str = "127.0.0.1"
+
+    #: Fixed listen port, or ``0`` to let the operating system choose one.
+    runtime_port: int = 0
+
+    #: How long the local server has to come up and answer its control probe
+    #: before the start is abandoned and rolled back.
+    runtime_readiness_timeout_seconds: int = 60
+
+    #: How long the runtime may sit without *authenticated learner activity*
+    #: before it shuts itself down. Public traffic through the tunnel does not
+    #: count: anybody can knock on a public URL, and treating that as "someone
+    #: is studying" would keep the runtime alive for as long as a scanner kept
+    #: scanning.
+    runtime_idle_timeout_seconds: int = 1800
+
+    #: The absolute ceiling on one runtime's life, busy or not. A Quick Tunnel
+    #: is a temporary public entrance to a personal learning record, and the
+    #: idle timer alone cannot bound how long one stays open.
+    runtime_max_lifetime_seconds: int = 7200
+
+    #: How long a stop waits after asking politely, before escalating.
+    runtime_graceful_stop_seconds: int = 10
+
+    #: How long the tunnel has to publish a usable URL.
+    tunnel_readiness_timeout_seconds: int = 60
+
+    #: Absolute path to the operator's ``cloudflared``. Empty means "discover
+    #: it on PATH". This plugin never downloads it and never installs it.
+    cloudflared_path: str = ""
+
+    #: Caption on the Telegram Web App button. Operators localise or brand it
+    #: here — ``Open Aula Lola`` is a perfectly good value for one profile and
+    #: is exactly why it is not the default.
+    launch_button_label: str = DEFAULT_BUTTON_LABEL
+
     #: Context values that apply to the whole profile (``profile_config``
     #: provenance) — e.g. an explanation language the operator has set.
     profile_context: dict[str, Any] = field(default_factory=dict)
@@ -174,6 +319,23 @@ class LearningStudioConfig:
     #: stored or explicit. Empty by default: this plugin has no opinion about
     #: what anyone is studying.
     defaults: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject combinations that are individually valid and jointly wrong.
+
+        Per-field parsing cannot see this: an idle timeout longer than the
+        maximum lifetime is two settings that each pass their own bounds and
+        together mean "the idle timer never fires", which is not what an
+        operator who set an idle timer asked for.
+        """
+        if self.runtime_idle_timeout_seconds > self.runtime_max_lifetime_seconds:
+            raise ConfigError(
+                f"{CONFIG_SECTION}.runtime_idle_timeout_seconds "
+                f"({self.runtime_idle_timeout_seconds}) must not exceed "
+                f"{CONFIG_SECTION}.runtime_max_lifetime_seconds "
+                f"({self.runtime_max_lifetime_seconds}); as written the idle timer could "
+                "never fire."
+            )
 
     @classmethod
     def from_mapping(cls, cfg: Any) -> LearningStudioConfig:
@@ -230,6 +392,15 @@ _PARSERS: dict[str, Any] = {
     "mini_app_rate_limit_window_seconds": lambda raw, key: _bounded_int(raw, key, 1, 3_600),
     "mini_app_max_sessions": lambda raw, key: _bounded_int(raw, key, 1, 100_000),
     "mini_app_allowed_telegram_users": _telegram_user_ids,
+    "runtime_host": _loopback_host,
+    "runtime_port": _runtime_port,
+    "runtime_readiness_timeout_seconds": lambda raw, key: _bounded_int(raw, key, 5, 600),
+    "runtime_idle_timeout_seconds": lambda raw, key: _bounded_int(raw, key, 60, 86_400),
+    "runtime_max_lifetime_seconds": lambda raw, key: _bounded_int(raw, key, 300, 86_400),
+    "runtime_graceful_stop_seconds": lambda raw, key: _bounded_int(raw, key, 1, 120),
+    "tunnel_readiness_timeout_seconds": lambda raw, key: _bounded_int(raw, key, 5, 600),
+    "cloudflared_path": _executable_path,
+    "launch_button_label": _button_label,
     "profile_context": _context_mapping,
     "defaults": _context_mapping,
 }

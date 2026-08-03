@@ -1848,3 +1848,171 @@ def test_every_corrupt_state_produces_one_indistinguishable_refusal(
 
     assert statuses == {400}
     assert len(bodies) == 1, "the refusal distinguishes one damaged state from another"
+
+
+# ── The launch selector, on a runtime this plugin started ─────────────────
+
+
+@pytest.fixture
+def launched(deps, clock, hermes_home, experience_id, principal):
+    """A runtime with a grant store, and one launch waiting to be opened."""
+    import dataclasses
+
+    from learning_studio.runtime.grants import GrantStore
+
+    grants = GrantStore(profile="default", generation=1, clock=clock)
+    created = grants.create(
+        {
+            "telegram_user_id": USER_ID,
+            "learner_id": _learner_id_of(principal, experience_id),
+            "experience_id": experience_id,
+        }
+    )
+    # A launch activates the grant once the button has actually been
+    # delivered. Until then it is pending and admits nobody, which is what
+    # stops a failed send from leaving a working entrance behind.
+    grants.activate(created["launch_id"])
+    return dataclasses.replace(deps, grants=grants), created["launch_id"], grants
+
+
+def _learner_id_of(principal, experience_id):
+    from learning_studio import service
+
+    return service.delivery_bundle(principal=principal, experience_id=experience_id).learner_id
+
+
+def _client(dependencies):
+    from fastapi.testclient import TestClient
+
+    return TestClient(create_app(dependencies))
+
+
+def test_a_launched_runtime_opens_from_the_selector(launched, experience_id):
+    dependencies, launch_id, _grants = launched
+
+    with _client(dependencies) as client:
+        opened = client.post("/api/session", headers=auth(), json={"launch_id": launch_id})
+
+    assert opened.status_code == 201
+    assert opened.json()["experience"]["experience_id"] == experience_id
+
+
+def test_a_launched_runtime_refuses_a_client_chosen_experience(launched, experience_id):
+    """Owning an exercise is not the same as having been invited to open it."""
+    dependencies, _launch_id, _grants = launched
+
+    with _client(dependencies) as client:
+        refused = client.post("/api/session", headers=auth(), json={"experience_id": experience_id})
+
+    assert refused.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"launch_id": ""},
+        {"launch_id": "short"},
+        {"launch_id": "../../etc/passwd"},
+        {"launch_id": "Zz" + "0" * 20},
+        {"launch_id": None},
+    ],
+)
+def test_a_missing_or_unknown_selector_opens_nothing(launched, payload):
+    dependencies, _launch_id, grants = launched
+
+    with _client(dependencies) as client:
+        refused = client.post("/api/session", headers=auth(), json=payload)
+
+    assert refused.status_code == 404
+    assert grants._grants[_launch_id_of(grants)].session is None
+
+
+def _launch_id_of(grants):
+    return next(iter(grants._grants))
+
+
+def test_another_account_cannot_use_a_copied_selector(launched):
+    dependencies, launch_id, _grants = launched
+
+    with _client(dependencies) as client:
+        intruder = client.post(
+            "/api/session", headers=auth(user_id=OTHER_USER_ID), json={"launch_id": launch_id}
+        )
+
+    # 403 at the allowlist, or 404 at the grant. Either way, not in.
+    assert intruder.status_code in (403, 404)
+
+
+def test_repeated_opens_never_leave_two_live_tokens(launched, clock):
+    dependencies, launch_id, grants = launched
+
+    with _client(dependencies) as client:
+        first = client.post("/api/session", headers=auth(), json={"launch_id": launch_id})
+        second = client.post("/api/session", headers=auth(), json={"launch_id": launch_id})
+
+        assert first.status_code == second.status_code == 201
+        first_token = first.json()["session_token"]
+        second_token = second.json()["session_token"]
+        assert first_token != second_token
+
+        # The first token is dead; the second works.
+        stale = client.get(
+            "/api/session/component",
+            headers={**auth(), SESSION_HEADER: first_token},
+        )
+        live = client.get(
+            "/api/session/component",
+            headers={**auth(), SESSION_HEADER: second_token},
+        )
+
+    assert stale.status_code == 401
+    assert live.status_code == 200
+
+
+def test_a_reload_resumes_where_the_learner_was(launched):
+    dependencies, launch_id, _grants = launched
+
+    with _client(dependencies) as client:
+        first = client.post("/api/session", headers=auth(), json={"launch_id": launch_id})
+        token = first.json()["session_token"]
+        component = client.get(
+            "/api/session/component", headers={**auth(), SESSION_HEADER: token}
+        ).json()["component"]
+        client.post(
+            "/api/session/answer",
+            headers={**auth(), SESSION_HEADER: token},
+            json={
+                "component_id": component["component_id"],
+                "response": response_for(component["type"], component["payload"]["content"]),
+            },
+        )
+
+        reopened = client.post("/api/session", headers=auth(), json={"launch_id": launch_id})
+
+    assert reopened.status_code == 201
+    assert reopened.json()["progress"]["position"] == 1
+    assert reopened.json()["progress"]["answered"] == 1
+
+
+def test_revoking_the_launch_kills_the_open_session(launched):
+    dependencies, launch_id, grants = launched
+
+    with _client(dependencies) as client:
+        token = client.post("/api/session", headers=auth(), json={"launch_id": launch_id}).json()[
+            "session_token"
+        ]
+
+        grants.revoke(launch_id)
+
+        after = client.get("/api/session/component", headers={**auth(), SESSION_HEADER: token})
+
+    assert after.status_code == 401
+
+
+def test_an_operator_run_server_still_opens_by_experience(deps, experience_id):
+    """No grant store means no launch ever happened; the old contract stands."""
+    with _client(deps) as client:
+        opened = client.post("/api/session", headers=auth(), json={"experience_id": experience_id})
+
+    assert opened.status_code == 201

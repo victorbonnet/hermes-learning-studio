@@ -26,13 +26,19 @@ from typing import Any
 
 from . import service
 from .config import ConfigError
+from .consent import ConsentRequired
 from .identity import IdentityError, resolve_principal
 from .paths import PathResolutionError
+from .runtime.errors import RuntimeUnavailable
 from .schemas import (
     GET_TOOL_NAME,
     IMPORT_ASSET_TOOL_NAME,
+    LAUNCH_TOOL_NAME,
     PREPARE_TOOL_NAME,
+    RESULTS_TOOL_NAME,
     SAVE_TOOL_NAME,
+    STATUS_TOOL_NAME,
+    STOP_TOOL_NAME,
     TOOL_SCHEMAS,
 )
 from .validation import SchemaViolation, validate
@@ -85,6 +91,13 @@ def _run(tool_name: str, raw: Any, call) -> str:
         return _error(str(exc))
     except service.NotFoundError as exc:
         return _error(str(exc))
+    except ConsentRequired as exc:
+        # A refusal on policy grounds, not a failure. The message says what to
+        # ask the learner; the reason is for logs.
+        return _error(exc.message, refused=exc.reason)
+    except RuntimeUnavailable as exc:
+        # Already written to be shown: no path, port, process, or command in it.
+        return _error(exc.message, refused=exc.reason)
     except service.ServiceError as exc:
         return _error(str(exc))
     except (ConfigError, PathResolutionError) as exc:
@@ -92,7 +105,13 @@ def _run(tool_name: str, raw: Any, call) -> str:
         # without naming a path, a profile, or another learner.
         return _error(str(exc))
     except Exception as exc:
-        logger.exception("%s failed: %s", tool_name, exc)
+        # The **class name**, not `str(exc)`. An unexpected exception here can
+        # be carrying anything the code below it was handling — a learner's
+        # answer, a storage path, a request URL with a bot token in it — and
+        # this line is the one place all of them converge. The traceback still
+        # goes to the log, because a tool that fails silently is worse; what
+        # does not go is a message chosen by whatever raised.
+        logger.exception("%s failed: %s", tool_name, type(exc).__name__)
         return _error(_INTERNAL_ERROR)
 
 
@@ -173,3 +192,89 @@ HANDLERS = {
     PREPARE_TOOL_NAME: handle_prepare,
     IMPORT_ASSET_TOOL_NAME: handle_import_asset,
 }
+
+
+# ── The on-demand runtime ─────────────────────────────────────────────────
+#
+# Four handlers over the same `_run` path as the rest: arguments validated
+# against the advertised schema, identity resolved from the host, and every
+# failure turned into a stated, actionable, leak-free message.
+#
+# Two error types are added to that path rather than handled here, so that a
+# refusal travels the same route as every other one and cannot acquire a
+# different shape: `RuntimeUnavailable` (the machine cannot do this) and
+# `ConsentRequired` (it could, but not without asking first).
+
+
+def handle_launch(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_launch``.
+
+    Note what is not passed through, because it is the whole security story of
+    this tool: no destination, no address, no process, no timeout. The
+    experience is named by an opaque id whose ownership is checked in SQL, and
+    everything else is derived from the host or the operator's configuration.
+    """
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        from . import launch
+
+        return launch.launch_experience(
+            principal=principal,
+            experience_id=args["experience_id"],
+            initiation=args["initiation"],
+            learner_quote=args["learner_quote"],
+            learner_confirmed=bool(args.get("learner_confirmed", False)),
+        )
+
+    return _run(LAUNCH_TOOL_NAME, params, call)
+
+
+def handle_status(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_status``."""
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        from .runtime import manager
+
+        del principal, args
+        return manager.status()
+
+    return _run(STATUS_TOOL_NAME, params, call)
+
+
+def handle_results(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_results``."""
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        from . import launch
+
+        return launch.launch_results(principal=principal, experience_id=args["experience_id"])
+
+    return _run(RESULTS_TOOL_NAME, params, call)
+
+
+def handle_stop(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_stop``.
+
+    Identity is still resolved first, even though stopping is per-profile and
+    takes no learner argument. A caller Hermes cannot identify is one this
+    plugin does nothing for, and making that uniform is worth more than the one
+    call it saves.
+    """
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        from .runtime import manager
+
+        del principal, args
+        return manager.stop()
+
+    return _run(STOP_TOOL_NAME, params, call)
+
+
+HANDLERS.update(
+    {
+        LAUNCH_TOOL_NAME: handle_launch,
+        STATUS_TOOL_NAME: handle_status,
+        RESULTS_TOOL_NAME: handle_results,
+        STOP_TOOL_NAME: handle_stop,
+    }
+)

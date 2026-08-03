@@ -34,6 +34,12 @@ from ..sessions import SessionStore
 #: Where Hermes already keeps the bot token. Read on demand, never copied into
 #: configuration, a database row, a response, a log line, or a process
 #: argument; the only thing it is ever used for is deriving the HMAC key.
+#:
+#: Read from ``os.environ`` here, and that is correct *in this process*: this
+#: module runs inside the runtime child, whose entire environment the
+#: supervisor built from the active profile's secret scope before spawning it.
+#: The profile-scoped resolution happens in the parent — see
+#: :mod:`learning_studio.secrets` — because that is where Hermes is.
 BOT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 
 #: Per-process key for pseudonymising user IDs in logs. Random per start, held
@@ -100,6 +106,20 @@ class Dependencies:
     #: aliases as though they were canonical — quietly, and only discovered by
     #: whatever tried to grade them later.
     component_aliases: Callable[..., Any] = field(default=lambda *_: _unwired("component_aliases"))
+    #: The launch grants this runtime honours, or ``None``.
+    #:
+    #: ``None`` means "this server was not started by a launch", which is the
+    #: case for an operator running the API themselves: authentication,
+    #: authorisation and session scoping are unchanged and are what protect it.
+    #: A runtime this plugin launched always has a store here, and then opening
+    #: a session additionally requires an unexpired grant for that Telegram
+    #: account and that exercise — so the tunnel address behind a button is not
+    #: on its own enough to open anything.
+    #:
+    #: There is deliberately no configuration that clears this on a launched
+    #: runtime. The field is set by the process that starts one, in code, and a
+    #: setting able to unset it would be a switch for turning the check off.
+    grants: Any = None
 
     def now(self) -> float:
         return float(self.clock())
@@ -124,11 +144,22 @@ def build_dependencies(
     *,
     config: LearningStudioConfig | None = None,
     clock: Callable[[], float] = time.time,
+    profile: Callable[[], str] | None = None,
 ) -> Dependencies:
-    """Wire the real implementations. Used by anything that actually serves."""
+    """Wire the real implementations. Used by anything that actually serves.
+
+    ``profile`` exists for one caller: the on-demand runtime, which runs in its
+    own virtual environment with no Hermes to ask. :func:`..paths.profile_id`
+    resolves the active profile by importing the host, so in that process it
+    would answer ``"default"`` — and every stored row is scoped by the profile
+    name, so a runtime serving the ``family`` profile would find none of its
+    exercises and report them all as missing. The supervisor therefore resolves
+    the name where the host *is* available and hands it over.
+    """
     from .. import service
 
     resolved = config or load_config()
+    profile_name = profile or profile_id
 
     def allowed_users() -> frozenset[str]:
         return effective_allowed_users(
@@ -145,7 +176,7 @@ def build_dependencies(
         ),
         bot_token=bot_token_from_env,
         allowed_users=allowed_users,
-        profile=profile_id,
+        profile=profile_name,
         clock=clock,
         load_experience=lambda principal, experience_id: service.delivery_bundle(
             principal=principal, experience_id=experience_id, config=resolved

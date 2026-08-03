@@ -41,6 +41,11 @@ class RegisteredTool:
     toolset: str
     schema: dict[str, Any]
     handler: Callable[..., Any]
+    #: Hermes calls this to decide whether to offer the tool at all, caches the
+    #: answer, and calls it again later. Recorded so a test can check both that
+    #: the right tools are gated and that the gate itself is cheap and
+    #: side-effect free.
+    check_fn: Callable[..., Any] | None = None
 
 
 class FakePluginContext:
@@ -118,9 +123,11 @@ class FakePluginContext:
                 f"Plugin '{self.plugin_name}' cannot override built-in tool '{name}' "
                 "without an operator opt-in (plugins.entries.<id>.allow_tool_override)."
             )
+        if check_fn is not None and not callable(check_fn):
+            raise TypeError(f"check_fn for tool '{name}' is not callable.")
         if any(tool.name == name for tool in self.tools):
             raise ValueError(f"Tool '{name}' is already registered.")
-        self.tools.append(RegisteredTool(name, toolset, schema, handler))
+        self.tools.append(RegisteredTool(name, toolset, schema, handler, check_fn))
 
     # -- surface this PR must NOT use yet --------------------------------
 

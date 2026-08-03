@@ -33,6 +33,15 @@ def scope(user: str = "1001", experience: str = "exp-1", profile: str = "default
     )
 
 
+def test_capacity_eviction_retires_the_session_object():
+    clock = Clock()
+    store = SessionStore(clock=clock, ttl_seconds=60, max_sessions=1)
+    _, first = store.create(scope(), component_count=1)
+    store.create(scope(experience="exp-2"), component_count=1)
+
+    assert first.expired(clock())
+
+
 @pytest.fixture
 def clock() -> Clock:
     return Clock()
@@ -192,3 +201,52 @@ def test_completion_is_recorded_on_the_session(store: SessionStore, clock: Clock
 
     assert isinstance(session, MiniAppSession)
     assert session.completed
+
+
+# ── Authenticated activity, which is what the runtime's idle timer reads ──
+
+
+def test_a_new_store_reports_no_activity(clock):
+    store = SessionStore(ttl_seconds=100, max_sessions=10, clock=clock)
+
+    assert store.last_activity_at is None
+
+
+def test_activity_is_recorded_against_the_store_clock(clock):
+    store = SessionStore(ttl_seconds=100, max_sessions=10, clock=clock)
+    clock.advance(50)
+
+    store.note_activity()
+
+    assert store.last_activity_at == clock.now
+
+
+def test_activity_outlives_the_session_that_produced_it(clock):
+    """A learner working for an hour holds several sessions in succession.
+
+    The idle timer must read that as continuous use, so the timestamp lives on
+    the store rather than on any one session.
+    """
+    store = SessionStore(ttl_seconds=10, max_sessions=10, clock=clock)
+    store.create(scope(), component_count=1)
+    store.note_activity()
+    recorded = store.last_activity_at
+
+    clock.advance(11)
+    store.purge_expired()
+
+    assert len(store) == 0
+    assert store.last_activity_at == recorded
+
+
+def test_creating_a_session_does_not_by_itself_count_as_activity(clock):
+    """The API records activity explicitly, at the two authenticated points.
+
+    Making creation implicitly count would mean a store used by something other
+    than the API silently drove a runtime's idle timer.
+    """
+    store = SessionStore(ttl_seconds=100, max_sessions=10, clock=clock)
+
+    store.create(scope(), component_count=1)
+
+    assert store.last_activity_at is None

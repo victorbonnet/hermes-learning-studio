@@ -112,12 +112,41 @@ def test_entry_point_registers_the_expected_qualified_name(
     assert ctx.qualified_skill_names == ["learning-studio:adaptive-learning"]
 
 
+@pytest.fixture
+def forgotten_optional_dependencies():
+    """Make the optional packages look unimported, then put them back.
+
+    Clearing them is what gives the assertion below any force: with FastAPI
+    already in ``sys.modules`` from another test, "registration did not import
+    FastAPI" is unfalsifiable.
+
+    Restoring them is not tidiness. Leaving the module table short of
+    ``fastapi`` and ``starlette`` means the next test that imports either gets
+    a *second* copy of ``starlette.requests.Request`` — and any module already
+    holding the first no longer satisfies FastAPI's ``issubclass`` check
+    against it. The symptom is a route whose ``Request`` parameter is suddenly
+    treated as a request body, several files away, in a test that has nothing
+    to do with entry points.
+    """
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.split(".", 1)[0] in OPTIONAL_DEPS
+    }
+    for name in saved:
+        del sys.modules[name]
+    try:
+        yield
+    finally:
+        for name in [n for n in sys.modules if n.split(".", 1)[0] in OPTIONAL_DEPS]:
+            del sys.modules[name]
+        sys.modules.update(saved)
+
+
 def test_entry_point_path_imports_no_optional_dependencies(
     declared_entry_point: EntryPoint,
+    forgotten_optional_dependencies,
 ):
-    for name in [n for n in sys.modules if n.split(".", 1)[0] in OPTIONAL_DEPS]:
-        del sys.modules[name]
-
     _, register_fn = hermes_load(declared_entry_point)
     register_fn(FakePluginContext(plugin_name=PLUGIN_NAME))
 

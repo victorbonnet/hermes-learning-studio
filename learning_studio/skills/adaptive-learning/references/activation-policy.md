@@ -51,16 +51,65 @@ cost of hijacking someone's attention.
 - **Revocation.** "Stop", "later", "not now", or a change of subject ends it
   immediately. Do not re-offer in the same breath.
 
+## Telling the launch tool which of the two happened
+
+`learning_studio_launch` asks you to say which rule applies, because it cannot
+work it out and neither can anything else after the fact.
+
+- **Rule 1** — `initiation: "learner_request"`, plus `learner_quote`.
+- **Rule 2** — `initiation: "agent_suggestion"`, plus `learner_confirmed: true`
+  and `learner_quote`.
+
+**Both need the quotation, and the quotation is checked.** The Studio holds the
+message the platform delivered for the turn you are answering, and looks for
+your words inside it. So:
+
+- copy, do not paraphrase — a summary will not be found;
+- quote the message you are *replying to*, not an earlier one;
+- a turn with no incoming learner message — a scheduled job, a background task
+  — cannot launch at all, and will say so.
+
+Three things follow, and all are enforced rather than advised:
+
+- **One message, one launch.** If the exercise expired unopened, that same
+  message does not open a second one. Ask again, and quote their new reply.
+  This is what stops a retry loop from repeatedly opening a public address on
+  somebody's behalf.
+- **A spent message stays spent.** Waiting does not make it usable again.
+- **Concurrency is arbitrated.** Two launches racing on one message do not both
+  succeed — the claim is taken before anything is created, so the second is
+  refused rather than delivering a second button.
+- **A failed send does not always free the message.** If the failure proves
+  nothing was sent, the same words may be used again. If it cannot — a
+  connection that dropped mid-request — a button may already be in their chat,
+  so the words stay spent and you must ask again. The refusal says
+  `confirmation_already_used`; treat it as "go back and ask", never as a reason
+  to retry.
+
+What this does *not* establish is what the learner meant. You are the one
+reading "go on then" as agreement, and the response says so in those terms — it
+reports that your quotation was found in their current message, not that the
+learner agreed. Do not repeat it back to them as though the Studio had
+confirmed their intent.
+
 ## Launching honestly
 
 Whatever the policy says, the mechanics are the same:
 
 - Check that the tool is actually in your tool list before routing to it.
 - If it is not, run the exercise in chat and say that is what you are doing.
-- Never claim that an exercise or a Mini App was launched, opened, or is
-  running without a real tool result saying so.
-- If a launch fails, say it failed. Do not fall back silently and let the
-  learner believe they are in the app.
+- **Never claim that an exercise was launched, opened, or is running unless the
+  result says `button_delivered`.** Preparing is not opening; a refusal is not a
+  launch; and "it should be there" is not a tool result.
+- If a launch fails, say it failed and continue in conversation. Do not fall
+  back silently and let the learner believe they are in the app, and do not tell
+  them to tap a button that was never sent.
+- A repeat launch of the same exercise reports the one already open and sends
+  nothing new. If the learner says the button is not there, that is a
+  conversation to have — not a reason to keep calling launch.
+- **Do not narrate the runtime.** The learner does not need to know about
+  servers, addresses, tunnels, or timeouts. "It's open — tap the button" and
+  "let's do this here instead" are the two things worth saying.
 
 ## Never launch when
 

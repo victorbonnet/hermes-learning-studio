@@ -36,7 +36,7 @@ def strings_in(value) -> list[str]:
 # ── Registration ──────────────────────────────────────────────────────────
 
 
-def test_exactly_four_tools_are_registered(ctx):
+def test_exactly_eight_tools_are_registered(ctx):
     from learning_studio import register
 
     register(ctx)
@@ -44,8 +44,12 @@ def test_exactly_four_tools_are_registered(ctx):
     assert sorted(tool.name for tool in ctx.tools) == [
         "learning_studio_get_context",
         "learning_studio_import_asset",
+        "learning_studio_launch",
         "learning_studio_prepare",
+        "learning_studio_results",
         "learning_studio_save_context",
+        "learning_studio_status",
+        "learning_studio_stop",
     ]
 
 
@@ -153,7 +157,7 @@ def test_the_response_summarises_the_experience_for_the_learner(hermes_home, gat
 def test_the_response_says_nothing_was_launched(hermes_home, gateway_session):
     result = call(manifest=manifest())
 
-    assert "no exercise has been launched" in result["delivery"].lower()
+    assert "nothing has been launched" in result["delivery"].lower()
 
 
 def test_the_response_disclaims_memory_writes(hermes_home, gateway_session):

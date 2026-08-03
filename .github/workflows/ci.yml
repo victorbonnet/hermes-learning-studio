@@ -42,9 +42,11 @@ jobs:
         with:
           node-version: "22"
 
-      # Also the acceptance check that a fresh clone can install dev deps.
-      - name: Install the project and dev dependencies
-        run: uv sync --python ${{ matrix.python-version }} --extra dev
+      # Every extra the complete suite needs. `dev` alone left FastAPI and
+      # Uvicorn out on some paths, so the tests that start a real runtime
+      # skipped -- and a green run said nothing about the launch path at all.
+      - name: Install the project and every test dependency
+        run: uv sync --python ${{ matrix.python-version }} --extra dev --extra web --extra media
 
       - name: Check formatting
         run: uv run ruff format --check .
@@ -54,3 +56,12 @@ jobs:
 
       - name: Run tests
         run: uv run pytest
+
+      # A skip in this set means a dependency or a test-order problem hid the
+      # launch path, which is exactly what a green CI run must not be able to
+      # do. Reported by name, and failed on.
+      - name: Prove the runtime launch path actually ran
+        run: uv run python tools/check_no_runtime_skips.py
+
+      - name: Run the frontend suite
+        run: uv run python tools/run_frontend_tests.py

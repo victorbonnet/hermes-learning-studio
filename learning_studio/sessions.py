@@ -129,9 +129,31 @@ class SessionStore:
         self._max = int(max_sessions)
         self._clock = clock
         self._sessions: dict[str, MiniAppSession] = {}
+        self._last_activity: float | None = None
 
     def __len__(self) -> int:
         return len(self._sessions)
+
+    @property
+    def last_activity_at(self) -> float | None:
+        """When an authenticated learner was last served, or ``None``.
+
+        Recorded on the store rather than on a session because it outlives
+        every individual one. A learner who works for an hour holds several
+        sessions in succession, and the runtime's idle timer must see that as
+        continuous use rather than as a series of sessions that each went quiet.
+
+        Deliberately *not* updated by unauthenticated traffic. Once the runtime
+        is reachable through a public tunnel, anything on the internet can
+        knock on the door; treating a scanner as a learner would keep a public
+        entrance to somebody's learning record open for as long as the scanning
+        continued.
+        """
+        return self._last_activity
+
+    def note_activity(self) -> None:
+        """Record that an authenticated learner request was just served."""
+        self._last_activity = float(self._clock())
 
     def create(
         self, scope: SessionScope, *, component_count: int, auth_date: int = 0
@@ -176,6 +198,7 @@ class SessionStore:
             # Drop it here as well as in the sweep: an expired session must not
             # survive being asked for.
             self._sessions.pop(_digest(token), None)
+            session.expires_at = 0.0
             raise SessionError("session_expired")
         if session.scope.profile != profile:
             raise SessionError("session_wrong_profile")
@@ -192,7 +215,8 @@ class SessionStore:
         now = float(self._clock())
         stale = [digest for digest, s in self._sessions.items() if s.expired(now)]
         for digest in stale:
-            del self._sessions[digest]
+            session = self._sessions.pop(digest)
+            session.expires_at = 0.0
         return len(stale)
 
     def _enforce_capacity(self) -> None:
@@ -205,7 +229,10 @@ class SessionStore:
         """
         while len(self._sessions) >= self._max:
             oldest = min(self._sessions, key=lambda d: self._sessions[d].expires_at)
-            del self._sessions[oldest]
+            session = self._sessions.pop(oldest)
+            # GrantStore holds the object, not its token.  Retiring in place
+            # keeps both stores' view of liveness identical after eviction.
+            session.expires_at = 0.0
 
 
 def _digest(token: str) -> str:

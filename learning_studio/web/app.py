@@ -302,6 +302,13 @@ def create_app(dependencies: Dependencies | None = None):
                 headers={"Retry-After": str(exc.retry_after)},
             ) from exc
 
+        # The runtime's idle timer is driven from exactly here, and from the
+        # bootstrap below. By this point the request has produced a verified
+        # Telegram signature, an account on the allowlist, and a session token
+        # minted for that account — so "somebody is studying" is a fact rather
+        # than an inference from traffic arriving at a public URL.
+        deps.sessions.note_activity()
+
         log_request(
             level=logging.DEBUG,
             event="session_request",
@@ -404,23 +411,73 @@ def create_app(dependencies: Dependencies | None = None):
         verified, user_ref = authenticate(request, bootstrap=True)
         payload = await json_body(request)
 
-        experience_id = payload.get("experience_id")
-        if not isinstance(experience_id, str) or not experience_id.strip():
-            raise ApiError(400, BAD_REQUEST, reason="experience_id_missing")
-
-        bundle = load_bundle(verified, experience_id.strip())
-        experience = bundle.experience
-        token, session = deps.sessions.create(
-            SessionScope(
-                profile=deps.profile(),
+        # Which exercise, and on whose authority.
+        #
+        # On a runtime this plugin launched there is a grant store, and the
+        # only acceptable answer is a *launch id*: an opaque selector the
+        # button carried in its URL fragment. The experience is then derived
+        # from the grant, so a client cannot name an exercise of its own — not
+        # even one it owns, because owning an exercise is not the same as
+        # having been invited to open it.
+        #
+        # Without a grant store this is an operator-run server, where no launch
+        # ever happened and the experience id is the selector it has always
+        # been. Authentication, the allowlist, and the SQL ownership check are
+        # what protect that path, exactly as before.
+        grant = None
+        if deps.grants is not None:
+            grant = deps.grants.admit(
+                launch_id=payload.get("launch_id") or "",
                 telegram_user_id=verified.user_id,
-                learner_id=bundle.learner_id,
-                experience_id=str(experience["experience_id"]),
-                track_id=experience.get("track_id"),
-            ),
-            component_count=len(experience["components"]),
-            auth_date=verified.auth_date,
-        )
+            )
+            if grant is None:
+                # The same 404 an experience belonging to somebody else
+                # produces, so a caller cannot tell a revoked launch, an
+                # expired one, another account's, or one that never existed.
+                raise ApiError(404, NOT_FOUND, reason="no_launch_grant")
+            experience_id = grant.experience_id
+        else:
+            experience_id = payload.get("experience_id")
+            if not isinstance(experience_id, str) or not experience_id.strip():
+                raise ApiError(400, BAD_REQUEST, reason="experience_id_missing")
+            experience_id = experience_id.strip()
+
+        bundle = load_bundle(verified, experience_id)
+        experience = bundle.experience
+
+        if grant is not None and bundle.learner_id != grant.learner_id:
+            # The grant was issued to a learner; the ownership check resolved a
+            # learner. They are derived independently and must agree.
+            raise ApiError(404, NOT_FOUND, reason="grant_learner_mismatch")
+
+        def mint():
+            return deps.sessions.create(
+                SessionScope(
+                    profile=deps.profile(),
+                    telegram_user_id=verified.user_id,
+                    learner_id=bundle.learner_id,
+                    experience_id=str(experience["experience_id"]),
+                    track_id=experience.get("track_id"),
+                ),
+                component_count=len(experience["components"]),
+                auth_date=verified.auth_date,
+            )
+
+        if grant is not None:
+            # Minted under the grant's lock, so two simultaneous opens cannot
+            # both produce a live token — and a reload resumes where the
+            # learner was instead of starting again.
+            admitted = deps.grants.admit_session(grant, mint)
+            if admitted is None:
+                # Revoked, expired, or superseded while this request was doing
+                # its ownership check. Indistinguishable from every other way a
+                # launch can fail to admit somebody, deliberately.
+                raise ApiError(404, NOT_FOUND, reason="no_launch_grant")
+            token, session = admitted
+        else:
+            token, session = mint()
+
+        deps.sessions.note_activity()
         log_request(
             event="session_opened",
             route="/api/session",

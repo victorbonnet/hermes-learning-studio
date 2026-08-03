@@ -5,24 +5,25 @@ learning: structured study sessions built on active recall and spaced
 repetition.
 
 > **Status: early development.** This is not the feature-complete public
-> release. What exists today is a bundled skill plus four tools: two that
+> release. What exists today is a bundled skill plus eight tools: two that
 > remember a learner's **context** — their goals, level, preferences, and
-> confirmed learning tracks — and one that validates and stores the
-> **exercises** an agent designs, plus a secure managed-image importer, all in
-> profile-scoped storage.
+> confirmed learning tracks — one that validates and stores the **exercises** an
+> agent designs, a secure managed-image importer, and four that **open** a
+> stored exercise on the learner's screen and close it again. All storage is
+> profile-scoped.
 >
-> There is now a **secure API** behind the optional `web` extra: a
-> Telegram-authenticated FastAPI service that serves a stored exercise to its
-> owner and collects their responses, plus the **Telegram Mini App** that renders
-> it — all thirty-one component types, keyboard-operable, in three interface
-> languages. See [Telegram Mini App API](#telegram-mini-app-api) and
-> [The Mini App interface](#the-mini-app-interface).
+> The exercise itself is a **Telegram Mini App** served by a
+> Telegram-authenticated FastAPI service — all thirty-one component types,
+> keyboard-operable, in three interface languages — behind the optional `web`
+> extra. `learning_studio_launch` starts that service on loopback, exposes it
+> through a temporary Cloudflare Quick Tunnel, and sends the learner a Web App
+> button in their private chat. See
+> [Opening an exercise](#opening-an-exercise).
 >
-> What is still missing is the **runtime around it**: no scoring engine, no
-> scheduler, and nothing that starts a server or opens a tunnel, so nothing
-> launches the Mini App yet. Responses collected by the API live in the session
-> and are not marked or persisted. See [Roadmap](#roadmap) for what is still to
-> come.
+> What is still missing: **nothing is marked and nothing is kept.** There is no
+> scoring engine, no durable attempt or score storage, no progress history and
+> no scheduler. Responses live in the learner's session and are gone when it
+> ends. See [Roadmap](#roadmap) for what is still to come.
 
 ## Install
 
@@ -345,6 +346,48 @@ learning_studio:
   # additional restriction. It can never add a user the profile excludes.
   mini_app_allowed_telegram_users: []
 
+  # ── The on-demand runtime ────────────────────────────────────────────
+  # Everything the launch path is allowed to decide is here, which is the
+  # point of it being here: no tool payload carries any of these.
+
+  # The interface the local server binds. A loopback IP literal, validated
+  # as one — a hostname is refused, because what it resolves to is decided
+  # by a resolver this plugin does not control.
+  runtime_host: 127.0.0.1
+
+  # Fixed listen port, or 0 to let the operating system choose. Zero is the
+  # better answer: a pinned port is a stable target on loopback for every
+  # other process on the machine. Below 1024 is refused outright.
+  runtime_port: 0
+
+  # How long the server has to come up and answer its control probe (5–600).
+  runtime_readiness_timeout_seconds: 60
+
+  # How long the runtime may sit without AUTHENTICATED LEARNER activity
+  # before it shuts itself down (60–86400). Public traffic does not count.
+  runtime_idle_timeout_seconds: 1800
+
+  # The absolute ceiling on one runtime's life, busy or not (300–86400).
+  # Must not be less than the idle timeout.
+  runtime_max_lifetime_seconds: 7200
+
+  # How long a stop waits after asking politely, before escalating (1–120).
+  runtime_graceful_stop_seconds: 10
+
+  # How long the tunnel has to publish a usable address (5–600).
+  tunnel_readiness_timeout_seconds: 60
+
+  # Absolute path to the operator's cloudflared. Empty means "find it on
+  # PATH". This plugin never downloads it and never installs it. A relative
+  # path is refused: it would resolve against a working directory nobody
+  # chose.
+  cloudflared_path: ""
+
+  # Caption on the Telegram Web App button. Localise or brand it here —
+  # "Open Aula Lola" is a perfectly good value for one profile, which is
+  # exactly why it is not the default.
+  launch_button_label: Open Learning Studio
+
   # Context values that apply to everyone on this profile.
   profile_context:
     explanation_language: English
@@ -365,6 +408,10 @@ and a misspelled
 `allow_durable_accessibility_needs` that silently degraded to "off" would look
 exactly like the setting working.
 
+The runtime settings are also the answer to "what can the model change?" —
+nothing. No tool payload carries a host, port, URL, executable, command,
+process id, timeout, environment variable, chat, account, or profile.
+
 ### Storage
 
 The database lives at:
@@ -381,11 +428,29 @@ shared between them.
 Validated images are copied to the sibling `assets/` directory with opaque
 filenames and owner-only permissions. Original source paths are never stored.
 
+The runtime keeps its state in a sibling `runtime/` directory, owner-only:
+
+| File | What it is |
+| --- | --- |
+| `runtime/venv/` | The plugin-local environment `tools/bootstrap_runtime.py` builds |
+| `runtime/venv.stamp` | What that environment was built for, so a rebuild is honest |
+| `runtime/runtime.json` | The current runtime record. `0600`, written by atomic replace, and it holds the control secret |
+| `runtime/runtime.lock` | An advisory lock held only across a start, stop, or reuse decision |
+
+Nothing about a learner is written there — no session, no grant, no response,
+no address. Those live in the runtime process and end with it.
+
 ## Tools
 
-Four tools, all in the `plugin_learning_studio` toolset. None takes a learner
+Eight tools, all in the `plugin_learning_studio` toolset. None takes a learner
 argument: identity is resolved from the Hermes session, so a call always reads
 and writes the record of whoever sent the current message.
+
+The four runtime tools take even less. Between them their payloads carry one
+opaque experience id, one enumerated word, one boolean and one quotation —
+there is no property anywhere for a host, port, URL, executable, command,
+process id, timeout, environment variable, chat, account, or profile. Those
+come from the operator's `config.yaml` and from Hermes' own session context.
 
 ### `learning_studio_get_context`
 
@@ -441,6 +506,480 @@ prompt. Visual manifest components accept only an asset owned by the current
 learner in the experience's exact track scope, with the same alternative text
 recorded at import. The tool does not generate images, serve files over HTTP,
 or open a UI.
+
+### `learning_studio_launch`
+
+Opens a prepared exercise on the learner's screen. Takes an opaque
+`experience_id`, an `initiation` of `learner_request` or `agent_suggestion`, a
+`learner_quote` copied from the learner's current message, and — for a
+suggestion — `learner_confirmed`. Nothing else. The quotation is checked
+against the message the platform actually delivered. See
+[Opening an exercise](#opening-an-exercise) for the whole sequence and
+[Consent to launch](#consent-to-launch) for the policy.
+
+### `learning_studio_status`
+
+Takes no arguments and reports on the current profile's own runtime: whether
+one is open, and whether this machine can open one at all — the two
+prerequisites an operator sets up once. It reports no address, no port, no
+process, and nothing about anyone's performance.
+
+### `learning_studio_results`
+
+Takes an `experience_id` and reports whether the learner opened it, which
+component they reached, how many they answered, and whether they finished.
+**That is the whole of what exists.** There is no score, no mark, no mastery
+estimate, no durable attempt and no review schedule, and the response says so
+rather than omitting the fields and letting a reader assume. It does not return
+the learner's answers.
+
+The answer is explicitly **tri-state**. `availability` is `known` only when a
+runtime actually told it something; otherwise `opened` is `null`, not `false`.
+That distinction matters: `false` is a finding — the learner did not open it —
+and it is only reported when something observed that. With no runtime, or an
+unreachable one, or one with no record of the launch, the honest answer is that
+the evidence is gone, and an agent reading `false` there would tell somebody
+they had ignored an exercise nobody can show they ever saw.
+
+### `learning_studio_stop`
+
+Takes no arguments and closes this profile's runtime and its public address.
+Idempotent, and it can stop nothing but its own profile's runtime. The runtime
+also stops itself — see [Lifetime](#lifetime) — so this is for finishing early.
+
+## Opening an exercise
+
+`learning_studio_prepare` stores an exercise; `learning_studio_launch` puts it
+in front of somebody. Nine steps, one commit point.
+
+1. **Who is asking**, from Hermes' session context — never from an argument.
+2. **Which exercise**, by opaque id, checked in SQL against that learner. A
+   missing exercise and somebody else's are the same refusal.
+3. **May this happen without asking?** — see
+   [Consent to launch](#consent-to-launch).
+4. **Where would the message go?** — derived from the authenticated private
+   chat and the profile's own Telegram allowlist. Resolved *before* anything
+   starts, so a launch that could never be delivered does not start a server
+   first.
+5. **A runtime**, started or reused, under a per-profile lock.
+6. **A public address** from the Quick Tunnel, validated on the way in.
+7. **A grant**: expiring, and bound to profile, runtime generation, Telegram
+   account, learner and experience.
+8. **The button**, sent to that one private chat.
+9. **Commit.** Everything before this is undone if anything after it fails.
+
+### Prerequisites
+
+Two things an operator does once, per profile.
+
+**Prepare the runtime environment.** The Mini App needs FastAPI and Uvicorn.
+Hermes' own environment is not this plugin's to change, so they go into a
+virtual environment under the profile's Learning Studio storage:
+
+```bash
+uv run python tools/bootstrap_runtime.py
+```
+
+Repeatable: an environment that already matches the pinned requirements is
+reported as current and rebuilt only with `--force`. `--remove` deletes it. It
+installs no operating-system package, asks for no privilege, and touches
+nothing outside the profile's own storage.
+
+**Install `cloudflared`.** The tunnel program is a prerequisite, not a
+download: this plugin will never fetch and execute a binary on somebody's
+machine. Install it however you install software — `brew install cloudflared`,
+your distribution's package, or Cloudflare's own release — and if it is not on
+`PATH`, name it in `config.yaml`:
+
+```yaml
+learning_studio:
+  cloudflared_path: /opt/homebrew/bin/cloudflared
+```
+
+`learning_studio_status` reports which of the two is missing, so the agent can
+say "somebody needs to finish setting this up" rather than leaving the learner
+wondering.
+
+### Consent to launch
+
+Opening an exercise creates a temporary public address and sends somebody a
+message, so the authority to do it comes from two places, not one.
+
+**The words come from the platform.** The plugin registers Hermes'
+`pre_gateway_dispatch` hook, which fires with the real incoming `MessageEvent`
+before the agent runs, and records it keyed by exactly which message it was.
+`learning_studio_launch` then requires `learner_quote` to appear in *that*
+message — the one the current turn is answering. So an exercise cannot be
+opened on words nobody wrote.
+
+**The meaning comes from the model.** Whether "go on then" is agreement is a
+judgement, and the agent is the right thing to make it. `initiation` says which
+of the two rules applies:
+
+- **`learner_request`** — they asked to practise, revise, be quizzed, or open
+  the exercise. That request *is* the agreement; a second ask is friction.
+- **`agent_suggestion`** — the agent proposed it. Additionally requires
+  `learner_confirmed: true`.
+
+Both require a quotation, of **at least four non-whitespace characters after
+normalisation**. The schema encodes that rule, and the conditional confirmation
+requirement, so a provider that validates before dispatch refuses the same
+payloads the handler would — length alone was not the rule, and `"    "` used
+to satisfy the schema and then be rejected as unusable.
+
+**One message opens one exercise once.** A repeat call reports the launch that
+is already open and sends no second button. A *new* launch on a message that
+has already been spent is refused, and a spent message stays spent — expiry
+leaves a tombstone that outlives the evidence, so "stale" is a terminal state
+rather than a step back to "new".
+
+The claim is taken **before** anything is created, not after the button is
+sent. Two calls racing on one sentence used to both validate it, both create a
+grant, and both deliver a button; the loser of the eventual spend was discarded
+in silence, and the learner had two messages. Now the first call to claim the
+message is the only one that proceeds, and the second is refused with
+`confirmation_already_used`.
+
+**A failed launch hands the message back only when it can prove nothing was
+sent.** No bot token, a malformed selector, a tunnel address that did not
+validate, a request Telegram received and declined — all of those mean no
+message exists, so the same words may authorise another attempt. A connection
+that dropped mid-request proves nothing: a button may be sitting in the
+learner's chat, and a retry would put a second one beside it. There the claim
+is kept and the agent has to go back and ask. The same rule covers an
+interruption after delivery but before the commit finishes — the claim stays
+held, which is what stops a retry from launching again.
+
+What this does not do is read minds. It establishes that a specific person
+wrote specific words in the turn being answered; whether they meant "open an
+exercise" is the agent's reading, and the response says so in those terms
+rather than reporting "the learner agreed" as a finding.
+
+**Only messages that could authorise a launch are kept.** A launch goes to an
+allowlisted Telegram direct message and nowhere else, so that is exactly what
+the capture hook records. It used to record everything the gateway saw — every
+platform, every group, everybody — and the store is small and bounded on
+purpose, so each of those evicted something that mattered: a learner's "yes" in
+their own conversation could be pushed out by strangers talking in a room they
+are not in. An unreadable chat type is refused rather than assumed private, and
+an allowlist that cannot be computed authorises nobody.
+
+**A consumed message stays consumed after its tombstone is gone.** Tombstones
+name one message each and the table holding them is bounded, so enough traffic
+evicts the oldest — and a redelivery of that Telegram update then looked like a
+message nobody had used. Alongside them the store keeps one integer per
+conversation: the highest message id it has ever spent. Telegram numbers
+messages upwards, so that one integer answers for every message below it, and
+it does not evict under the traffic that evicts tombstones. A platform whose
+ids are not ordered has no such inference made about it and relies on the
+tombstones alone.
+
+**Privacy.** The learner's message text is held in memory, in the process that
+already had it, for a short bounded window, and is never written to disk,
+returned, or logged. Only the current message is kept; there is no history.
+
+### Where a launch can happen
+
+A Telegram **direct message**, and nowhere else. Hermes normalises Telegram's
+`private` chat type to its own canonical `dm`, so that is the value the plugin
+accepts (along with `private` and `sender`, which are unambiguous). `group`,
+`forum`, `channel` and anything unrecognised are refused: an exercise is one
+person's, and a button in a room is an invitation to whoever is in the room.
+
+The destination is derived from the session — never from a tool argument — and
+the chat id must equal the sender's user id, which is an independent check that
+holds even where `chat_type` is absent.
+
+### Credentials belong to the profile, not the process
+
+Hermes can multiplex several profiles through one process, and there the bot
+token and Telegram allowlists in `os.environ` may belong to a *different*
+profile than the turn being served. Both are resolved through Hermes'
+`agent.secret_scope.get_secret`, at the parent boundary, before the runtime
+child is spawned — so a launch for one profile is never delivered by another's
+bot. The host's own single-profile fallback is preserved; an unscoped read
+under multiplexing is treated as an absent credential and refuses.
+
+### The button is not a credential
+
+The button's URL is the validated tunnel origin plus `#launch=<launch id>`.
+
+The selector is in the **fragment** because browsers never send a fragment to
+the server: it is absent from the request line, from access logs, and from
+`Referer`, and the page removes it from history as soon as it has read it. It
+carries no session token, no experience id, and no query string.
+
+**It is a selector, not a capability.** Presenting it says only *which* launch
+is meant. Opening still requires all of: verified `initData`, an account on the
+effective allowlist, ownership of the exercise in SQL, and a grant that is
+activated, unexpired, unrevoked, issued to that same account, and from this
+runtime generation. Somebody who copies the whole URL out of a screenshot opens
+nothing.
+
+On a launched runtime the client may **not** name an exercise of its own. The
+server derives it from the grant, because owning an exercise is not the same as
+having been invited to open it. An operator running the API themselves has no
+grant store and keeps the contract they had; there is no setting that removes
+one from a runtime this plugin launched.
+
+### One launch, one live session
+
+A grant has at most one live session. Re-admission — a webview reload, a retry —
+carries the learner's position, answers and reveals onto a new token and expires
+the old one, so a reload resumes rather than restarts and there is never a
+second token that still works. Revoking a launch expires every session it ever
+minted, not just the newest.
+
+### What a launch actually does, step by step
+
+| State | Meaning |
+| --- | --- |
+| `pending` | A grant exists and admits nobody. The selector has to exist before a message can carry it. |
+| delivered | Telegram accepted the message. |
+| `open` | The grant is activated and the learner's message is spent. This is the commit. |
+| `closed` | It was opened, and the session has since run out. Distinct from `expired`, which is a button nobody tapped. |
+| indeterminate | The message went out and the commit did not finish, or a rollback could not be confirmed. |
+
+The last row is the one worth reading twice. If the button was sent and the
+launch could not be committed, `learning_studio_launch` reports that it **does
+not know** whether the exercise is usable — because claiming success would tell
+the learner to tap something that may admit nobody, and claiming failure would
+say nothing was sent while a message sits in their chat. The same applies to a
+rollback that could not be confirmed: "nothing was saved" is a claim, and it is
+not made unless it is true.
+
+### Lifetime
+
+A public entrance to somebody's learning record is not left open.
+
+| Setting | Default | What it bounds |
+| --- | --- | --- |
+| `runtime_idle_timeout_seconds` | 1800 | Time without *authenticated learner* activity |
+| `runtime_max_lifetime_seconds` | 7200 | Absolute life, busy or not |
+
+Both are enforced **inside** the runtime process, because it deliberately
+outlives the Hermes process that started it — a tool call returns in a second
+and a learner works for twenty minutes. Nothing outside it can be relied on to
+stop it, so it stops itself.
+
+Idle is measured from authenticated learner requests only. Traffic arriving at
+a public URL is not evidence that anybody is studying, and treating a scanner
+as a learner would hold the entrance open for as long as the scanning
+continued.
+
+### Process ownership
+
+A process id is not identity: the operating system reuses them. So nothing here
+trusts a saved one.
+
+The plugin generates a secret when it starts a runtime and hands it over in the
+child's environment — never in an argument, where the process table would show
+it. The runtime serves one control endpoint, on loopback, that answers nothing
+without that secret. Ownership is proved by asking it who it is: the runtime
+id, generation, process id and interpreter path must all match the record.
+
+- A process that inherited the pid cannot produce the secret.
+- A runtime that has died cannot answer, and a dead runtime is never signalled.
+- Stopping asks over that authenticated channel first. That is the path that
+  actually stops a runtime, and it needs no signal at all.
+
+**Escalation needs more than a proof.** A userspace check followed by a signal
+to a *number* is a race: the runtime can exit between the two and the operating
+system can hand that number to something else. So a signal is only ever sent
+through a pid file descriptor, which pins the identity. The sequence is pin,
+re-prove against the pinned identity, then signal **through the descriptor**
+with `signal.pidfd_send_signal`.
+
+There is no `killpg` on this path and no pid passed to anything. A process
+group is named by a number, and a number can be reused between a leader exiting
+and a signal arriving; holding a pidfd narrowed that window without closing it,
+because the pidfd was never the thing delivering. What the group kill bought
+was reaching `cloudflared`, which used to share the runtime's group — it has
+its own session now, so the runtime's group holds the runtime and nothing else,
+and signalling it by number bought a race in exchange for nothing.
+
+(`pidfd_open` is in `os`; `pidfd_send_signal` is in `signal`. Probing the wrong
+module is not an error anybody sees — `hasattr` simply answers False for ever,
+and escalation reports the platform unsupported on the one platform that
+supports it. There is a test that asserts where the attribute lives.)
+
+**The cost is stated, not hidden.** A runtime killed *because it is wedged*
+never runs its own teardown, so its tunnel is not closed by anything, and
+`learning_studio_stop` reports `tunnel_indeterminate` rather than `stopped`. A
+`cloudflared` in that state proxies to an origin that is gone, so it serves
+errors rather than anybody's work — but it is a hostname that has not been
+withdrawn, and saying so is better than a cleanup path that signals numbers to
+make the report look tidy.
+
+**Where an identity cannot be pinned, escalation refuses.** `pidfd_open` is
+Linux. On macOS and anything else without it, a wedged runtime is left to the
+deadline it enforces on itself and `learning_studio_stop` reports that it could
+not be confirmed stopped. That is worse than killing it, and much better than
+killing something else.
+- A recorded runtime that cannot be proved is **left alone** and its record
+  cleared. From outside, one that died and one that is wedged are the same
+  observation, and the safe response to both is to touch neither. It stops
+  itself at its own maximum lifetime.
+
+This needs POSIX process groups. On a platform without them the four runtime
+tools are not offered at all, rather than falling back to signalling a pid and
+hoping.
+
+### Tunnel address validation
+
+`cloudflared` prints a hostname and this plugin then sends it to a person, so
+almost nothing it prints is accepted. A candidate must survive, in order:
+
+1. a closed ASCII character set — which defeats homograph and normalisation
+   tricks before any parser sees them;
+2. no percent-encoding;
+3. no userinfo, query, or fragment;
+4. no port;
+5. an anchored whole-string pattern: exactly one label, then
+   `.trycloudflare.com`, then at most a trailing slash;
+6. a second reading by `urlsplit`, whose opinion of the scheme, host, port and
+   userinfo must agree with the pattern's.
+
+Extraction hands the validator a **complete token** — everything from
+`https://` to whitespace or a box-drawing character. That matters more than it
+sounds: an earlier version cut the candidate at the first `@`, `:` or `/`, so
+`https://victim.trycloudflare.com@evil.test` arrived as the harmless-looking
+prefix and the rules above were never asked about the rest of it.
+
+So `https://trycloudflare.com@evil.test`, `https://eviltrycloudflare.com`,
+`https://a.trycloudflare.com.evil.test`, a Cyrillic lookalike and an explicit
+`:443` are each refused by a different rule. Output is bounded in lines and
+bytes, and two *different* valid addresses from one process is a refusal rather
+than a choice.
+
+Two *different* addresses from one process is a refusal, and that is checked
+across lines as well as within one: after the first address the reader keeps
+going for a short bounded window, because a check that returned on the first
+match could only ever have seen one line.
+
+Readiness also requires the tunnel process to still be running. A process that
+printed a hostname and exited has published nothing.
+
+Cloudflared's own output is never relayed to the model or the learner.
+
+### What a Quick Tunnel is, and is not
+
+A Quick Tunnel is a free, unauthenticated, temporary hostname that Cloudflare
+assigns and can withdraw. It needs no Cloudflare account and this plugin
+provisions none. The address is public for as long as the runtime lives:
+anybody who has it can reach the server, and the four gates above are what stop
+them opening anything.
+
+Custom domains and permanent named tunnels are deliberately out of scope.
+
+### When something goes wrong
+
+| Symptom | What it means |
+| --- | --- |
+| The launch tools are not in the tool list | Not a POSIX platform. Process ownership cannot be proved here. |
+| "the runtime has not been prepared" | Run `tools/bootstrap_runtime.py` once for this profile. |
+| "cloudflared is not installed or not where this profile is configured to find it" | Install it, or set `cloudflared_path`. |
+| "not authorised to use the Learning Studio here" | The account is outside the intersection of Hermes' Telegram gates and this plugin's optional narrowing. |
+| A group chat refuses | An exercise is one person's. Offer it in a direct message. |
+| "could not confirm the recorded runtime was its own" | A runtime this plugin cannot verify. It was left alone and stops itself at its maximum lifetime; `learning_studio_status` reports `stale_record`. |
+| The learner says the button does nothing | The runtime or the launch has probably expired. Launch again from a fresh message — the button is not a permanent link. |
+| "could not finish opening the exercise" | The message went out and the launch could not be committed. Its state is genuinely unknown: ask whether a button arrived, and carry on in conversation. Do not relaunch. |
+| "the words you quoted are not in the learner's current message" | The quotation has to be the learner's own words from the message being answered. |
+| "there is no current learner message to launch from" | The turn carries no incoming message — a scheduled job, a background task. Offer the exercise next time they write. |
+| A stop reports it could not confirm | Escalation needs a pinned process identity, which is Linux-only. The runtime stops itself at its own deadline. |
+| "the exercise could not be sent" and the same words are refused afterwards | The send failed in a way that cannot prove nothing arrived. A message may be in the chat, so the claim on that sentence is kept. Ask the learner, and quote their reply. |
+| The runtime exits with status 4 | The server stopped but `cloudflared` could not be confirmed gone, so the public address may still be open. Distinct from exit 0 on purpose: a clean stop and an unconfirmed one are not the same event. |
+| A close reports `tunnel_descendants_indeterminate` | The tunnel leader was signalled, but its process group could not be. Whatever `cloudflared` had started may still be running; the public address itself is closed. |
+| A stop reports `tunnel_indeterminate` | Either the runtime said on its way out that it could not confirm its tunnel closed, or it had to be signalled and so never ran its own teardown. The address may still resolve; it has no origin behind it. |
+
+### The tunnel's lifetime, and its descendants
+
+`cloudflared` is started in **its own session**, so it leads a process group
+containing it and anything it starts. Ending the tunnel signals that group, not
+just the leader: killing only the leader left a wrapper script's children
+running, still holding what the leader held, with nothing left that knew they
+existed.
+
+Signalling a group takes a number, and here that is safe for a reason that does
+not generalise, and one worth stating precisely because a later version claimed
+a different one. It is *not* that a pid file descriptor is held: a pidfd that is
+never used to deliver the signal makes `getpgid` and `killpg` no more atomic
+than they were, and does not stop a pid being reused once the process is
+reaped. It is that **the runtime is the tunnel's parent and has not reaped
+it** — an unreaped child's pid cannot be recycled — and that the tunnel leads
+its own group because it was started with `start_new_session`. Both are checked
+rather than assumed.
+
+Where neither holds, only the leader is signalled and the tunnel says so:
+`aclose` raises `tunnel_descendants_indeterminate`. The address closes either
+way, but "nothing it started is left" stops being something anybody can claim,
+so it is not claimed.
+
+An exit code only reaches a parent, and a runtime that outlives the Hermes
+process that started it usually has none. So a runtime that cannot confirm its
+tunnel is gone also leaves a marker beside its record; the next stop reads it,
+consumes it, and reports `tunnel_indeterminate` instead of watching the control
+endpoint go quiet and calling that success.
+
+### Two expiries, and what happens when both run out
+
+The button's window and the session's lifetime are different clocks on purpose:
+a learner working through an exercise is not thrown out because the *invitation*
+went stale mid-question. What that must not become is no expiry at all.
+
+- A grant whose window closed **cannot be activated**. A button that arrives
+  after its own window is not a launch, and activating it anyway produced the
+  worst pair of facts available: a launch reported open, and an entrance that
+  admits nobody.
+- A grant stays admissible past its own window only while it holds a **live**
+  session. A pointer to a session is not a session — retirement sets an expiry,
+  it does not clear the field — so the previous rule kept a launch alive for
+  ever once it had been opened once, long enough to mint a brand new session
+  after both clocks had run out.
+- Progress reporting reads the live session too, so a learner's position stops
+  being reported when the thing that bounds it stops existing.
+
+### What is written under the profile, and how
+
+The record, the lock, the handshake and the bootstrap stamp all live in the
+profile's own `runtime` directory, and every one of them is created, opened,
+mode-changed, renamed and removed **relative to a descriptor for that
+directory** — never by pathname.
+
+A pathname check followed by a pathname write is two lookups, and anything at
+all can happen between them. The directory is opened `O_NOFOLLOW`, so a
+symbolic link substituted for it is refused by the kernel rather than silently
+redirecting a write; individual files are opened the same way, and modes are
+set with `fchmod` on the descriptor rather than `chmod` on a name, because
+`chmod` follows links and would otherwise loosen the permissions of whatever
+the link pointed at. The record holds a control secret, which is why this is
+worth the syscalls.
+
+The *directories* leading to the interpreter get the same treatment: `runtime`
+→ `venv` → `bin`, each opened no-follow relative to the one above it. A link at
+any of them moves the whole environment somewhere the profile does not control,
+which is the accident an unpacked archive or a careless sync tool actually
+produces.
+
+**The interpreter itself may be a link, because that is what a virtual
+environment is.** `python -m venv` and `uv venv` both create `bin/python` as a
+symlink — to `python3.11`, and that to the base interpreter *outside* managed
+storage. Opening the last component no-follow as well sounds stricter and in
+fact refused every environment this plugin builds, so the managed path always
+answered `runtime_not_bootstrapped` and no launch could happen. What is
+required of the final target is what can honestly be required: that it resolves
+to a regular file with an execute bit.
+
+Two things this does **not** claim. It does not survive a swap in the instant
+between the check and the `exec` — nothing about path handling can give that,
+and the two obvious attempts make it worse (holding the descriptor pins the
+file but not the *name*; executing it through `/proc/self/fd/N` pins the file
+but puts it in a directory with no `pyvenv.cfg`, so CPython stops recognising a
+virtual environment and the runtime loses every dependency installed for it).
+And it does not defend against somebody who can already write inside
+`venv/bin`, who can replace the interpreter's target, its contents, or
+`pyvenv.cfg` unseen. What proves the environment is one this plugin built is
+the stamp, not the path check.
 
 ## Exercise manifests
 
@@ -1287,17 +1826,20 @@ The card renderers and the Mini App frontend **are** here: all thirty-one
 component types render, submit, and are keyboard-operable, in three interface
 languages. See [The Mini App interface](#the-mini-app-interface).
 
-Deliberately **not** here yet: image-generation providers, anything that starts
-or supervises the server process, Cloudflare tunnels, slash commands, sending a
-Telegram launch button, launch/status/stop tools, scoring, attempt and score
-storage, progress dashboards, and any scheduler. The skill says which of these
-exist and which do not, and instructs the agent to deliver in conversation until
-the launch tooling lands.
+Starting the runtime, opening a Cloudflare Quick Tunnel, and sending a Telegram
+Web App button **are** here, with `learning_studio_launch`, `_status`,
+`_results` and `_stop`. See [Opening an exercise](#opening-an-exercise).
 
-An exercise can now be served *and rendered*, but nothing starts the server, so
-in practice the agent still delivers exercises in conversation until the launch
-tooling lands. Responses collected by the API are held in the session and are
-never marked or stored.
+Deliberately **not** here: image-generation providers, slash commands, scoring,
+durable attempt or score storage, progress dashboards, any scheduler or spaced
+repetition daemon, custom domains, permanent named tunnels, Cloudflare account
+provisioning, and automatic installation of anything.
+
+**Nothing is marked and nothing is kept.** Responses live in the learner's
+session and end with it; `learning_studio_results` reports whether they opened
+the exercise and how far they got, and nothing else exists to report. The skill
+says so, in those terms, and instructs the agent to say so too rather than
+implying a report card is coming.
 
 ## Development
 
@@ -1318,6 +1860,21 @@ HERMES_AGENT_SRC=/path/to/hermes-agent uv run pytest tests/test_hermes_integrati
 
 They skip when the variable is unset, so CI stays self-contained. Run them
 before changing how the skill loads its references.
+
+The frontend suite runs under Node's built-in test runner, with fixtures
+generated from the real component registry:
+
+```bash
+uv run python tools/run_frontend_tests.py
+```
+
+**No test in this repository reaches Telegram, Cloudflare, public DNS, or the
+internet.** The process, the tunnel and the message are each substituted at the
+narrowest point that removes the outside effect, and
+`tests/test_runtime_security.py` asserts that the substitutions have not
+widened. Two tests do start the real runtime — on a loopback port, with a
+shell-script stand-in for `cloudflared` — because a supervisor's interesting
+failures are the ones a mock agrees with.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
