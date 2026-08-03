@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -968,3 +969,101 @@ def _stopping(record):
         }
 
     return request
+
+
+# ── The managed interpreter, taken by the branch production actually uses ──
+
+
+def _build_managed_venv(stub: str = "managed_runtime_marker") -> Path:
+    """A real virtual environment where the plugin keeps its own, plus a stub.
+
+    ``--without-pip`` because this needs a venv, not a package index: the
+    property under test is that executing the managed interpreter yields a
+    ``sys.prefix`` of that venv, so its ``site-packages`` is importable. A stub
+    module dropped in there stands in for FastAPI and Uvicorn and needs no
+    network.
+    """
+    import compileall
+    import venv
+
+    target = bootstrap.venv_dir()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(target)
+
+    site = next(iter((target / "lib").glob("python*/site-packages")))
+    (site / f"{stub}.py").write_text("VALUE = 'from the managed environment'\n", encoding="utf-8")
+    compileall.compile_dir(str(site), quiet=2)
+    return target
+
+
+def _probe(interpreter: str, script: str) -> subprocess.CompletedProcess:
+    return subprocess.run([interpreter, "-c", script], capture_output=True, text=True, timeout=120)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the runtime is POSIX only")
+def test_the_managed_interpreter_runs_inside_its_own_virtual_environment(hermes_home: Path):
+    """The default branch — no ``python=`` — must produce a usable interpreter.
+
+    Every other test here passes ``python=Path(sys.executable)``, which takes
+    the *other* branch, so a change to how the managed interpreter is resolved
+    and executed could break the real thing while the suite stayed green. That
+    happened: executing it through ``/proc/self/fd/N`` pinned the file but put
+    it in a directory with no ``pyvenv.cfg``, so CPython stopped recognising a
+    virtual environment at all — ``sys.prefix`` collapsed to
+    ``sys.base_prefix`` and the runtime lost every dependency installed for it.
+
+    Three things are asserted, because the failure had three faces: the spawn
+    argument, what the interpreter reports about itself, and whether the
+    environment's own packages are reachable from it.
+    """
+    managed = _build_managed_venv()
+    popen = FakePopen(publishes=45999)
+
+    with pytest.raises(RuntimeUnavailable):
+        # It cannot become *ready* — the fake never answers the challenge — but
+        # it gets far enough to record what it was going to run.
+        supervisor.ensure_running(config(), popen=popen)
+
+    assert popen.command is not None
+    spawned = popen.command[0]
+
+    # (1) An ordinary path inside the managed environment, not a descriptor.
+    assert spawned == str(bootstrap.runtime_python())
+    assert "/proc/" not in spawned and "/dev/fd" not in spawned
+
+    # (2) Run it. It must consider itself part of *this* environment.
+    reported = _probe(
+        spawned, "import sys;print(sys.prefix);print(sys.base_prefix);print(sys.executable)"
+    )
+    assert reported.returncode == 0, reported.stderr
+    prefix, base_prefix, executable = reported.stdout.strip().splitlines()
+    assert Path(prefix).resolve() == managed.resolve(), "the managed venv was not detected"
+    assert Path(prefix).resolve() != Path(base_prefix).resolve()
+
+    # (3) Its installed dependencies are therefore importable.
+    imported = _probe(spawned, "import managed_runtime_marker as m;print(m.VALUE)")
+    assert imported.returncode == 0, imported.stderr
+    assert imported.stdout.strip() == "from the managed environment"
+
+    # (4) The identity the child would report matches the one recorded, which
+    # is what the ownership challenge compares. Two different strings there
+    # made that check pass by coincidence rather than by construction.
+    assert Path(executable).resolve() == Path(spawned).resolve()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the runtime is POSIX only")
+def test_the_recorded_executable_is_the_one_that_was_spawned(hermes_home: Path):
+    """One string for the spawn and the record, so the challenge means something."""
+    _build_managed_venv()
+    popen = FakePopen(publishes=45999)
+
+    with pytest.raises(RuntimeUnavailable):
+        supervisor.ensure_running(config(), popen=popen)
+
+    child_env = popen.kwargs["env"]
+    recorded = state.read_record()
+    # The start rolled back, so there is no record left behind; the identity
+    # that *would* have been recorded is the interpreter that was spawned.
+    assert recorded is None
+    assert popen.command[0] == str(bootstrap.runtime_python())
+    assert env.RUNTIME_ID in child_env

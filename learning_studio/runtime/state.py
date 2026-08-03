@@ -175,6 +175,24 @@ def managed_dir():
 #: Flags for opening a managed file: never follow a link, never leak to a child.
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
+#: How many times an ``O_CREAT`` open may be retried after a spurious ``ENOENT``.
+#:
+#: On Darwin/APFS, two threads calling ``open(..., O_CREAT)`` on the *same*
+#: not-yet-existing name race inside the kernel, and the loser gets ``ENOENT``
+#: instead of the file the winner just created — reproducible here in roughly
+#: nine runs out of ten with twelve threads, with or without ``O_NOFOLLOW`` and
+#: with or without ``dir_fd``.
+#:
+#: The path that hits it is the first two concurrent launches on a fresh
+#: profile, both creating ``runtime.lock``: one took the lock, and the other
+#: raised ``FileNotFoundError`` out of the tool call instead of being told the
+#: profile was busy. A retry is correct rather than a papering-over — ``ENOENT``
+#: from a *create* means the name was not there, which is the state ``O_CREAT``
+#: exists to resolve, so asking again is asking the same question.
+#:
+#: Bounded, and small: this resolves on the next attempt or it is not this race.
+_CREATE_RACE_ATTEMPTS = 3
+
 
 def open_managed(name: str, flags: int, mode: int = FILE_MODE, *, dir_fd: int | None = None) -> int:
     """Open one file in the runtime directory, refusing a link at its name.
@@ -187,20 +205,32 @@ def open_managed(name: str, flags: int, mode: int = FILE_MODE, *, dir_fd: int | 
     :class:`ContainmentError` here. The distinction is worth keeping: "somebody
     put a link where this plugin's file goes" is a different event from "the
     file is not there", and only one of them is worth a person's attention.
+
+    A create that loses a race is retried rather than raised — see
+    :data:`_CREATE_RACE_ATTEMPTS`.
     """
     _require_plain_name(name)
     opened = flags | _NOFOLLOW | os.O_CLOEXEC
-    try:
-        if dir_fd is not None:
-            return os.open(name, opened, mode, dir_fd=dir_fd)
-        with managed_dir() as directory:
-            return os.open(name, opened, mode, dir_fd=directory)
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise ContainmentError(
-                f"the Learning Studio {name} is a symbolic link and was refused"
-            ) from exc
-        raise
+    creating = bool(flags & os.O_CREAT)
+
+    for attempt in range(_CREATE_RACE_ATTEMPTS):
+        remaining = _CREATE_RACE_ATTEMPTS - attempt - 1
+        try:
+            if dir_fd is not None:
+                return os.open(name, opened, mode, dir_fd=dir_fd)
+            with managed_dir() as directory:
+                return os.open(name, opened, mode, dir_fd=directory)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise ContainmentError(
+                    f"the Learning Studio {name} is a symbolic link and was refused"
+                ) from exc
+            # Only a create losing the race is retried. A read that finds
+            # nothing, or a create with no attempts left, is the real answer.
+            if not creating or exc.errno != errno.ENOENT or not remaining:
+                raise
+
+    raise AssertionError("unreachable: the loop above returns or raises")
 
 
 def read_managed(name: str, *, max_bytes: int) -> str | None:

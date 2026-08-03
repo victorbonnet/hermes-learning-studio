@@ -103,68 +103,74 @@ def runtime_python() -> Path:
     return venv_dir() / "bin" / "python"
 
 
-@dataclass
-class VerifiedRuntimePython:
-    """A pinned interpreter executable whose identity survives path swaps."""
+def verified_runtime_python() -> Path:
+    """The interpreter, with the directories leading to it proved unredirected.
 
-    fd: int
-    display_path: Path
+    ``runtime`` → ``venv`` → ``bin`` are opened ``O_NOFOLLOW`` relative to one
+    another, so no *directory* on the way can be a symbolic link. A link at any
+    of them would move the entire environment somewhere the profile does not
+    control — the accident an unpacked archive or a careless sync tool actually
+    produces — and this refuses it in a single resolution with no name lookup
+    left to race.
 
-    @property
-    def executable(self) -> str:
-        return f"/proc/self/fd/{self.fd}"
+    **The interpreter itself may be a link, because that is what a virtual
+    environment is.** ``python -m venv`` and ``uv venv`` both create
+    ``bin/python`` as a symlink — to ``python3.11``, and that to the base
+    interpreter *outside* managed storage. An earlier version of this function
+    opened the last component ``O_NOFOLLOW`` too, which sounds stricter and in
+    fact refused every environment this plugin builds: the whole managed path
+    reported ``runtime_not_bootstrapped`` and no launch could happen. Nothing
+    caught it because every test wrote a plain file there.
 
-    def close(self) -> None:
-        fd, self.fd = self.fd, -1
-        if fd >= 0:
-            os.close(fd)
+    So the last component is followed, and what is required of it is what can
+    honestly be required: that it resolves to a regular file with an execute
+    bit. Where it points is not constrained, because a venv legitimately points
+    out of the profile.
 
+    **The trust boundary, stated exactly.** What is established is that at the
+    moment of the check, no directory component was a link, and the final
+    target was an executable regular file. Nothing is established about the
+    instant after: the spawn resolves the path again, and a replacement made in
+    between is executed. That gap cannot be closed here — holding the
+    descriptor open pins the file but not the *name*, and executing the
+    descriptor through ``/proc/self/fd/N`` pins the file but puts it in a
+    directory with no ``pyvenv.cfg``, so CPython stops recognising a virtual
+    environment and the runtime loses every dependency installed for it. That
+    was tried; it is why this returns a path.
 
-def open_verified_runtime_python() -> VerifiedRuntimePython:
-    """Open every component no-follow and retain the executable descriptor."""
+    Nor is anything established against somebody who can already write inside
+    ``venv/bin``. They can replace the interpreter's target, its contents, or
+    ``pyvenv.cfg``, and no path handling sees it. What proves the environment
+    is one this plugin built is the stamp — see :func:`is_bootstrapped` — not
+    this function.
+    """
     from .state import ContainmentError, managed_dir, open_managed
 
     with managed_dir() as runtime:
         venv = open_managed(VENV_DIRNAME, os.O_RDONLY | _O_DIRECTORY, dir_fd=runtime)
         try:
             binaries = open_managed("bin", os.O_RDONLY | _O_DIRECTORY, dir_fd=venv)
+        except OSError as exc:
+            raise ContainmentError("the Learning Studio runtime environment is incomplete") from exc
         finally:
             os.close(venv)
-        try:
-            interpreter = open_managed("python", os.O_RDONLY, dir_fd=binaries)
-        finally:
-            os.close(binaries)
-    info = os.fstat(interpreter)
-    if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+
+    try:
+        # Followed on purpose: see above. `bin` was opened no-follow, so this
+        # resolves from a directory that is provably the managed one.
+        interpreter = os.open("python", os.O_RDONLY | os.O_CLOEXEC, dir_fd=binaries)
+    finally:
+        os.close(binaries)
+
+    try:
+        info = os.fstat(interpreter)
+        if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+            raise ContainmentError(
+                "the Learning Studio runtime interpreter is not an executable file"
+            )
+    finally:
         os.close(interpreter)
-        raise ContainmentError("the Learning Studio runtime interpreter is not an executable file")
-    return VerifiedRuntimePython(interpreter, runtime_python())
 
-
-def verified_runtime_python() -> Path:
-    """The interpreter, with every component proved not to be a link.
-
-    This is the one path in the package where following a symbolic link
-    changes *what code runs*. Checking the final file with ``is_file()`` and
-    then handing the string to a spawner checked nothing useful: a link at
-    ``venv``, at ``venv/bin``, or at the interpreter itself redirected the
-    execution somewhere the profile does not control, and the check would still
-    have passed. A planted link pointing outside managed storage was accepted.
-
-    So each component is opened ``O_NOFOLLOW`` relative to the descriptor for
-    the one above it — ``runtime`` → ``venv`` → ``bin`` → ``python`` — which is
-    a single resolution with no name lookup left to race. The interpreter must
-    also be a regular file this user can execute.
-
-    **What this does not claim.** A swap in the instant between this check and
-    the ``exec`` is not prevented, and cannot be by any amount of path
-    handling: anybody able to do that is able to write inside the profile's own
-    storage directory, and can simply rewrite the interpreter's *contents*
-    instead. The boundary here is a link planted from outside that directory,
-    which is the one this closes.
-    """
-    verified = open_verified_runtime_python()
-    verified.close()
     return runtime_python()
 
 
@@ -278,15 +284,7 @@ def bootstrap(*, runner=subprocess.run, force: bool = False) -> BootstrapResult:
             detail=_tail(creation.stderr or creation.stdout),
         )
 
-    from .state import managed_dir, open_managed
-
-    with managed_dir() as runtime_fd:
-        target_fd = open_managed(VENV_DIRNAME, os.O_RDONLY | _O_DIRECTORY, dir_fd=runtime_fd)
-    try:
-        with contextlib.suppress(OSError, NotImplementedError):
-            os.fchmod(target_fd, DIRECTORY_MODE)
-    finally:
-        os.close(target_fd)
+    _tighten_venv_permissions()
 
     installation = _run(
         [
@@ -318,6 +316,29 @@ def bootstrap(*, runner=subprocess.run, force: bool = False) -> BootstrapResult:
         outcome="created",
         message="The Learning Studio runtime environment is ready.",
     )
+
+
+def _tighten_venv_permissions() -> None:
+    """Make the environment owner-only, through a descriptor. Best effort.
+
+    ``fchmod`` on a descriptor rather than ``chmod`` on a name, so a link
+    planted at ``venv`` cannot have somebody else's directory relaxed for them.
+
+    Best effort in the sense the previous ``chmod`` was: a mode that could not
+    be tightened is not a reason to fail a bootstrap that otherwise worked, and
+    the environment is created inside a storage root that is already owner-only.
+    Letting an error escape here would turn a cosmetic failure into "the
+    Learning Studio cannot be installed".
+    """
+    from .state import ContainmentError, managed_dir, open_managed
+
+    with contextlib.suppress(OSError, NotImplementedError, ContainmentError):
+        with managed_dir() as runtime_fd:
+            target_fd = open_managed(VENV_DIRNAME, os.O_RDONLY | _O_DIRECTORY, dir_fd=runtime_fd)
+        try:
+            os.fchmod(target_fd, DIRECTORY_MODE)
+        finally:
+            os.close(target_fd)
 
 
 def _write_stamp(directory: Path) -> None:

@@ -7,10 +7,12 @@ pure function over a string, and it is attacked accordingly.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import signal
 import time
+from pathlib import Path
 
 import pytest
 
@@ -545,3 +547,146 @@ async def test_a_cancelled_open_also_takes_the_group():
         tunnel._signal_group = original
 
     assert signalled == [signal.SIGTERM, signal.SIGKILL]
+
+
+# ── Portability: no pidfd, no ctypes, no silent claims ────────────────────
+
+
+def test_the_tunnel_never_reaches_for_a_native_symbol():
+    """A ``ctypes`` fallback here broke the platforms it was written for.
+
+    ``ctypes.CDLL(None).pidfd_open`` raises ``AttributeError`` when the symbol
+    is absent — not ``OSError`` — so on macOS it propagated out of every
+    teardown path and out of ``open_tunnel``, and the runtime died during
+    startup. It also bought nothing: the descriptor was never used to deliver a
+    signal, so ``getpgid`` and ``killpg`` were exactly as numeric as before.
+    """
+    source = Path(tunnel.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    imported = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert "ctypes" not in imported
+
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "pidfd_open" not in called
+    assert "CDLL" not in called
+
+
+@pytest.mark.anyio
+async def test_a_platform_without_pidfds_opens_stops_and_closes_cleanly(monkeypatch):
+    """Neither ``os.pidfd_open`` nor a libc symbol, and nothing raises."""
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    monkeypatch.delattr(os, "pidfd_send_signal", raising=False)
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+
+    # A pid, so this reaches the code that used to grope for a native symbol.
+    # Without one the old `_pin` returned early and the test proved nothing.
+    process = FakeProcess([b"|  https://calm-forest-1234.trycloudflare.com  |\n", b""])
+    process.pid = os.getpid()
+    opened = await tunnel.open_tunnel(
+        executable="/usr/bin/cloudflared",
+        target="http://127.0.0.1:8080",
+        environment={},
+        timeout_seconds=30,
+        spawn=Spawner(process),
+    )
+
+    assert opened.state == "ready"
+    opened.stop()
+    await opened.aclose()
+    assert opened.state == "stopped"
+
+
+@pytest.mark.anyio
+async def test_a_platform_without_process_groups_refuses_to_claim_descendants(monkeypatch):
+    """Leader-only cleanup is reported, not quietly passed off as success.
+
+    The address closes either way — the leader is signalled — but "nothing it
+    started is left" stops being something anybody can claim, so the caller is
+    told rather than left to assume.
+    """
+    monkeypatch.delattr(os, "killpg", raising=False)
+    monkeypatch.delattr(os, "getpgid", raising=False)
+
+    process = FakeProcess([])
+    process.pid = os.getpid()
+    quick = tunnel.QuickTunnel()
+    quick.process = process
+    quick.state = "ready"
+
+    with pytest.raises(tunnel.TunnelError) as caught:
+        await quick.aclose(grace_seconds=1)
+
+    assert caught.value.reason == "tunnel_descendants_indeterminate"
+    assert process.terminated or process.returncode is not None, "the leader was not signalled"
+    assert quick.descendants_ended is False
+
+
+@pytest.mark.anyio
+async def test_closing_a_tunnel_that_never_started_is_truthful_and_idempotent():
+    """No process is not a reason to keep reporting ``ready``."""
+    quick = tunnel.QuickTunnel()
+    quick.state = "ready"
+
+    await quick.aclose()
+    assert quick.state == "stopped"
+
+    quick.stop()
+    assert quick.state == "stopped"
+
+
+@pytest.mark.anyio
+async def test_a_failed_tunnel_keeps_saying_it_failed():
+    """``stopped`` would erase why there is no address."""
+    quick = tunnel.QuickTunnel()
+    quick.state = "failed"
+    quick.reason = "tunnel_readiness_timeout"
+
+    await quick.aclose()
+    quick.stop()
+
+    assert quick.state == "failed"
+    assert quick.reason == "tunnel_readiness_timeout"
+
+
+@pytest.mark.anyio
+async def test_a_close_that_could_not_confirm_keeps_the_process_for_a_retry():
+    """Cancellation and failure must stay retryable."""
+
+    class Immortal(FakeProcess):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.signals: list[int] = []
+
+        def terminate(self):
+            self.signals.append(signal.SIGTERM)
+
+        def kill(self):
+            self.signals.append(signal.SIGKILL)
+
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    process = Immortal()
+    quick = tunnel.QuickTunnel()
+    quick.process = process
+    quick.state = "ready"
+
+    with pytest.raises(tunnel.TunnelError) as caught:
+        await quick.aclose(grace_seconds=0.01)
+
+    assert caught.value.reason == "tunnel_cleanup_indeterminate"
+    assert quick.process is process, "a tunnel nobody confirmed gone was released"

@@ -543,14 +543,16 @@ def test_a_managed_name_that_could_escape_the_directory_is_refused():
 # ── The interpreter is the one thing a link can change into other code ────
 
 
-@pytest.mark.parametrize("component", ["venv", "bin", "python"])
-def test_a_link_anywhere_on_the_interpreter_path_is_refused(storage, tmp_path, component):
-    """The one place following a link changes *what code runs*.
+@pytest.mark.parametrize("component", ["venv", "bin"])
+def test_a_link_on_a_directory_of_the_interpreter_path_is_refused(storage, tmp_path, component):
+    """A link at a *directory* moves the whole environment somewhere else.
 
-    ``is_file()`` on the final name proved nothing useful: a link at ``venv``,
-    at ``venv/bin``, or at the interpreter itself redirected execution outside
-    the profile's storage, and the check passed anyway. Each component is now
-    opened no-follow relative to the one above it.
+    ``is_file()`` on the final name proved nothing useful: a link at ``venv``
+    or at ``venv/bin`` redirected execution outside the profile's storage and
+    the check passed anyway. Both are now opened no-follow relative to the one
+    above them.
+
+    The interpreter itself is deliberately not in this list — see below.
     """
     from learning_studio.runtime import bootstrap
 
@@ -564,17 +566,60 @@ def test_a_link_anywhere_on_the_interpreter_path_is_refused(storage, tmp_path, c
     if component == "venv":
         runtime.mkdir(parents=True, exist_ok=True)
         os.symlink(outside, runtime / bootstrap.VENV_DIRNAME)
-    elif component == "bin":
+    else:
         (runtime / bootstrap.VENV_DIRNAME).mkdir(parents=True, exist_ok=True)
         os.symlink(outside / "bin", runtime / bootstrap.VENV_DIRNAME / "bin")
-    else:
-        (runtime / bootstrap.VENV_DIRNAME / "bin").mkdir(parents=True, exist_ok=True)
-        os.symlink(external, runtime / bootstrap.VENV_DIRNAME / "bin" / "python")
 
     with pytest.raises((ContainmentError, OSError)):
         bootstrap.verified_runtime_python()
 
     assert bootstrap.is_bootstrapped() is False
+
+
+def test_the_interpreter_may_be_the_symlink_every_virtual_environment_has(storage, tmp_path):
+    """Refusing a link here refused every environment this plugin builds.
+
+    ``python -m venv`` and ``uv venv`` both make ``bin/python`` a symlink — to
+    ``python3.11``, and that to the base interpreter *outside* the profile.
+    Opening the last component no-follow sounds stricter and in fact meant the
+    managed path always reported ``runtime_not_bootstrapped``, so no launch
+    could happen at all. Nothing caught it because every other test writes a
+    plain file there.
+    """
+    base = tmp_path / "base" / "bin"
+    base.mkdir(parents=True)
+    real = base / "python3.11"
+    real.write_text("#!/bin/sh\n", encoding="utf-8")
+    real.chmod(0o755)
+
+    binaries = storage / "runtime" / bootstrap.VENV_DIRNAME / "bin"
+    binaries.mkdir(parents=True)
+    os.symlink(real, binaries / "python3.11")
+    os.symlink("python3.11", binaries / "python")
+
+    assert bootstrap.verified_runtime_python() == binaries / "python"
+
+
+def test_an_interpreter_link_to_something_unrunnable_is_still_refused(storage, tmp_path):
+    """Following the link does not mean accepting whatever it lands on."""
+    target = tmp_path / "not-a-program"
+    target.write_text("", encoding="utf-8")
+    target.chmod(0o644)
+
+    binaries = storage / "runtime" / bootstrap.VENV_DIRNAME / "bin"
+    binaries.mkdir(parents=True)
+    os.symlink(target, binaries / "python")
+
+    with pytest.raises(ContainmentError):
+        bootstrap.verified_runtime_python()
+
+    directory = tmp_path / "a-directory"
+    directory.mkdir()
+    (binaries / "python").unlink()
+    os.symlink(directory, binaries / "python")
+
+    with pytest.raises((ContainmentError, OSError)):
+        bootstrap.verified_runtime_python()
 
 
 def test_a_bootstrapped_interpreter_inside_the_profile_is_accepted(storage):

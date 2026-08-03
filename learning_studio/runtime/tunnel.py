@@ -59,7 +59,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ctypes
 import logging
 import os
 import re
@@ -261,10 +260,13 @@ class QuickTunnel:
     url: str = ""
     reason: str = ""
     process: object | None = field(default=None, repr=False)
-    #: Stable kernel handle for the session leader.  A pidfd pins the numeric
-    #: process-group name until cleanup finishes, closing the getpgid/killpg
-    #: reuse race while still allowing the whole descendant group to be ended.
-    pidfd: int | None = field(default=None, repr=False)
+    #: False once a cleanup attempt could not reach the tunnel's process group.
+    #:
+    #: The leader still gets its signal, so the address closes; what is unknown
+    #: is whether anything ``cloudflared`` started went with it. Recorded rather
+    #: than assumed, because "we killed the process" and "nothing it spawned is
+    #: left" are different claims and only the first one is always true.
+    descendants_ended: bool = True
 
     @property
     def ready(self) -> bool:
@@ -289,38 +291,52 @@ class QuickTunnel:
     async def aclose(self, *, grace_seconds: float = 5.0) -> None:
         """End the tunnel and **wait for it to be gone**. Idempotent.
 
-        Terminate, wait, kill, wait. The previous version called ``terminate``
-        and returned, so a cloudflared that ignores SIGTERM outlived the stop
-        that reported success — and a caller was told the public address was
-        closed while it was still open.
+        Terminate the group, wait, kill the group, wait. An earlier version
+        called ``terminate`` and returned, so a cloudflared that ignores
+        SIGTERM outlived the stop that reported success — and a caller was told
+        the public address was closed while it was still open.
+
+        The process is released only once bounded cleanup has actually
+        finished. A cancellation or a failure part-way through therefore leaves
+        this object still holding it, so a later call can retry rather than
+        find ``None`` and report a tunnel it never confirmed gone as stopped.
 
         The only process touched is the child this object is holding. There is
         no process id here that was read from anywhere.
         """
         process = self.process
         if process is None:
+            # Nothing to end — either it never started or a previous call
+            # finished the job. Either way the truthful state is "not running",
+            # and a failure already recorded stays recorded.
+            if self.state != "failed":
+                self.state = "stopped"
             return
-        self._pin(process)
-        completed = False
-        try:
-            _signal_group(process, signal.SIGTERM)
+
+        reached = _signal_group(process, signal.SIGTERM)
+        if not await _reaped(process, grace_seconds):
+            reached = _signal_group(process, signal.SIGKILL) and reached
             if not await _reaped(process, grace_seconds):
-                _signal_group(process, signal.SIGKILL)
-                if not await _reaped(process, grace_seconds):
-                    logger.warning("the tunnel process did not exit after being killed")
-                    raise TunnelError("tunnel_cleanup_indeterminate")
-            completed = True
-        finally:
-            # Keep ownership reachable across cancellation or interruption. A
-            # later close can retry unless bounded cleanup actually completed.
-            if completed:
-                self.process = None
-                if self.pidfd is not None:
-                    with contextlib.suppress(OSError):
-                        os.close(self.pidfd)
-                    self.pidfd = None
-                if self.state != "failed":
-                    self.state = "stopped"
+                # Reported rather than hidden: the caller has to be able to say
+                # "the address may still be open" instead of claiming it is
+                # closed. `self.process` is deliberately still set, so a retry
+                # is possible.
+                logger.warning("the tunnel process did not exit after being killed")
+                raise TunnelError("tunnel_cleanup_indeterminate")
+
+        self.process = None
+        if self.state != "failed":
+            self.state = "stopped"
+        self.descendants_ended = self.descendants_ended and reached
+        if not self.descendants_ended:
+            # The leader is confirmed gone, so the address is closed. What
+            # cannot be confirmed is that nothing it started is still running,
+            # and saying "stopped" would be claiming both.
+            #
+            # Read from the field rather than the local, so a `stop()` that
+            # already failed to reach the group is not forgotten by a later
+            # `aclose()` that happens to have nothing left to signal.
+            raise TunnelError("tunnel_descendants_indeterminate")
 
     def stop(self) -> None:
         """Synchronous best effort, for a caller with no event loop.
@@ -338,65 +354,86 @@ class QuickTunnel:
         leaving a public address served by a process whose runtime has gone.
         ``SIGKILL`` cannot be declined, and a Quick Tunnel has no state to
         flush, so the trade is a plainly good one.
+
+        Idempotent: a second call finds no process and changes nothing.
         """
         process = self.process
         if process is None:
+            if self.state != "failed":
+                self.state = "stopped"
             return
-        self._pin(process)
-        _signal_group(process, signal.SIGTERM)
-        _signal_group(process, signal.SIGKILL)
+        reached = _signal_group(process, signal.SIGTERM)
+        reached = _signal_group(process, signal.SIGKILL) and reached
+        self.descendants_ended = self.descendants_ended and reached
+        self.process = None
         if self.state != "failed":
             self.state = "stopped"
 
-    def _pin(self, process) -> None:
-        if self.pidfd is not None:
-            return
-        pid = getattr(process, "pid", None)
-        if not isinstance(pid, int) or pid <= 0:
-            return
-        try:
-            if hasattr(os, "pidfd_open"):
-                fd = os.pidfd_open(pid)
-            else:
-                # CPython builds may omit the wrapper although the running
-                # Linux kernel/libc provides pidfds. This narrow call obtains
-                # the same stable identity; no arbitrary native symbol or
-                # model-controlled argument is involved.
-                libc = ctypes.CDLL(None, use_errno=True)
-                fd = int(libc.pidfd_open(pid, 0))
-                if fd < 0:
-                    raise OSError(ctypes.get_errno(), "pidfd_open")
-        except OSError:
-            return
-        self.pidfd = fd
-        process._learning_studio_pidfd = fd
 
-
-def _signal_group(process, sig: int) -> None:
-    """Signal the tunnel's whole process group, falling back to the leader.
+def _signal_group(process, sig: int) -> bool:
+    """Signal the tunnel's process group. Returns whether the group was reached.
 
     The **group**, because ``cloudflared`` may have started things of its own
     and killing only the leader left them running — still holding whatever the
     leader was holding, with nothing left that knows they exist.
 
     Signalling a group takes a number, and a number is safe here for a reason
-    that does not generalise: this process is the tunnel's parent and has not
-    reaped it, so the kernel cannot reuse that pid, and the group it leads is
-    its own because it was started with ``start_new_session``. Both conditions
-    are checked rather than assumed — if the process has already been reaped,
-    or does not lead its own group, only the leader is signalled.
+    that does not generalise, and that is worth stating precisely because an
+    earlier version claimed a different one. It is *not* that a pid file
+    descriptor is held: a pidfd that is never used to deliver the signal makes
+    ``getpgid`` and ``killpg`` no more atomic than they were, and does not stop
+    a pid being reused once the process is reaped. It is that **this process is
+    the tunnel's parent and has not reaped it** — an unreaped child's pid
+    cannot be recycled by the kernel — and that the tunnel leads its own group,
+    because it was started with ``start_new_session``. Both are checked here
+    rather than assumed: ``returncode is None`` is the first, ``getpgid(pid)
+    == pid`` is the second.
+
+    When neither holds, the leader alone is signalled and this returns False.
+    The caller turns that into an honest report rather than a silent
+    downgrade — the address closes either way, but "nothing it started is left"
+    stops being something anybody can claim.
     """
     if getattr(process, "returncode", None) is not None:
-        return
+        # Already gone. Nothing to reach, and nothing left unclaimed.
+        return True
+
+    if not (hasattr(os, "killpg") and hasattr(os, "getpgid")):
+        # No process groups on this platform. The runtime tools are not offered
+        # here at all — see `ownership.platform_supported` — but if this is
+        # somehow reached, only the leader can be signalled and that is what is
+        # reported.
+        logger.warning(
+            "this platform cannot signal a process group; the tunnel's children "
+            "cannot be confirmed stopped"
+        )
+        _signal_leader(process, sig)
+        return False
+
     pid = getattr(process, "pid", None)
-    pidfd = getattr(process, "_learning_studio_pidfd", None)
-    if pidfd is not None and isinstance(pid, int) and pid > 0 and hasattr(os, "killpg"):
-        try:
-            if os.getpgid(pid) == pid:
-                os.killpg(pid, sig)
-                return
-        except (ProcessLookupError, OSError):
-            return
+    if not isinstance(pid, int) or pid <= 0:
+        # No usable pid: not a real child of this process, so there is no group
+        # of descendants for it to have leaked.
+        _signal_leader(process, sig)
+        return True
+
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, sig)
+            return True
+    except ProcessLookupError:
+        # It exited between the two calls. Reaped or not, it is gone, and so is
+        # anything that was waiting on it to be signalled.
+        return True
+    except OSError as exc:
+        logger.warning("the tunnel's process group could not be signalled: %s", type(exc).__name__)
+
+    _signal_leader(process, sig)
+    return False
+
+
+def _signal_leader(process, sig: int) -> None:
+    """The fallback: the one process this object is holding."""
     with contextlib.suppress(ProcessLookupError, OSError):
         if sig == signal.SIGKILL:
             process.kill()
@@ -444,7 +481,6 @@ async def open_tunnel(
         return tunnel
 
     tunnel.process = process
-    tunnel._pin(process)
     try:
         url = await asyncio.wait_for(_read_url(process), timeout=timeout_seconds)
     except TimeoutError:

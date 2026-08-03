@@ -8,6 +8,7 @@ best guess.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -553,3 +554,78 @@ def test_the_safe_description_of_a_reply_never_carries_the_address(monkeypatch):
     described = json.dumps(ownership.query(rec).describe())
 
     assert "trycloudflare" not in described
+
+
+def test_a_create_that_loses_the_kernel_race_is_retried_not_raised(hermes_home: Path):
+    """Two launches racing to create the lock must not crash one of them.
+
+    On Darwin/APFS, two ``open(..., O_CREAT)`` calls on the same not-yet-
+    existing name race inside the kernel and the loser gets ``ENOENT`` rather
+    than the file the winner just made. The path that hits it is the first two
+    concurrent launches on a fresh profile: one took the lock, and the other
+    raised ``FileNotFoundError`` out of the tool call instead of being told the
+    profile was busy.
+    """
+    state.runtime_dir()
+    crashed: list[BaseException] = []
+    outcomes: list[str] = []
+    start = threading.Barrier(12)
+
+    def attempt() -> None:
+        start.wait()
+        lock = state.ProfileLock()
+        try:
+            lock.acquire()
+        except RuntimeUnavailable:
+            outcomes.append("busy")
+            return
+        except BaseException as exc:  # noqa: BLE001 - the crash is the assertion
+            crashed.append(exc)
+            return
+        outcomes.append("held")
+        lock.release()
+
+    threads = [threading.Thread(target=attempt) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert crashed == [], f"a racing acquire crashed: {crashed[:1]}"
+    assert len(outcomes) == 12
+    assert "held" in outcomes
+
+
+def test_a_lost_create_race_is_retried_deterministically(hermes_home: Path, monkeypatch):
+    """The same defect without the thread scheduler deciding whether it appears.
+
+    The concurrent test above reproduces the real thing but only sometimes.
+    This one injects the kernel's answer directly: one spurious ``ENOENT`` from
+    a create, exactly as Darwin returns to the loser of the race.
+    """
+    state.runtime_dir()
+    real_open = os.open
+    refusals = {"left": 1}
+
+    def flaky(path, flags, mode=0o777, *, dir_fd=None):
+        if path == state.LOCK_FILENAME and flags & os.O_CREAT and refusals["left"]:
+            refusals["left"] -= 1
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+        if dir_fd is not None:
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", flaky)
+
+    handle = state.open_managed(state.LOCK_FILENAME, os.O_RDWR | os.O_CREAT)
+    os.close(handle)
+
+    assert refusals["left"] == 0, "the injected refusal never happened"
+
+
+def test_a_genuinely_missing_file_is_still_reported(hermes_home: Path):
+    """The retry must not turn "it is not there" into a hang or a lie."""
+    state.runtime_dir()
+
+    with pytest.raises(FileNotFoundError):
+        state.open_managed("never-created.json", os.O_RDONLY)

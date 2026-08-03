@@ -272,7 +272,6 @@ def ensure_running(
         else:
             return RuntimeHandle(record=previous, reply=reply, started=False)
 
-    verified_interpreter = None
     if python is not None:
         # A caller-supplied interpreter, which only the tests and the bootstrap
         # tool pass. Not resolved through the managed chain because it is not
@@ -288,28 +287,24 @@ def ensure_running(
         from .state import ContainmentError
 
         try:
-            verified_interpreter = bootstrap.open_verified_runtime_python()
-            interpreter = Path(verified_interpreter.executable)
+            interpreter = bootstrap.verified_runtime_python()
         except (OSError, ContainmentError) as exc:
             logger.warning("the runtime interpreter could not be verified: %s", type(exc).__name__)
             raise _unavailable(NOT_BOOTSTRAPPED, "runtime_not_bootstrapped") from exc
 
-    try:
-        return _start(
-            config,
-            interpreter=interpreter,
-            previous=previous,
-            popen=popen,
-            clock=clock,
-            sleep=sleep,
-            pass_fds=(() if python is not None else (verified_interpreter.fd,)),
-            executable_identity=(
-                str(interpreter) if python is not None else str(verified_interpreter.display_path)
-            ),
-        )
-    finally:
-        if verified_interpreter is not None:
-            verified_interpreter.close()
+    # One path, used for the spawn *and* recorded as this runtime's identity.
+    # They must be the same string: the ownership challenge compares the record
+    # against the `sys.executable` the child reports, and a scheme that
+    # execute[d] one name while recording another made that comparison a
+    # coincidence rather than a check.
+    return _start(
+        config,
+        interpreter=interpreter,
+        previous=previous,
+        popen=popen,
+        clock=clock,
+        sleep=sleep,
+    )
 
 
 def _deferrable_signals() -> set:
@@ -367,8 +362,6 @@ def _start(
     popen,
     clock,
     sleep,
-    pass_fds=(),
-    executable_identity: str | None = None,
 ) -> RuntimeHandle:
     """Start one runtime, or leave the profile exactly as it was found."""
     from ..paths import profile_id
@@ -387,7 +380,7 @@ def _start(
         # `_await_handshake` is what produces the record this function returns.
         port=1,
         control_token=new_control_token(),
-        executable=executable_identity or str(interpreter),
+        executable=str(interpreter),
         started_at=time.time(),
         idle_timeout_seconds=config.runtime_idle_timeout_seconds,
         max_lifetime_seconds=config.runtime_max_lifetime_seconds,
@@ -418,7 +411,6 @@ def _start(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
-                pass_fds=pass_fds,
                 cwd=str(runtime_dir()),
             )
         record = dataclasses.replace(record_without_port, pid=child.pid)

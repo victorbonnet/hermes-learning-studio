@@ -621,9 +621,11 @@ of the two rules applies:
 - **`agent_suggestion`** — the agent proposed it. Additionally requires
   `learner_confirmed: true`.
 
-Both require a quotation. The schema encodes the conditional requirement too,
-so a provider that validates before dispatch refuses the same payloads the
-handler would.
+Both require a quotation, of **at least four non-whitespace characters after
+normalisation**. The schema encodes that rule, and the conditional confirmation
+requirement, so a provider that validates before dispatch refuses the same
+payloads the handler would — length alone was not the rule, and `"    "` used
+to satisfy the schema and then be rejected as unusable.
 
 **One message opens one exercise once.** A repeat call reports the launch that
 is already open and sends no second button. A *new* launch on a message that
@@ -887,6 +889,7 @@ Custom domains and permanent named tunnels are deliberately out of scope.
 | A stop reports it could not confirm | Escalation needs a pinned process identity, which is Linux-only. The runtime stops itself at its own deadline. |
 | "the exercise could not be sent" and the same words are refused afterwards | The send failed in a way that cannot prove nothing arrived. A message may be in the chat, so the claim on that sentence is kept. Ask the learner, and quote their reply. |
 | The runtime exits with status 4 | The server stopped but `cloudflared` could not be confirmed gone, so the public address may still be open. Distinct from exit 0 on purpose: a clean stop and an unconfirmed one are not the same event. |
+| A close reports `tunnel_descendants_indeterminate` | The tunnel leader was signalled, but its process group could not be. Whatever `cloudflared` had started may still be running; the public address itself is closed. |
 | A stop reports `tunnel_indeterminate` | Either the runtime said on its way out that it could not confirm its tunnel closed, or it had to be signalled and so never ran its own teardown. The address may still resolve; it has no origin behind it. |
 
 ### The tunnel's lifetime, and its descendants
@@ -898,9 +901,19 @@ running, still holding what the leader held, with nothing left that knew they
 existed.
 
 Signalling a group takes a number, and here that is safe for a reason that does
-not generalise — the runtime is the tunnel's parent and has not reaped it, so
-the kernel cannot reuse the pid, and the group is its own by construction. Both
-conditions are checked rather than assumed.
+not generalise, and one worth stating precisely because a later version claimed
+a different one. It is *not* that a pid file descriptor is held: a pidfd that is
+never used to deliver the signal makes `getpgid` and `killpg` no more atomic
+than they were, and does not stop a pid being reused once the process is
+reaped. It is that **the runtime is the tunnel's parent and has not reaped
+it** — an unreaped child's pid cannot be recycled — and that the tunnel leads
+its own group because it was started with `start_new_session`. Both are checked
+rather than assumed.
+
+Where neither holds, only the leader is signalled and the tunnel says so:
+`aclose` raises `tunnel_descendants_indeterminate`. The address closes either
+way, but "nothing it started is left" stops being something anybody can claim,
+so it is not claimed.
 
 An exit code only reaches a parent, and a runtime that outlives the Hermes
 process that started it usually has none. So a runtime that cannot confirm its
@@ -942,19 +955,31 @@ set with `fchmod` on the descriptor rather than `chmod` on a name, because
 the link pointed at. The record holds a control secret, which is why this is
 worth the syscalls.
 
-The interpreter gets the same treatment, and it is the one path where following
-a link changes *what code runs*: `runtime` → `venv` → `bin` → `python`, each
-component opened no-follow relative to the one above it, and the interpreter
-required to be a regular executable file. Checking the final name with
-`is_file()` and handing the string to a spawner checked nothing useful — a link
-at any component redirected execution outside the profile's storage and the
-check still passed.
+The *directories* leading to the interpreter get the same treatment: `runtime`
+→ `venv` → `bin`, each opened no-follow relative to the one above it. A link at
+any of them moves the whole environment somewhere the profile does not control,
+which is the accident an unpacked archive or a careless sync tool actually
+produces.
 
-What that does **not** claim is protection against a swap in the instant
-between the check and the `exec`. Nothing about path handling can give that:
-anybody able to do it can write inside the profile's own storage directory, and
-can rewrite the interpreter's contents instead. The boundary this closes is a
-link planted from outside that directory.
+**The interpreter itself may be a link, because that is what a virtual
+environment is.** `python -m venv` and `uv venv` both create `bin/python` as a
+symlink — to `python3.11`, and that to the base interpreter *outside* managed
+storage. Opening the last component no-follow as well sounds stricter and in
+fact refused every environment this plugin builds, so the managed path always
+answered `runtime_not_bootstrapped` and no launch could happen. What is
+required of the final target is what can honestly be required: that it resolves
+to a regular file with an execute bit.
+
+Two things this does **not** claim. It does not survive a swap in the instant
+between the check and the `exec` — nothing about path handling can give that,
+and the two obvious attempts make it worse (holding the descriptor pins the
+file but not the *name*; executing it through `/proc/self/fd/N` pins the file
+but puts it in a directory with no `pyvenv.cfg`, so CPython stops recognising a
+virtual environment and the runtime loses every dependency installed for it).
+And it does not defend against somebody who can already write inside
+`venv/bin`, who can replace the interpreter's target, its contents, or
+`pyvenv.cfg` unseen. What proves the environment is one this plugin built is
+the stamp, not the path check.
 
 ## Exercise manifests
 

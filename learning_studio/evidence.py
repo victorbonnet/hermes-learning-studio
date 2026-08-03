@@ -80,11 +80,15 @@ MAX_TOMBSTONES = 512
 #: integer per conversation rather than one entry per message, so it survives
 #: the traffic that evicts tombstones and answers the same question for every
 #: message below it at once.
-# Watermarks are intentionally not capacity-evicted.  The capture hook admits
-# only allowlisted Telegram DMs, so this is bounded by the profile's authorised
-# conversations rather than by message traffic.  Evicting one is unsafe: it
-# turns an already-consumed Telegram update back into fresh authority.
-MAX_WATERMARKS = 4096  # compatibility/test corpus size; no longer an eviction cap
+# Watermarks are deliberately **not** capacity-evicted, and so there is no
+# constant here bounding them. Evicting one turns an already-consumed Telegram
+# update back into fresh authority, which is the replay this structure exists
+# to prevent — a cap would have been a scheduled reintroduction of the bug.
+#
+# What bounds them instead is who can create one: the capture hook admits only
+# allowlisted Telegram direct messages, so the number of entries is the number
+# of conversations this profile has authorised, and each is a tuple and two
+# numbers. Message traffic does not move it.
 
 #: Longest message text retained. A learner's request is a sentence; anything
 #: past this is truncated before it is stored, because the only thing it is
@@ -292,13 +296,19 @@ class EvidenceStore:
         """Turn a reservation into a spend. The launch happened."""
         now = float(self._clock())
         with self._lock:
-            # Delivery is the irreversible boundary.  A reservation may have
-            # disappeared because a store operation failed halfway through;
-            # that uncertainty must never re-arm the message.  Commit is thus
-            # monotonic and idempotent once the exact captured key is known.
-            if key not in self._reserved and key not in self._entries and key not in self._spent:
+            # Strict: this call must be holding the reservation it is spending.
+            #
+            # Widening it to "the key is known here" made `commit` succeed for
+            # a message that was never reserved, and for one already spent, so
+            # its answer stopped meaning anything the caller could act on — and
+            # the caller does act on it, by reporting `consent_commit_lost`
+            # rather than success. The uncertainty that widening was meant to
+            # cover is real, but it belongs in `seal`, which the launch path
+            # calls on exactly the boundary where delivery has become
+            # irreversible.
+            if key not in self._reserved:
                 return False
-            self._reserved.pop(key, None)
+            del self._reserved[key]
             self._entries.pop(key, None)
             self._spent[key] = now
             while len(self._spent) > MAX_TOMBSTONES:

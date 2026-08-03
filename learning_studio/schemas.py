@@ -632,16 +632,13 @@ LAUNCH_SCHEMA: dict[str, Any] = {
                 # was then refused as unusable, which is the same mismatch as
                 # the confirmation flag above.
                 #
-                # A *necessary* condition, not an exact one. What the handler
-                # actually requires is four characters after whitespace is
-                # collapsed, and encoding that normaliser as a regex would
-                # produce something nobody could read and that would start
-                # rejecting quotations the handler accepts — "a b c" is five
-                # characters collapsed and three otherwise. Requiring at least
-                # one non-space character removes the reported gap without
-                # inventing a stricter rule than the one being enforced.
-                # Runtime requires four non-whitespace characters after
-                # normalisation; advertise that same rule to providers.
+                # The rule the handler enforces, stated where providers can
+                # read it: at least four **non-whitespace** characters after
+                # normalisation. Length alone was not it — `"    "` satisfied
+                # `minLength` and was then refused as unusable — and neither
+                # was "at least one non-space character", which admitted
+                # quotations the handler goes on to reject. The two are now the
+                # same rule in both places.
                 "pattern": r"^(?:\s*\S){4}",
                 "description": (
                     "A few words copied exactly from the learner's CURRENT message - the "

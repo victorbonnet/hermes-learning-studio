@@ -534,14 +534,26 @@ def test_every_earlier_message_in_the_conversation_is_covered(store):
     assert store.state(newer, "quiz me on photosynthesis") == "matched"
 
 
-def test_authorised_conversation_watermarks_are_not_capacity_evicted(store):
-    from learning_studio import evidence as evidence_module
+#: Far more conversations than a profile can plausibly authorise. There is no
+#: constant in the module to borrow here, because there is no cap to borrow: a
+#: cap would be a scheduled reintroduction of the replay this prevents.
+_MORE_CONVERSATIONS_THAN_ANY_PROFILE_HAS = 5000
 
+
+def test_authorised_conversation_watermarks_are_not_capacity_evicted(store):
+    """A watermark must not be evictable, at any volume.
+
+    Evicting one turns an already-consumed Telegram update back into fresh
+    authority — the exact replay the watermark exists to stop. What bounds the
+    table is who can create an entry: the capture hook admits only allowlisted
+    direct messages, so it grows with authorised conversations and not with
+    traffic.
+    """
     first = key(message_id="500")
     store.record(first, "quiz me on photosynthesis")
     assert store.spend(first) is True
 
-    for index in range(evidence_module.MAX_WATERMARKS + 50):
+    for index in range(_MORE_CONVERSATIONS_THAN_ANY_PROFILE_HAS):
         other = key(chat_id=f"chat-{index}", message_id="1")
         store.record(other, "quiz me on photosynthesis")
         assert store.spend(other) is True
