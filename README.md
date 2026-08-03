@@ -653,6 +653,25 @@ wrote specific words in the turn being answered; whether they meant "open an
 exercise" is the agent's reading, and the response says so in those terms
 rather than reporting "the learner agreed" as a finding.
 
+**Only messages that could authorise a launch are kept.** A launch goes to an
+allowlisted Telegram direct message and nowhere else, so that is exactly what
+the capture hook records. It used to record everything the gateway saw — every
+platform, every group, everybody — and the store is small and bounded on
+purpose, so each of those evicted something that mattered: a learner's "yes" in
+their own conversation could be pushed out by strangers talking in a room they
+are not in. An unreadable chat type is refused rather than assumed private, and
+an allowlist that cannot be computed authorises nobody.
+
+**A consumed message stays consumed after its tombstone is gone.** Tombstones
+name one message each and the table holding them is bounded, so enough traffic
+evicts the oldest — and a redelivery of that Telegram update then looked like a
+message nobody had used. Alongside them the store keeps one integer per
+conversation: the highest message id it has ever spent. Telegram numbers
+messages upwards, so that one integer answers for every message below it, and
+it does not evict under the traffic that evicts tombstones. A platform whose
+ids are not ordered has no such inference made about it and relies on the
+tombstones alone.
+
 **Privacy.** The learner's message text is held in memory, in the process that
 already had it, for a short bounded window, and is never written to disk,
 returned, or logged. Only the current message is kept; there is no history.
@@ -716,6 +735,7 @@ minted, not just the newest.
 | `pending` | A grant exists and admits nobody. The selector has to exist before a message can carry it. |
 | delivered | Telegram accepted the message. |
 | `open` | The grant is activated and the learner's message is spent. This is the commit. |
+| `closed` | It was opened, and the session has since run out. Distinct from `expired`, which is a button nobody tapped. |
 | indeterminate | The message went out and the commit did not finish, or a rollback could not be confirmed. |
 
 The last row is the one worth reading twice. If the button was sent and the
@@ -765,15 +785,29 @@ id, generation, process id and interpreter path must all match the record.
 to a *number* is a race: the runtime can exit between the two and the operating
 system can hand that number to something else. So a signal is only ever sent
 through a pid file descriptor, which pins the identity. The sequence is pin,
-re-prove against the pinned identity, signal the **leader through the
-descriptor** with `pidfd_send_signal`, and only then reach its descendants with
-`killpg`.
+re-prove against the pinned identity, then signal **through the descriptor**
+with `signal.pidfd_send_signal`.
 
-That order is the whole argument, and holding a pidfd without it is not enough:
-`killpg` takes a number, so what makes the number safe is having just proved,
-by signalling the descriptor, that the leader still exists — the kernel does
-not reuse a pid while the process it names is still there. If the descriptor
-refuses the signal, the number is never used at all.
+There is no `killpg` on this path and no pid passed to anything. A process
+group is named by a number, and a number can be reused between a leader exiting
+and a signal arriving; holding a pidfd narrowed that window without closing it,
+because the pidfd was never the thing delivering. What the group kill bought
+was reaching `cloudflared`, which used to share the runtime's group — it has
+its own session now, so the runtime's group holds the runtime and nothing else,
+and signalling it by number bought a race in exchange for nothing.
+
+(`pidfd_open` is in `os`; `pidfd_send_signal` is in `signal`. Probing the wrong
+module is not an error anybody sees — `hasattr` simply answers False for ever,
+and escalation reports the platform unsupported on the one platform that
+supports it. There is a test that asserts where the attribute lives.)
+
+**The cost is stated, not hidden.** A runtime killed *because it is wedged*
+never runs its own teardown, so its tunnel is not closed by anything, and
+`learning_studio_stop` reports `tunnel_indeterminate` rather than `stopped`. A
+`cloudflared` in that state proxies to an origin that is gone, so it serves
+errors rather than anybody's work — but it is a hostname that has not been
+withdrawn, and saying so is better than a cleanup path that signals numbers to
+make the report look tidy.
 
 **Where an identity cannot be pinned, escalation refuses.** `pidfd_open` is
 Linux. On macOS and anything else without it, a wedged runtime is left to the
@@ -853,6 +887,44 @@ Custom domains and permanent named tunnels are deliberately out of scope.
 | A stop reports it could not confirm | Escalation needs a pinned process identity, which is Linux-only. The runtime stops itself at its own deadline. |
 | "the exercise could not be sent" and the same words are refused afterwards | The send failed in a way that cannot prove nothing arrived. A message may be in the chat, so the claim on that sentence is kept. Ask the learner, and quote their reply. |
 | The runtime exits with status 4 | The server stopped but `cloudflared` could not be confirmed gone, so the public address may still be open. Distinct from exit 0 on purpose: a clean stop and an unconfirmed one are not the same event. |
+| A stop reports `tunnel_indeterminate` | Either the runtime said on its way out that it could not confirm its tunnel closed, or it had to be signalled and so never ran its own teardown. The address may still resolve; it has no origin behind it. |
+
+### The tunnel's lifetime, and its descendants
+
+`cloudflared` is started in **its own session**, so it leads a process group
+containing it and anything it starts. Ending the tunnel signals that group, not
+just the leader: killing only the leader left a wrapper script's children
+running, still holding what the leader held, with nothing left that knew they
+existed.
+
+Signalling a group takes a number, and here that is safe for a reason that does
+not generalise — the runtime is the tunnel's parent and has not reaped it, so
+the kernel cannot reuse the pid, and the group is its own by construction. Both
+conditions are checked rather than assumed.
+
+An exit code only reaches a parent, and a runtime that outlives the Hermes
+process that started it usually has none. So a runtime that cannot confirm its
+tunnel is gone also leaves a marker beside its record; the next stop reads it,
+consumes it, and reports `tunnel_indeterminate` instead of watching the control
+endpoint go quiet and calling that success.
+
+### Two expiries, and what happens when both run out
+
+The button's window and the session's lifetime are different clocks on purpose:
+a learner working through an exercise is not thrown out because the *invitation*
+went stale mid-question. What that must not become is no expiry at all.
+
+- A grant whose window closed **cannot be activated**. A button that arrives
+  after its own window is not a launch, and activating it anyway produced the
+  worst pair of facts available: a launch reported open, and an entrance that
+  admits nobody.
+- A grant stays admissible past its own window only while it holds a **live**
+  session. A pointer to a session is not a session — retirement sets an expiry,
+  it does not clear the field — so the previous rule kept a launch alive for
+  ever once it had been opened once, long enough to mint a brand new session
+  after both clocks had run out.
+- Progress reporting reads the live session too, so a learner's position stops
+  being reported when the thing that bounds it stops existing.
 
 ### What is written under the profile, and how
 
@@ -869,6 +941,20 @@ set with `fchmod` on the descriptor rather than `chmod` on a name, because
 `chmod` follows links and would otherwise loosen the permissions of whatever
 the link pointed at. The record holds a control secret, which is why this is
 worth the syscalls.
+
+The interpreter gets the same treatment, and it is the one path where following
+a link changes *what code runs*: `runtime` → `venv` → `bin` → `python`, each
+component opened no-follow relative to the one above it, and the interpreter
+required to be a regular executable file. Checking the final name with
+`is_file()` and handing the string to a spawner checked nothing useful — a link
+at any component redirected execution outside the profile's storage and the
+check still passed.
+
+What that does **not** claim is protection against a swap in the instant
+between the check and the `exec`. Nothing about path handling can give that:
+anybody able to do it can write inside the profile's own storage directory, and
+can rewrite the interpreter's contents instead. The boundary this closes is a
+link planted from outside that directory.
 
 ## Exercise manifests
 

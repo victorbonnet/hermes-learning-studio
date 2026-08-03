@@ -412,8 +412,10 @@ def test_a_live_runtime_is_asked_to_stop_before_it_is_signalled(monkeypatch):
     assert killed == []
 
 
-def test_a_wedged_runtime_escalates_to_its_own_process_group(monkeypatch):
-    """Escalation targets the group, from a pinned identity, proved again first."""
+def test_a_wedged_runtime_is_escalated_through_its_pinned_descriptor(monkeypatch):
+    """Escalation signals the pinned identity, proved again immediately first."""
+    import signal as signal_module
+
     monkeypatch.setattr(ownership, "handle_supported", lambda: True)
     monkeypatch.setattr(os, "pidfd_open", lambda pid, flags: 99, raising=False)
     monkeypatch.setattr(os, "close", lambda fd: None)
@@ -429,27 +431,22 @@ def test_a_wedged_runtime_escalates_to_its_own_process_group(monkeypatch):
         return reply_for(rec)
 
     monkeypatch.setattr(ownership, "_request", request)
-    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
-    killed: list[tuple[int, int]] = []
     signalled: list[tuple[int, int]] = []
+    killed: list[tuple[int, int]] = []
 
-    def killpg(pid, sig):
-        killed.append((pid, sig))
+    def send(fd, sig):
+        signalled.append((fd, sig))
         alive["value"] = False
 
-    monkeypatch.setattr(os, "killpg", killpg)
-    # The leader is reached through the pinned descriptor, and the group by
-    # number only afterwards.
-    monkeypatch.setattr(
-        os, "pidfd_send_signal", lambda fd, sig: signalled.append((fd, sig)), raising=False
-    )
+    monkeypatch.setattr(signal_module, "pidfd_send_signal", send, raising=False)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append((pid, sig)))
 
     outcome = ownership.stop_owned(rec, graceful_seconds=2, clock=clock, sleep=clock.sleep)
 
     assert outcome.result == "stopped"
     assert outcome.method == "sigterm"
     assert signalled and signalled[0][0] == 99
-    assert killed and killed[0][0] == rec.pid
+    assert killed == [], "a signal was addressed to a number"
 
 
 def test_a_runtime_that_leads_no_process_group_is_never_signalled(monkeypatch):

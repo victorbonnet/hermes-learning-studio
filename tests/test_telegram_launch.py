@@ -409,6 +409,17 @@ def test_an_unexpected_transport_failure_never_carries_the_token_out(raised, cap
     assert "secret" not in rendered
 
 
-def test_an_unexpected_failure_is_treated_as_having_sent_nothing():
-    """It never reached a request, so the learner's words are not spent on it."""
-    assert telegram_launch.proves_nothing_was_sent("telegram_endpoint_unexpected") is True
+def test_an_unexpected_failure_is_never_treated_as_proof_that_nothing_was_sent():
+    """ "Unexpected" means unclassified, and unclassified is not evidence.
+
+    It was in the "nothing was sent" set, which was a category error: such an
+    exception can be raised after the request body has been written and
+    Telegram has already acted on it. Releasing the learner's claim there let a
+    retry deliver a second button.
+    """
+    assert telegram_launch.proves_nothing_was_sent("telegram_endpoint_unexpected") is False
+
+    # The three that really are proof, kept apart from it.
+    for reason in ("bot_token_absent", "launch_selector_malformed", "telegram_refused"):
+        assert telegram_launch.proves_nothing_was_sent(reason) is True
+    assert telegram_launch.proves_nothing_was_sent("delivery_tunnel_url_scheme") is True

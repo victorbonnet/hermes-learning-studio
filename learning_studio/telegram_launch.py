@@ -81,13 +81,23 @@ LAUNCH_FRAGMENT_KEY = "launch"
 #: chat, and a retry would put a second one beside it.
 NOTHING_WAS_SENT = frozenset(
     {
+        # Refused before a socket was opened.
         "bot_token_absent",
         "launch_selector_malformed",
-        "telegram_endpoint_unexpected",
-        # Telegram received the request and declined it, so there is no message.
+        # Telegram received the request, parsed it, and declined it. Its own
+        # answer is the evidence that no message was created.
         "telegram_refused",
     }
 )
+
+#: Deliberately **not** in the set above: ``telegram_endpoint_unexpected``.
+#:
+#: It was, and that was wrong. "Unexpected" is by definition a failure nobody
+#: classified, and it can be raised at any point — including after the request
+#: body has been written and Telegram has already acted on it. Treating it as
+#: proof of nothing sent released the learner's claim and let a retry deliver a
+#: second button beside a first one nobody could see. An unclassified failure
+#: is now treated as unknown, which is what it is.
 
 
 def proves_nothing_was_sent(reason: str) -> bool:

@@ -8,6 +8,9 @@ pure function over a string, and it is attacked accordingly.
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import time
 
 import pytest
 
@@ -472,3 +475,73 @@ async def test_a_cancelled_open_kills_a_tunnel_that_ignores_terminate():
 
     assert process.terminated is True
     assert process.killed is True, "a cancelled launch left the tunnel running"
+
+
+@pytest.mark.anyio
+async def test_a_tunnels_descendants_are_ended_with_it():
+    """Killing the leader is not killing the tunnel.
+
+    ``cloudflared`` may start things of its own — and an operator's wrapper
+    script certainly does. Signalling only the process this object holds left
+    those running, still bound to whatever the leader was bound to, with
+    nothing left that knew they existed. The tunnel is started in its own
+    session precisely so there is a group to end.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import os, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        "print('|  https://calm-forest-1234.trycloudflare.com  |', flush=True)\n"
+        "sys.stdout.write(str(child.pid) + '\\n'); sys.stdout.flush()\n"
+        "time.sleep(300)\n"
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
+    )
+    await process.stdout.readline()
+    descendant = int((await process.stdout.readline()).decode().strip())
+
+    quick = tunnel.QuickTunnel()
+    quick.process = process
+    quick.state = "ready"
+
+    await quick.aclose(grace_seconds=5)
+
+    assert process.returncode is not None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        alive = subprocess.run(
+            [sys.executable, "-c", f"import os;os.kill({descendant}, 0)"], capture_output=True
+        )
+        if alive.returncode != 0:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        os.kill(descendant, signal.SIGKILL)
+        raise AssertionError("a descendant of the tunnel outlived it")
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_open_also_takes_the_group():
+    """The cancellation path uses the same group signal, not a lone kill."""
+    process = StubbornProcess()
+    signalled: list[int] = []
+    quick = tunnel.QuickTunnel()
+    quick.process = process
+
+    original = tunnel._signal_group
+    try:
+        tunnel._signal_group = lambda proc, sig: signalled.append(sig)
+        quick.stop()
+    finally:
+        tunnel._signal_group = original
+
+    assert signalled == [signal.SIGTERM, signal.SIGKILL]

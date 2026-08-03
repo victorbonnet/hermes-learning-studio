@@ -538,3 +538,65 @@ def test_a_managed_name_that_could_escape_the_directory_is_refused():
     for name in ("", ".", "..", "../runtime.json", "sub/dir"):
         with pytest.raises(ContainmentError):
             state.remove_managed(name)
+
+
+# ── The interpreter is the one thing a link can change into other code ────
+
+
+@pytest.mark.parametrize("component", ["venv", "bin", "python"])
+def test_a_link_anywhere_on_the_interpreter_path_is_refused(storage, tmp_path, component):
+    """The one place following a link changes *what code runs*.
+
+    ``is_file()`` on the final name proved nothing useful: a link at ``venv``,
+    at ``venv/bin``, or at the interpreter itself redirected execution outside
+    the profile's storage, and the check passed anyway. Each component is now
+    opened no-follow relative to the one above it.
+    """
+    from learning_studio.runtime import bootstrap
+
+    runtime = storage / "runtime"
+    outside = tmp_path / "outside"
+    (outside / "bin").mkdir(parents=True)
+    external = outside / "bin" / "python"
+    external.write_text("#!/bin/sh\necho pwned\n", encoding="utf-8")
+    external.chmod(0o755)
+
+    if component == "venv":
+        runtime.mkdir(parents=True, exist_ok=True)
+        os.symlink(outside, runtime / bootstrap.VENV_DIRNAME)
+    elif component == "bin":
+        (runtime / bootstrap.VENV_DIRNAME).mkdir(parents=True, exist_ok=True)
+        os.symlink(outside / "bin", runtime / bootstrap.VENV_DIRNAME / "bin")
+    else:
+        (runtime / bootstrap.VENV_DIRNAME / "bin").mkdir(parents=True, exist_ok=True)
+        os.symlink(external, runtime / bootstrap.VENV_DIRNAME / "bin" / "python")
+
+    with pytest.raises((ContainmentError, OSError)):
+        bootstrap.verified_runtime_python()
+
+    assert bootstrap.is_bootstrapped() is False
+
+
+def test_a_bootstrapped_interpreter_inside_the_profile_is_accepted(storage):
+    """The check refuses links, not ordinary environments."""
+    from learning_studio.runtime import bootstrap
+
+    python = storage / "runtime" / bootstrap.VENV_DIRNAME / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
+
+    assert bootstrap.verified_runtime_python() == python
+
+
+def test_an_interpreter_that_is_not_executable_is_refused(storage):
+    """A half-built environment is refused rather than spawned and diagnosed."""
+    from learning_studio.runtime import bootstrap
+
+    python = storage / "runtime" / bootstrap.VENV_DIRNAME / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o644)
+
+    with pytest.raises(ContainmentError):
+        bootstrap.verified_runtime_python()

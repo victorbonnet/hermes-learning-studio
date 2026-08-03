@@ -13,6 +13,7 @@ import inspect
 import json
 import os
 import signal
+import sys
 from pathlib import Path
 
 import pytest
@@ -210,23 +211,31 @@ def test_a_process_that_knows_the_secret_but_is_not_ours_is_not_signalled(monkey
     assert killed == []
 
 
-def test_signalling_goes_to_a_group_the_runtime_leads(monkeypatch):
-    """A group led by somebody else would take strangers down with it."""
+def test_no_process_is_ever_addressed_by_number_here(monkeypatch):
+    """A number can name a stranger; a descriptor cannot.
+
+    The group kill existed to reach ``cloudflared``, which used to share the
+    runtime's process group. It has its own session now — so the runtime can
+    end it and its descendants without ending itself — and the runtime's group
+    holds nothing but the runtime. Signalling that group by number bought a
+    reuse race in exchange for nothing, so it is gone.
+    """
     source = Path(ownership.__file__).read_text(encoding="utf-8")
 
-    assert "os.getpgid(self._pid) != self._pid" in source
-    assert "os.killpg" in source
+    assert "os.killpg" not in source
     assert "os.kill(" not in source
+    assert "os.getpgid" not in source
 
 
 def test_a_signal_is_only_ever_sent_through_a_pinned_identity():
-    """The race the previous version could not win.
+    """No signal in this module is addressed by number.
 
-    It proved ownership in userspace, discarded the proof, then called
-    ``getpgid`` and ``killpg`` on a number — and between those the runtime
-    could exit and the number could be reused. Signalling now happens only from
-    a ``ProcessHandle``, which holds a pid file descriptor precisely so the
-    kernel will not recycle the identity underneath it.
+    The first version proved ownership in userspace, discarded the proof, then
+    called ``getpgid`` and ``killpg`` on a number — and between those the
+    runtime could exit and the number could be reused. The second held a pidfd
+    but still delivered with ``killpg``, which narrowed the window without
+    closing it. There is now no numeric signalling here at all: the descriptor
+    is the identity, and it is the thing that delivers.
     """
     import ast
 
@@ -243,14 +252,30 @@ def test_a_signal_is_only_ever_sent_through_a_pinned_identity():
             ):
                 calls.setdefault(node.name, []).append(inner.func.attr)
 
-    assert list(calls) == ["signal_group"], calls
+    assert list(calls) == ["signal_runtime"], calls
+    assert calls["signal_runtime"] == ["pidfd_send_signal"], calls["signal_runtime"]
 
-    # And within it: the descriptor first, the number second. `killpg` takes a
-    # pid, so the only thing that makes it safe is having just proved — by
-    # signalling the pidfd — that the leader still exists and its number is
-    # therefore not available for reuse. Reverse the order and the race is back.
-    sent = calls["signal_group"]
-    assert sent == ["pidfd_send_signal", "killpg"], sent
+
+def test_the_pidfd_sender_is_probed_where_python_actually_puts_it():
+    """``pidfd_open`` is in ``os``; ``pidfd_send_signal`` is in ``signal``.
+
+    Probing the wrong module is not a crash and not a test failure — `hasattr`
+    just answers False, for ever. The whole escalation path then reports the
+    platform unsupported, on Linux, where it is supported, and a wedged runtime
+    is never stopped. That is exactly what happened, and nothing caught it,
+    which is why this assertion is about the standard library rather than about
+    this package.
+    """
+    import signal as signal_module
+
+    assert hasattr(os, "pidfd_open") == (sys.platform.startswith("linux"))
+    assert not hasattr(os, "pidfd_send_signal"), "the probe below would be vacuous"
+    if sys.platform.startswith("linux"):
+        assert hasattr(signal_module, "pidfd_send_signal")
+
+    source = Path(ownership.__file__).read_text(encoding="utf-8")
+    assert "signal.pidfd_send_signal" in source
+    assert "os.pidfd_send_signal" not in source
 
 
 def test_escalation_fails_closed_where_no_identity_can_be_pinned(monkeypatch):
@@ -696,7 +721,7 @@ def test_the_group_is_never_signalled_when_the_leader_could_not_be(monkeypatch):
     monkeypatch.setattr(ownership, "_request", _answering(record()))
     monkeypatch.setattr(os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(
-        os,
+        signal,
         "pidfd_send_signal",
         lambda fd, sig: (_ for _ in ()).throw(ProcessLookupError(fd)),
         raising=False,
@@ -704,33 +729,22 @@ def test_the_group_is_never_signalled_when_the_leader_could_not_be(monkeypatch):
     killed: list[tuple[int, int]] = []
     monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append((pid, sig)))
 
-    assert handle.signal_group(signal.SIGTERM, record()) is False
+    assert handle.signal_runtime(signal.SIGTERM, record()) is False
     assert killed == [], "a signal went to a number after the identity refused it"
 
 
-def test_the_leader_is_signalled_by_descriptor_and_the_group_by_number(monkeypatch):
-    """The successful path, in order: descriptor first, then the descendants."""
+def test_the_runtime_is_signalled_by_descriptor_and_nothing_else_is(monkeypatch):
+    """The successful path touches the descriptor and no number at all."""
     handle = ownership.ProcessHandle(4242, 99)
     monkeypatch.setattr(ownership, "_request", _answering(record()))
-    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
     order: list[str] = []
     monkeypatch.setattr(
-        os, "pidfd_send_signal", lambda fd, sig: order.append(f"pidfd:{fd}:{sig}"), raising=False
+        signal,
+        "pidfd_send_signal",
+        lambda fd, sig: order.append(f"pidfd:{fd}:{sig}"),
+        raising=False,
     )
     monkeypatch.setattr(os, "killpg", lambda pid, sig: order.append(f"group:{pid}:{sig}"))
 
-    assert handle.signal_group(signal.SIGTERM, record()) is True
-    assert order == [f"pidfd:99:{int(signal.SIGTERM)}", f"group:4242:{int(signal.SIGTERM)}"]
-
-
-def test_a_group_that_cannot_be_reached_does_not_undo_a_delivered_signal(monkeypatch):
-    """The leader has the signal. An empty group is not a failure to stop it."""
-    handle = ownership.ProcessHandle(4242, 99)
-    monkeypatch.setattr(ownership, "_request", _answering(record()))
-    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
-    monkeypatch.setattr(os, "pidfd_send_signal", lambda fd, sig: None, raising=False)
-    monkeypatch.setattr(
-        os, "killpg", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError(pid))
-    )
-
-    assert handle.signal_group(signal.SIGTERM, record()) is True
+    assert handle.signal_runtime(signal.SIGTERM, record()) is True
+    assert order == [f"pidfd:99:{int(signal.SIGTERM)}"]

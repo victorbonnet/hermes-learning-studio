@@ -127,6 +127,22 @@ class LaunchGrant:
     def expired(self, now: float) -> bool:
         return now >= self.expires_at
 
+    def live_session(self, now: float) -> Any:
+        """The session this grant is holding, if it is still usable.
+
+        A *pointer* to a session is not a session. The pointer outlives the
+        thing it names — retirement sets an expiry, it does not clear the
+        field — so asking "is there a session?" answered yes forever, and every
+        rule built on that question inherited the mistake.
+        """
+        session = self.session
+        if session is None:
+            return None
+        expires_at = getattr(session, "expires_at", None)
+        if expires_at is None or now >= float(expires_at):
+            return None
+        return session
+
     def admissible(self, now: float) -> bool:
         """May still admit a learner who taps the button.
 
@@ -134,10 +150,16 @@ class LaunchGrant:
         nobody has opened. Once a session exists, that session's own lifetime
         governs, so a learner working through an exercise is not thrown out
         because the *invitation* went stale mid-question.
+
+        A **live** session, though. The previous version accepted any session
+        pointer, so a launch that had been opened once stayed admissible for
+        ever: the button's window had passed, the session had passed, and the
+        grant still let a fresh one be minted. Two expiries that had both run
+        out added up to no expiry at all.
         """
         if self.revoked or not self.activated:
             return False
-        if self.session is not None:
+        if self.live_session(now) is not None:
             return True
         return not self.expired(now)
 
@@ -146,9 +168,15 @@ class LaunchGrant:
             return "revoked"
         if not self.activated:
             return "pending"
-        session = self.session
+        session = self.live_session(now)
         if session is not None:
             return "completed" if getattr(session, "completed", False) else "opened"
+        if self.session is not None:
+            # Opened, and the session has since run out. Distinct from
+            # ``expired``, which is a button nobody ever tapped: this learner
+            # did open the exercise, and saying otherwise would misreport what
+            # happened.
+            return "closed"
         return "expired" if self.expired(now) else "waiting"
 
 
@@ -236,8 +264,16 @@ class GrantStore:
         and has to say so rather than report success.
         """
         with self._lock:
+            now = float(self._clock())
             grant = self._grants.get(str(launch_id))
             if grant is None or grant.revoked:
+                return False
+            if grant.expired(now):
+                # The button's window closed while the message was in flight.
+                # Activating anyway produced the worst possible pair of facts:
+                # a launch reported as open, and a button that admits nobody.
+                # Refusing here makes the caller report what is true — it could
+                # not be committed — and roll the grant back.
                 return False
             grant.activated = True
             return True
@@ -434,12 +470,16 @@ class GrantStore:
         of them travels: an agent is told how far somebody got, never what they
         said.
         """
-        session = grant.session
+        # The live one, so progress stops being reported the moment the
+        # session it came from stops existing. A retired session kept answering
+        # "position 3 of 10" indefinitely, which is a learner's activity
+        # outliving the thing that was supposed to bound it.
+        session = grant.live_session(now)
         return {
             "launch_id": grant.launch_id,
             "generation": grant.generation,
             "state": grant.state(now),
-            "opened": session is not None,
+            "opened": grant.session is not None,
             "expires_in_seconds": max(0.0, grant.expires_at - now),
             "position": int(getattr(session, "position", 0) or 0),
             "component_count": int(getattr(session, "component_count", 0) or 0),

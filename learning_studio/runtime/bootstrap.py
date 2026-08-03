@@ -44,6 +44,8 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -93,8 +95,59 @@ def runtime_python() -> Path:
 
     A POSIX layout, because :mod:`learning_studio.runtime.ownership` already
     refuses to manage processes anywhere else.
+
+    This is the *name*. Anything that is about to execute it calls
+    :func:`verified_runtime_python`, which is the one that proves the name
+    leads where it should.
     """
     return venv_dir() / "bin" / "python"
+
+
+def verified_runtime_python() -> Path:
+    """The interpreter, with every component proved not to be a link.
+
+    This is the one path in the package where following a symbolic link
+    changes *what code runs*. Checking the final file with ``is_file()`` and
+    then handing the string to a spawner checked nothing useful: a link at
+    ``venv``, at ``venv/bin``, or at the interpreter itself redirected the
+    execution somewhere the profile does not control, and the check would still
+    have passed. A planted link pointing outside managed storage was accepted.
+
+    So each component is opened ``O_NOFOLLOW`` relative to the descriptor for
+    the one above it — ``runtime`` → ``venv`` → ``bin`` → ``python`` — which is
+    a single resolution with no name lookup left to race. The interpreter must
+    also be a regular file this user can execute.
+
+    **What this does not claim.** A swap in the instant between this check and
+    the ``exec`` is not prevented, and cannot be by any amount of path
+    handling: anybody able to do that is able to write inside the profile's own
+    storage directory, and can simply rewrite the interpreter's *contents*
+    instead. The boundary here is a link planted from outside that directory,
+    which is the one this closes.
+    """
+    from .state import ContainmentError, managed_dir, open_managed
+
+    with managed_dir() as runtime:
+        venv = open_managed(VENV_DIRNAME, os.O_RDONLY | _O_DIRECTORY, dir_fd=runtime)
+        try:
+            binaries = open_managed("bin", os.O_RDONLY | _O_DIRECTORY, dir_fd=venv)
+        except OSError as exc:
+            os.close(venv)
+            raise ContainmentError("the Learning Studio runtime environment is incomplete") from exc
+        try:
+            interpreter = open_managed("python", os.O_RDONLY, dir_fd=binaries)
+            try:
+                info = os.fstat(interpreter)
+                if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+                    raise ContainmentError(
+                        "the Learning Studio runtime interpreter is not an executable file"
+                    )
+            finally:
+                os.close(interpreter)
+        finally:
+            os.close(binaries)
+            os.close(venv)
+    return runtime_python()
 
 
 def requirements_digest() -> str:
@@ -108,6 +161,11 @@ def _expected_stamp() -> dict[str, str]:
     }
 
 
+#: ``O_DIRECTORY`` where the platform has it, so a file where a directory
+#: belongs is refused by the kernel rather than by a later, vaguer error.
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+
 def is_bootstrapped() -> bool:
     """True when a usable environment for *these* requirements already exists.
 
@@ -116,7 +174,11 @@ def is_bootstrapped() -> bool:
     different requirements, and reporting it as current is how an operator ends
     up debugging a version they already upgraded.
     """
-    if not runtime_python().is_file():
+    from .state import ContainmentError
+
+    try:
+        verified_runtime_python()
+    except (OSError, ContainmentError):
         return False
     raw = read_managed(STAMP_FILENAME, max_bytes=MAX_STAMP_BYTES)
     if raw is None:

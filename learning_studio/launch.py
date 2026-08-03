@@ -294,22 +294,35 @@ def _launch_within(
             raise exc
         raise _MayHaveBeenSent(exc) from None
 
-    # Delivered. Commit: the grant starts admitting its learner, and then the
-    # reservation on the learner's message becomes a spend.
+    # ── Past this line a message exists in the learner's chat. ──────────
     #
-    # An interruption between the two leaves an active launch and a message
-    # that is still *reserved* — which is the safe residue, because a
-    # reservation blocks a second launch exactly as a spend does. It is
-    # released only on a path that proved nothing was sent, and this is not
-    # one.
-    if not _activate(handle, launch_id):
-        with _suppressed("revoking a grant that could not be committed"):
-            _revoke(handle, launch_id)
-        raise _MayHaveBeenSent(
-            RuntimeUnavailable(DELIVERY_INDETERMINATE, reason="commit_indeterminate")
-        )
+    # Nothing below may hand the claim on their sentence back, whatever goes
+    # wrong, because every path here is one where a button has already been
+    # delivered. So the whole region is wrapped: any failure at all leaves as
+    # `_MayHaveBeenSent`, rather than only the failures somebody remembered to
+    # mark. The previous version marked two of them and let a third — an
+    # exception out of `commit` itself — fall through to the release, which
+    # allowed a retry to send and activate a second button.
+    try:
+        # Commit, in two steps: the grant starts admitting its learner, and
+        # then the reservation on their message becomes a spend.
+        if not _activate(handle, launch_id):
+            with _suppressed("revoking a grant that could not be committed"):
+                _revoke(handle, launch_id)
+            raise RuntimeUnavailable(DELIVERY_INDETERMINATE, reason="commit_indeterminate")
 
-    consent_policy.commit(decision, store=evidence)
+        # The **return value matters.** False means this call no longer held
+        # the reservation it was about to spend — somebody else resolved it —
+        # so the launch is not in the state a success describes. It used to be
+        # discarded, and the caller was told the exercise was open.
+        if not consent_policy.commit(decision, store=evidence):
+            with _suppressed("revoking a launch whose consent could not be spent"):
+                _revoke(handle, launch_id)
+            raise RuntimeUnavailable(DELIVERY_INDETERMINATE, reason="consent_commit_lost")
+    except _MayHaveBeenSent:
+        raise
+    except BaseException as exc:
+        raise _MayHaveBeenSent(exc) from None
 
     return _result(
         experience=experience, granted=granted, decision=decision, delivered=True, reused=False

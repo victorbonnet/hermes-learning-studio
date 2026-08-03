@@ -380,7 +380,7 @@ def _escalate(
 
     try:
         for sig, method in ((signal.SIGTERM, "sigterm"), (signal.SIGKILL, "sigkill")):
-            if not handle.signal_group(sig, record):
+            if not handle.signal_runtime(sig, record):
                 return StopOutcome(
                     result="stopped" if not owned(record) else "unprovable", method=method
                 )
@@ -407,56 +407,44 @@ class ProcessHandle:
         self._pid = pid
         self._fd = fd
 
-    def signal_group(self, sig: int, record: RuntimeRecord) -> bool:
-        """Deliver to the runtime's process group, re-proving first.
+    def signal_runtime(self, sig: int, record: RuntimeRecord) -> bool:
+        """Deliver to the runtime, through the descriptor that pins it.
 
-        The group rather than the process alone, because the runtime has a
-        tunnel child and stopping only the leader would leave a public address
-        being served by an orphan.
+        **Only through the descriptor.** There is no ``killpg`` here and no pid
+        passed to anything, which is the point: a process group is named by a
+        number, and a number can be reused between the moment a leader exits
+        and the moment the signal is delivered. Holding a pidfd narrowed that
+        window without closing it, because the pidfd was never the thing doing
+        the signalling.
 
-        **The leader is signalled through the descriptor, and the group only
-        afterwards.** That order is the whole safety argument, and the previous
-        version did not have it: it checked ``getpgid`` and then called
-        ``killpg`` on a *number*, so a runtime that exited in between handed
-        that number — and the signal — to whatever the kernel gave it to next.
-        Holding a pidfd made the race narrower without closing it, because the
-        pidfd was never the thing used to signal.
+        What the group kill used to buy was reaching ``cloudflared``, which
+        shared the runtime's group. It no longer does — the tunnel is started
+        in its own session so the runtime can end it and its descendants
+        without ending itself — so the runtime's group now contains the runtime
+        and nothing else, and signalling it by number bought a race in exchange
+        for nothing.
 
-        Now:
-
-        1. ``pidfd_send_signal`` delivers to the pinned process. The descriptor
-           *is* the identity, so there is no number for anything to recycle,
-           and a leader that has already gone raises ``ProcessLookupError``
-           rather than reaching a stranger.
-        2. Only because step 1 succeeded is the group id then usable: the
-           kernel does not reuse a pid while the process it names still exists,
-           even as a zombie, so ``self._pid`` still names this runtime's group
-           and nobody else's.
-
-        A failure at step 1 returns False without step 2 ever running.
+        The cost is stated rather than hidden: if a runtime has to be killed
+        *because it is wedged*, its tunnel is not reached by this call, and
+        :func:`stop_owned` reports that the public address could not be
+        confirmed closed. A ``cloudflared`` in that state proxies to an origin
+        that is gone, so it serves errors rather than anybody's work — but it
+        is a hostname that has not been withdrawn, and saying so is better than
+        a cleanup path that signals numbers to make the report look tidy.
         """
         if not owned(record, timeout=1.0):
             return False
         try:
-            if os.getpgid(self._pid) != self._pid:
-                logger.warning("refusing to signal runtime: process group is not its own")
-                return False
-            # (1) The pinned leader, by descriptor. Race-free by construction.
-            os.pidfd_send_signal(self._fd, sig)  # type: ignore[attr-defined]
+            # `signal.pidfd_send_signal`, not `os.` — CPython puts `pidfd_open`
+            # in `os` and `pidfd_send_signal` in `signal`. Probing the wrong
+            # module is not an error anybody sees: `hasattr` simply answers
+            # False for ever, which turns "escalate when a runtime wedges" into
+            # "never escalate" on the one platform that can. There is a test
+            # that asserts the attribute lives where this expects it.
+            signal.pidfd_send_signal(self._fd, sig)  # type: ignore[attr-defined]
         except (OSError, PermissionError) as exc:
             logger.warning("could not signal the runtime process: %s", type(exc).__name__)
             return False
-
-        try:
-            # (2) Its descendants. Reachable only by number — there is no
-            # descriptor for a process group — but the number is safe to use
-            # here, and only here, because the leader was alive a moment ago.
-            os.killpg(self._pid, sig)
-        except (OSError, PermissionError) as exc:
-            # The leader has the signal either way, so this is not a failure to
-            # signal the runtime; it is a failure to reach the rest of a group
-            # that may already be empty.
-            logger.debug("could not signal the runtime process group: %s", type(exc).__name__)
         return True
 
     def close(self) -> None:
@@ -476,11 +464,11 @@ def handle_supported() -> bool:
     """
     return (
         hasattr(os, "pidfd_open")
-        # The one that actually delivers. Without it a handle could pin an
-        # identity and then have no way to use it, which is how signalling a
-        # number crept back in the first time.
-        and hasattr(os, "pidfd_send_signal")
-        and hasattr(os, "killpg")
+        # The one that actually delivers, and it lives in `signal` rather than
+        # `os`. Probing the wrong module is not an error anybody sees — it just
+        # answers False forever, which turns "escalate when a runtime wedges"
+        # into "never escalate" on the one platform that can.
+        and hasattr(signal, "pidfd_send_signal")
     )
 
 

@@ -60,7 +60,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
+import signal
 import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -297,14 +299,11 @@ class QuickTunnel:
         if process is None:
             return
 
-        with contextlib.suppress(ProcessLookupError, OSError):
-            if getattr(process, "returncode", None) is None:
-                process.terminate()
+        _signal_group(process, signal.SIGTERM)
         if await _reaped(process, grace_seconds):
             return
 
-        with contextlib.suppress(ProcessLookupError, OSError):
-            process.kill()
+        _signal_group(process, signal.SIGKILL)
         if not await _reaped(process, grace_seconds):
             # Reported rather than hidden: the caller has to be able to say
             # "the address may still be open" instead of claiming it is closed.
@@ -334,12 +333,39 @@ class QuickTunnel:
             self.state = "stopped"
         if process is None:
             return
-        with contextlib.suppress(ProcessLookupError, OSError):
-            if getattr(process, "returncode", None) is None:
-                process.terminate()
-        with contextlib.suppress(ProcessLookupError, OSError):
-            if getattr(process, "returncode", None) is None:
-                process.kill()
+        _signal_group(process, signal.SIGTERM)
+        _signal_group(process, signal.SIGKILL)
+
+
+def _signal_group(process, sig: int) -> None:
+    """Signal the tunnel's whole process group, falling back to the leader.
+
+    The **group**, because ``cloudflared`` may have started things of its own
+    and killing only the leader left them running — still holding whatever the
+    leader was holding, with nothing left that knows they exist.
+
+    Signalling a group takes a number, and a number is safe here for a reason
+    that does not generalise: this process is the tunnel's parent and has not
+    reaped it, so the kernel cannot reuse that pid, and the group it leads is
+    its own because it was started with ``start_new_session``. Both conditions
+    are checked rather than assumed — if the process has already been reaped,
+    or does not lead its own group, only the leader is signalled.
+    """
+    if getattr(process, "returncode", None) is not None:
+        return
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0 and hasattr(os, "killpg"):
+        try:
+            if os.getpgid(pid) == pid:
+                os.killpg(pid, sig)
+                return
+        except (ProcessLookupError, OSError):
+            return
+    with contextlib.suppress(ProcessLookupError, OSError):
+        if sig == signal.SIGKILL:
+            process.kill()
+        else:
+            process.terminate()
 
 
 async def _reaped(process, timeout: float) -> bool:
@@ -432,6 +458,13 @@ async def _spawn(argv: list[str], environment: dict[str, str]):
     ``create_subprocess_exec`` rather than ``create_subprocess_shell``: there is
     no shell anywhere in this package, so there is no string for one to
     reinterpret and no quoting to get wrong.
+
+    ``start_new_session=True`` so the tunnel **leads its own process group**.
+    That is what makes it possible to end it and everything it started: killing
+    the process alone left its descendants running, and a wrapper script's
+    child kept serving after the tunnel it belonged to was gone. The runtime
+    cannot group-kill a tunnel that shares its own group without killing
+    itself, so the tunnel needs a group of its own to be killable at all.
     """
     return await asyncio.create_subprocess_exec(
         *argv,
@@ -440,7 +473,7 @@ async def _spawn(argv: list[str], environment: dict[str, str]):
         stderr=asyncio.subprocess.STDOUT,
         env=environment,
         limit=MAX_LINE_BYTES,
-        start_new_session=False,
+        start_new_session=True,
     )
 
 

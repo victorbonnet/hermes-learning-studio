@@ -72,6 +72,16 @@ TOMBSTONE_TTL_SECONDS = EVIDENCE_TTL_SECONDS * 3
 MAX_ENTRIES = 64
 MAX_TOMBSTONES = 512
 
+#: Conversations for which the highest consumed message id is remembered.
+#:
+#: A tombstone names one message and the table holding them is bounded, so an
+#: old enough tombstone is evicted — and a redelivery of that same Telegram
+#: update then looked like a message nobody had used. A watermark is one
+#: integer per conversation rather than one entry per message, so it survives
+#: the traffic that evicts tombstones and answers the same question for every
+#: message below it at once.
+MAX_WATERMARKS = 4096
+
 #: Longest message text retained. A learner's request is a sentence; anything
 #: past this is truncated before it is stored, because the only thing it is
 #: used for is checking whether a short quotation appears in it.
@@ -84,6 +94,23 @@ MAX_TEXT_CHARS = 4000
 MIN_MATCH_CHARS = 4
 
 _WHITESPACE = re.compile(r"\s+")
+
+
+def _ordinal(message_id: str) -> int | None:
+    """A message id as a comparable position, or ``None`` if it is not one.
+
+    Telegram numbers messages upwards within a conversation, which is what
+    lets one integer stand for every message before it. Anything that is not a
+    plain non-negative integer has no such order and is not treated as though
+    it did.
+    """
+    text = str(message_id or "").strip()
+    if not text.isdigit():
+        return None
+    try:
+        return int(text)
+    except ValueError:  # pragma: no cover - `isdigit` already excludes this
+        return None
 
 
 def normalise(text: object) -> str:
@@ -158,6 +185,8 @@ class EvidenceStore:
         #: Claimed but not yet resolved. Held for the length of one launch
         #: transaction, and never handed to a second caller.
         self._reserved: dict[EvidenceKey, float] = {}
+        #: ``conversation -> (highest consumed message ordinal, when)``.
+        self._watermarks: dict[tuple, tuple[int, float]] = {}
 
     def __len__(self) -> int:
         with self._lock:
@@ -179,6 +208,12 @@ class EvidenceStore:
                 # A message id this store has already spent — or is in the
                 # middle of spending — must not be re-armed by a second
                 # delivery of the same update.
+                return
+            if self._below_watermark(key):
+                # Older than something already consumed in this conversation.
+                # The tombstone for it may be long gone — that table is bounded
+                # and evicts by age — and without this a redelivered update
+                # from before the eviction became trusted evidence again.
                 return
             self._entries[key] = _Entry(text=cleaned, captured_at=now)
             while len(self._entries) > self._max:
@@ -205,10 +240,13 @@ class EvidenceStore:
         now = float(self._clock())
         with self._lock:
             self._purge(now)
-            if key in self._spent or key in self._reserved:
+            if key in self._spent or key in self._reserved or self._below_watermark(key):
                 # A reservation reads as spent to everybody except the holder.
                 # It may become free again if that launch gives up, but until
-                # then nobody else may act on it.
+                # then nobody else may act on it. Below the watermark reads the
+                # same way, and says the accurate thing — "already used" rather
+                # than "nobody said that" — for a message whose tombstone has
+                # since been evicted.
                 return "spent"
             entry = self._entries.get(key)
             if entry is None:
@@ -239,7 +277,7 @@ class EvidenceStore:
         now = float(self._clock())
         with self._lock:
             self._purge(now)
-            if key in self._spent or key in self._reserved:
+            if key in self._spent or key in self._reserved or self._below_watermark(key):
                 return False
             if key not in self._entries:
                 return False
@@ -258,6 +296,7 @@ class EvidenceStore:
             while len(self._spent) > MAX_TOMBSTONES:
                 oldest = min(self._spent, key=lambda k: self._spent[k])
                 del self._spent[oldest]
+            self._raise_watermark(key, now)
             return True
 
     def release(self, key: EvidenceKey) -> bool:
@@ -294,11 +333,46 @@ class EvidenceStore:
         for key in [k for k, at in self._reserved.items() if now - at > self._tombstone_ttl]:
             del self._reserved[key]
 
+    # -- the watermark ---------------------------------------------------
+
+    def _conversation(self, key: EvidenceKey) -> tuple:
+        return (key.profile, key.platform, key.chat_id, key.thread_id, key.user_id)
+
+    def _raise_watermark(self, key: EvidenceKey, now: float) -> None:
+        """Remember that everything up to this message has been consumed.
+
+        Telegram numbers the messages in a conversation upwards, so one integer
+        stands in for every tombstone below it — which is what makes this
+        survive the eviction that bounded the tombstones. The caller holds the
+        lock.
+        """
+        ordinal = _ordinal(key.message_id)
+        if ordinal is None:
+            # A platform whose message ids are not ordered. Nothing can be
+            # inferred about "older", so this conversation relies on the
+            # tombstone table alone, and does not take a slot here.
+            return
+        conversation = self._conversation(key)
+        highest, _ = self._watermarks.get(conversation, (0, 0.0))
+        self._watermarks[conversation] = (max(highest, ordinal), now)
+        while len(self._watermarks) > MAX_WATERMARKS:
+            oldest = min(self._watermarks, key=lambda c: self._watermarks[c][1])
+            del self._watermarks[oldest]
+
+    def _below_watermark(self, key: EvidenceKey) -> bool:
+        """Whether this message is at or below one already consumed here."""
+        ordinal = _ordinal(key.message_id)
+        if ordinal is None:
+            return False
+        highest, _ = self._watermarks.get(self._conversation(key), (0, 0.0))
+        return bool(highest) and ordinal <= highest
+
     def clear(self) -> None:
         """Forget everything. For tests, and for a deliberate shutdown."""
         with self._lock:
             self._entries.clear()
             self._spent.clear()
+            self._watermarks.clear()
             self._reserved.clear()
 
 
@@ -329,6 +403,50 @@ def current_key(profile: str) -> EvidenceKey:
     )
 
 
+def _could_ever_authorise(source, platform: str) -> bool:
+    """Whether a message from here could authorise a launch at all.
+
+    The store is small and bounded on purpose — it holds one turn's worth of
+    what people said, not a history — and until now it recorded *everything*
+    the gateway saw. A busy group on another platform, or somebody who is not
+    on the allowlist, filled it with messages that no launch could ever have
+    used, and each one evicted a message that could: a learner's "yes" in a DM
+    could be pushed out by strangers talking in a room the learner is not in.
+
+    So the filter is exactly the set of launches that can happen. A launch goes
+    to a Telegram direct message, from an allowlisted account, and nowhere
+    else; anything else is not evidence for anything and is not kept.
+
+    Fail closed twice over. An unreadable chat type is refused rather than
+    assumed private, and an allowlist that cannot be computed authorises
+    nobody — the same rule the launch path itself applies.
+    """
+    from .destination import PRIVATE_CHAT_TYPES
+
+    if platform.lower() != "telegram":
+        return False
+
+    chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+    if chat_type not in PRIVATE_CHAT_TYPES:
+        # Absent counts as unrecognised. A group message that simply did not
+        # carry its type must not be stored as though it were a DM.
+        return False
+
+    user_id = str(getattr(source, "user_id", "") or "").strip()
+    try:
+        from .authorization import effective_allowed_users, is_authorized
+        from .config import load_config, load_raw_config
+
+        allowed = effective_allowed_users(
+            plugin_restriction=load_config().mini_app_allowed_telegram_users,
+            host_config=load_raw_config(),
+        )
+    except Exception as exc:
+        logger.debug("consent evidence not captured: %s", type(exc).__name__)
+        return False
+    return is_authorized(user_id, allowed)
+
+
 def capture_message_evidence(event=None, gateway=None, session_store=None, **_kwargs) -> None:
     """``pre_gateway_dispatch``: record the incoming message, and nothing else.
 
@@ -351,6 +469,9 @@ def capture_message_evidence(event=None, gateway=None, session_store=None, **_kw
         platform = getattr(getattr(source, "platform", None), "value", None) or str(
             getattr(source, "platform", "") or ""
         )
+        if not _could_ever_authorise(source, str(platform).strip()):
+            return None
+
         from .paths import profile_id
 
         key = EvidenceKey(

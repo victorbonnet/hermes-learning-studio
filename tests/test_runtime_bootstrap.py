@@ -42,6 +42,7 @@ class FakeRunner:
             python = bootstrap.runtime_python()
             python.parent.mkdir(parents=True, exist_ok=True)
             python.write_text("#!/bin/sh\n", encoding="utf-8")
+            python.chmod(0o755)
         return subprocess.CompletedProcess(
             command, code, stdout="installed\n", stderr="" if code == 0 else self.stderr
         )

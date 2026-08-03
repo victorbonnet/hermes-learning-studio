@@ -122,6 +122,7 @@ def interpreter(hermes_home: Path) -> Path:
     path = bootstrap.runtime_python()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(0o755)
     return path
 
 
@@ -809,3 +810,161 @@ def test_the_runtime_entry_point_clears_an_inherited_signal_mask():
 
     assert probe.returncode == 0, probe.stderr
     assert probe.stdout.strip() == "[]"
+
+
+def test_a_signal_nobody_thought_of_cannot_interrupt_the_spawn(hermes_home, interpreter):
+    """The chosen-four version defended against Ctrl-C and left the rest.
+
+    Any signal with a Python handler can raise out of that handler, and the
+    handler may raise anything. ``SIGALRM`` from an unrelated timeout is the
+    easy one to demonstrate; ``SIGUSR1`` from an operator's script is the same
+    bug. All of them land in the one-instruction window between ``popen``
+    returning and the reference being stored, and leak the same runtime.
+    """
+    import signal
+
+    fired: list[str] = []
+
+    def handler(signum, frame):
+        fired.append("alarm")
+        raise KeyboardInterrupt("an unrelated timeout")
+
+    stopped: list = []
+    real_terminate = supervisor._terminate_held_child
+
+    def watching(child, graceful_seconds):
+        stopped.append(child)
+        return real_terminate(child, graceful_seconds)
+
+    previous = signal.signal(signal.SIGALRM, handler)
+    original = supervisor._terminate_held_child
+    supervisor._terminate_held_child = watching
+    try:
+
+        class Alarming(FakePopen):
+            def __call__(self, command, **kwargs):
+                child = super().__call__(command, **kwargs)
+                # Raised inside the spawn region, exactly where the reference
+                # has not been stored yet. Deferred, so it arrives after.
+                signal.raise_signal(signal.SIGALRM)
+                self.deferred = not fired
+                return child
+
+        popen = Alarming(publishes=45999)
+        with pytest.raises(BaseException) as caught:
+            supervisor.ensure_running(config(), python=interpreter, popen=popen)
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+        supervisor._terminate_held_child = original
+
+    assert popen.deferred is True, "the handler ran inside the spawn region"
+    assert fired == ["alarm"], "the signal was swallowed rather than deferred"
+    assert isinstance(caught.value, (KeyboardInterrupt, RuntimeUnavailable))
+    # It arrived late, so the rollback had a child to hand to the cleanup owner
+    # rather than a `None` it could do nothing with.
+    assert stopped == [popen.child], "the runtime was left with nothing holding it"
+    assert state.read_record() is None
+
+
+# ── A stop that could not close the tunnel says so ────────────────────────
+
+
+def test_a_runtime_that_left_a_tunnel_running_is_not_reported_as_stopped(
+    hermes_home, monkeypatch, clock=None
+):
+    """The exit code reaches a parent; a runtime that outlives Hermes has none.
+
+    The runtime exits 4 when it cannot confirm its tunnel is gone, and that is
+    the right thing for it to do — but nobody is waiting on it. The supervisor
+    watched the control endpoint go quiet and called that a clean stop, which
+    is precisely the claim that must not be made about an address nobody could
+    confirm was closed. So the runtime also leaves a marker, and this is what
+    reads it.
+    """
+    from learning_studio.runtime import server as runtime_server
+    from learning_studio.runtime.state import managed_path
+
+    record = _record_for(hermes_home)
+    runtime_server.write_handshake(
+        managed_path(f"residue-{record.runtime_id}.json"),
+        {"runtime_id": record.runtime_id, "generation": 1, "reason": "x"},
+    )
+    monkeypatch.setattr(ownership, "_request", _stopping(record))
+
+    outcome = supervisor.stop(config())
+
+    assert outcome["state"] == "tunnel_indeterminate"
+    assert outcome["stopped"] is False
+
+    # Consumed, so the *next* stop reports the truth about the next runtime
+    # rather than repeating this one's problem for ever.
+    state.write_record(record)
+    monkeypatch.setattr(ownership, "_request", _stopping(record))
+    assert supervisor.stop(config())["state"] == "stopped"
+
+
+def test_a_runtime_that_had_to_be_signalled_never_confirms_its_tunnel(hermes_home, monkeypatch):
+    """Escalation reaches the runtime, not its tunnel — they are separate sessions.
+
+    That separation is what lets a healthy runtime end its tunnel and every
+    descendant of it. The cost lands here: a runtime killed *because it was
+    wedged* never ran its own teardown, so nothing closed the address, and the
+    stop says so rather than rounding up to success.
+    """
+    record = _record_for(hermes_home)
+    monkeypatch.setattr(ownership, "_request", _stopping(record))
+    monkeypatch.setattr(
+        ownership,
+        "stop_owned",
+        lambda *a, **k: ownership.StopOutcome(result="stopped", method="sigkill"),
+    )
+
+    outcome = supervisor.stop(config())
+
+    assert outcome["state"] == "tunnel_indeterminate"
+    assert outcome["stopped"] is False
+
+
+def _record_for(hermes_home) -> state.RuntimeRecord:
+    record = state.RuntimeRecord(
+        runtime_id="runtime-residue",
+        generation=1,
+        profile="default",
+        pid=4242,
+        host="127.0.0.1",
+        port=45678,
+        control_token="token",
+        executable="/x/python",
+        started_at=0.0,
+        idle_timeout_seconds=60,
+        max_lifetime_seconds=300,
+    )
+    state.write_record(record)
+    return record
+
+
+def _stopping(record):
+    gone = {"value": False}
+
+    def request(rec, method, path, *, body=None, timeout=None):
+        if path == ownership.SHUTDOWN_PATH:
+            gone["value"] = True
+            return {}
+        if gone["value"]:
+            raise ownership.ControlError("control_unreachable_OSError")
+        return {
+            "runtime_id": record.runtime_id,
+            "generation": record.generation,
+            "pid": record.pid,
+            "executable": record.executable,
+            "started_at": 0.0,
+            "idle_seconds": None,
+            "server_state": "ready",
+            "tunnel_state": "ready",
+            "tunnel_ready": True,
+            "tunnel_url": "https://calm-forest-1234.trycloudflare.com",
+            "sessions": 0,
+            "expires_in_seconds": 300,
+        }
+
+    return request

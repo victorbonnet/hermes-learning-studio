@@ -156,6 +156,7 @@ def runtime(clock, monkeypatch, hermes_home) -> FakeRuntime:
     python = bootstrap.runtime_python()
     python.parent.mkdir(parents=True, exist_ok=True)
     python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
     monkeypatch.setattr(bootstrap, "is_bootstrapped", lambda: True)
     monkeypatch.setattr(supervisor, "resolve_cloudflared", lambda cfg: "/usr/bin/cloudflared")
     return fake
@@ -1068,3 +1069,140 @@ def test_two_launches_racing_on_one_message_deliver_exactly_one_button(
     assert len(refused) == 1
     assert refused[0].reason == "confirmation_already_used"
     assert len(runtime.store) == 1, "one message created two launches"
+
+
+# ── The schema must describe what the handler actually accepts ────────────
+
+
+def _schema_accepts(payload: dict) -> bool:
+    """Whether the advertised JSON Schema admits this payload."""
+    import jsonschema
+
+    from learning_studio.schemas import LAUNCH_SCHEMA
+
+    try:
+        jsonschema.validate(payload, LAUNCH_SCHEMA["parameters"])
+    except jsonschema.ValidationError:
+        return False
+    return True
+
+
+def test_a_suggestion_the_learner_did_not_confirm_is_refused_by_the_schema(
+    runtime, spoken, principal, experience_id
+):
+    """Advertised as required, then accepted as ``false``, then refused anyway.
+
+    A provider that validates before dispatch let the payload through, and the
+    refusal arrived from a place the model had been told was already satisfied.
+    The schema now says what the handler means: with ``agent_suggestion`` the
+    flag must be present *and* true.
+    """
+    payload = {
+        "experience_id": experience_id,
+        "initiation": "agent_suggestion",
+        "learner_confirmed": False,
+        "learner_quote": LEARNER_QUOTE,
+    }
+
+    assert _schema_accepts(payload) is False
+
+    with pytest.raises(ConsentRequired) as caught:
+        launch(
+            principal,
+            experience_id,
+            deliver=Deliveries(),
+            evidence=spoken,
+            initiation="agent_suggestion",
+            learner_confirmed=False,
+            learner_quote=SUGGESTION_QUOTE,
+        )
+    assert caught.value.reason == "suggestion_not_confirmed"
+
+    payload["learner_confirmed"] = True
+    assert _schema_accepts(payload) is True
+
+
+def test_a_quotation_of_nothing_but_spaces_is_refused_by_the_schema(experience_id):
+    """``"    "`` satisfied ``minLength`` and was then rejected as unusable."""
+    assert (
+        _schema_accepts(
+            {
+                "experience_id": experience_id,
+                "initiation": "learner_request",
+                "learner_quote": "      ",
+            }
+        )
+        is False
+    )
+    assert (
+        _schema_accepts(
+            {
+                "experience_id": experience_id,
+                "initiation": "learner_request",
+                "learner_quote": LEARNER_QUOTE,
+            }
+        )
+        is True
+    )
+
+
+def test_a_commit_that_raises_still_keeps_the_message_claimed(
+    runtime, spoken, principal, experience_id, monkeypatch
+):
+    """The hole the marker-by-exception approach left open.
+
+    Two failures after delivery were marked as "may have been sent"; a third —
+    an exception out of ``commit`` itself — was not, so it fell through to the
+    release and a retry could send *and activate* a second button. The whole
+    post-delivery region is wrapped now, so a new early exit is safe by
+    omission rather than by somebody remembering.
+    """
+    deliver = Deliveries()
+    real_commit = launch_module.consent_policy.commit
+    broken = {"value": True}
+
+    def commit(decision, store=None):
+        if broken["value"]:
+            raise RuntimeError("store went away")
+        return real_commit(decision, store=store)
+
+    # A flag rather than `monkeypatch.undo()`: undo rolls back *everything*,
+    # including the fixtures that built this profile's storage.
+    monkeypatch.setattr(launch_module.consent_policy, "commit", commit)
+
+    with pytest.raises(RuntimeError):
+        launch(principal, experience_id, deliver=deliver, evidence=spoken)
+
+    broken["value"] = False
+
+    # The grant is then lost — a runtime restart, an expiry, a revocation.
+    # This is what makes the test discriminating: while a grant survives, the
+    # store reuses it and no second button goes out whatever consent thinks.
+    # With it gone, only the claim on the learner's message stands between a
+    # retry and a second delivery.
+    for launch_id in list(runtime.store._grants):
+        runtime.store.revoke(launch_id)
+
+    second = Deliveries()
+    with pytest.raises(ConsentRequired) as caught:
+        launch(principal, experience_id, deliver=second, evidence=spoken)
+
+    assert caught.value.reason == "confirmation_already_used"
+    assert second.sent == [], "a retry sent and activated a second button"
+    assert len(deliver.sent) == 1
+
+
+def test_a_commit_that_returns_false_is_not_reported_as_success(
+    runtime, spoken, principal, experience_id, monkeypatch
+):
+    """False means this call no longer held the reservation it was spending.
+
+    The return value was discarded, so the caller was told the exercise was
+    open while consent had never been spent for it.
+    """
+    monkeypatch.setattr(launch_module.consent_policy, "commit", lambda decision, store=None: False)
+
+    with pytest.raises(RuntimeUnavailable) as caught:
+        launch(principal, experience_id, deliver=Deliveries(), evidence=spoken)
+
+    assert caught.value.reason == "consent_commit_lost"

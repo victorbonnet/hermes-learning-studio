@@ -591,7 +591,16 @@ LAUNCH_SCHEMA: dict[str, Any] = {
                     "properties": {"initiation": {"const": "agent_suggestion"}},
                     "required": ["initiation"],
                 },
-                "then": {"required": ["learner_confirmed"]},
+                # `const: True`, not merely "present". Advertising that the
+                # field is required while accepting `false` for it made the
+                # schema describe a payload the handler refuses: a provider
+                # that validated before dispatch let it through, and the
+                # refusal arrived from somewhere the model had been told was
+                # already satisfied.
+                "then": {
+                    "required": ["learner_confirmed"],
+                    "properties": {"learner_confirmed": {"const": True}},
+                },
             }
         ],
         "properties": {
@@ -619,6 +628,19 @@ LAUNCH_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "minLength": MIN_QUOTE_CHARS,
                 "maxLength": MAX_QUOTE_CHARS,
+                # Length is not content: `"    "` satisfied `minLength` and
+                # was then refused as unusable, which is the same mismatch as
+                # the confirmation flag above.
+                #
+                # A *necessary* condition, not an exact one. What the handler
+                # actually requires is four characters after whitespace is
+                # collapsed, and encoding that normaliser as a regex would
+                # produce something nobody could read and that would start
+                # rejecting quotations the handler accepts — "a b c" is five
+                # characters collapsed and three otherwise. Requiring at least
+                # one non-space character removes the reported gap without
+                # inventing a stricter rule than the one being enforced.
+                "pattern": "\\S",
                 "description": (
                     "A few words copied exactly from the learner's CURRENT message - the "
                     "one you are replying to. Required for both kinds of launch. The Studio "

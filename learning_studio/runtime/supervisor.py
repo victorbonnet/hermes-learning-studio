@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import logging
 import os
 import shutil
@@ -271,9 +272,25 @@ def ensure_running(
         else:
             return RuntimeHandle(record=previous, reply=reply, started=False)
 
-    interpreter = Path(python) if python is not None else bootstrap.runtime_python()
-    if not interpreter.is_file():
-        raise _unavailable(NOT_BOOTSTRAPPED, "runtime_not_bootstrapped")
+    if python is not None:
+        # A caller-supplied interpreter, which only the tests and the bootstrap
+        # tool pass. Not resolved through the managed chain because it is not
+        # in managed storage.
+        interpreter = Path(python)
+        if not interpreter.is_file():
+            raise _unavailable(NOT_BOOTSTRAPPED, "runtime_not_bootstrapped")
+    else:
+        # The managed one, resolved with every component proved not to be a
+        # link. `is_file()` on the final name proved nothing about what would
+        # actually be executed: a link at `venv`, at `venv/bin`, or at the
+        # interpreter redirected it outside the profile's storage entirely.
+        from .state import ContainmentError
+
+        try:
+            interpreter = bootstrap.verified_runtime_python()
+        except (OSError, ContainmentError) as exc:
+            logger.warning("the runtime interpreter could not be verified: %s", type(exc).__name__)
+            raise _unavailable(NOT_BOOTSTRAPPED, "runtime_not_bootstrapped") from exc
 
     return _start(
         config,
@@ -285,9 +302,24 @@ def ensure_running(
     )
 
 
-#: Kept out of the child: `subprocess` restores an empty mask in the child when
-#: `restore_signals` is left at its default, and there is a test for that.
-_DEFERRED_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})
+def _deferrable_signals() -> set:
+    """Every signal this thread is allowed to postpone.
+
+    **Every** one, not a chosen four. The chosen-four version defended against
+    the interruptions somebody thought of — Ctrl-C, a service stop — and left
+    the rest. Any signal with a Python handler can raise out of that handler,
+    and a handler is free to raise anything: a ``SIGALRM`` from an unrelated
+    timeout, a ``SIGUSR1`` from an operator's script, a ``SIGWINCH`` handler in
+    a host that installed one. All of them land in the same one-instruction
+    window and leak the same runtime.
+
+    ``SIGKILL`` and ``SIGSTOP`` cannot be blocked and are excluded rather than
+    attempted. Nothing can defend against ``SIGKILL``, and nothing pretends to.
+    """
+    blockable = set(signal.valid_signals())
+    blockable.discard(signal.SIGKILL)
+    blockable.discard(signal.SIGSTOP)
+    return blockable
 
 
 @contextlib.contextmanager
@@ -297,10 +329,10 @@ def _interruptions_deferred():
     There is a window no ``try`` can cover: ``popen`` returns a live process
     and the interpreter has not yet performed the assignment that stores it. A
     signal delivered between those two — Ctrl-C during a launch is the ordinary
-    way to hit it — raises out of the statement with the reference already
-    dropped, and the cleanup handler below finds ``child is None`` and has
-    nothing to kill. The process keeps running, holding a port and a tunnel,
-    with nothing in the profile that names it.
+    way to hit it, but *any* signal whose Python handler raises will do —
+    unwinds with the reference already dropped, and the cleanup handler below
+    finds ``child is None`` and has nothing to kill. The process keeps running,
+    holding a port and a tunnel, with nothing in the profile that names it.
 
     Blocking the signal moves its delivery to the moment the mask is restored,
     by which time the assignment has happened and the handler can do its job.
@@ -310,7 +342,7 @@ def _interruptions_deferred():
     and it is restored in a ``finally`` — an exception from ``popen`` itself
     leaves no signals blocked.
     """
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, _DEFERRED_SIGNALS)
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, _deferrable_signals())
     try:
         yield
     finally:
@@ -535,4 +567,47 @@ def stop(config: LearningStudioConfig) -> dict[str, object]:
     outcome = ownership.stop_owned(record, graceful_seconds=config.runtime_graceful_stop_seconds)
     if outcome.result != "unprovable":
         clear_record()
-    return {"stopped": outcome.stopped, "state": outcome.result}
+
+    state = outcome.result
+    stopped = outcome.stopped
+    if stopped and _left_something_running(record):
+        # The runtime stopped and told us, on its way out, that it could not
+        # confirm its tunnel was gone. Its exit code says the same thing, and
+        # an exit code reaches only a parent — which, for a runtime that
+        # deliberately outlives the Hermes process that started it, is usually
+        # nobody. Reporting "stopped" on the strength of a control endpoint
+        # going quiet would be reporting the part we can see and dropping the
+        # part it went out of its way to tell us.
+        state = "tunnel_indeterminate"
+        stopped = False
+
+    # Escalation reaches the runtime and not its tunnel: the two are in
+    # different sessions, which is what lets the runtime end its tunnel
+    # cleanly in every case but this one. A runtime that had to be signalled
+    # never ran its own teardown, so nothing confirmed the address closed.
+    if outcome.method in ("sigterm", "sigkill"):
+        state = "tunnel_indeterminate"
+        stopped = False
+
+    return {"stopped": stopped, "state": state}
+
+
+def _left_something_running(record: RuntimeRecord) -> bool:
+    """Whether the runtime published a residue marker on its way out.
+
+    Consumed as it is read: the fact is about the run that just ended, and a
+    marker left lying around would make every later stop report a problem that
+    has already been reported.
+    """
+    from .state import MAX_HANDSHAKE_BYTES, read_managed, remove_managed
+
+    name = f"residue-{record.runtime_id}.json"
+    raw = read_managed(name, max_bytes=MAX_HANDSHAKE_BYTES)
+    remove_managed(name)
+    if raw is None:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("runtime_id") == record.runtime_id

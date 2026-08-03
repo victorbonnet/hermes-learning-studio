@@ -363,6 +363,16 @@ def _is_loopback(host: str) -> bool:
 # ── Serving ───────────────────────────────────────────────────────────────
 
 
+def residue_path(handshake: Path, runtime_id: str) -> Path:
+    """Where a runtime says it left something running.
+
+    Beside the handshake, named after the same runtime id, so the supervisor
+    can find it without being told and two runtimes cannot overwrite each
+    other's.
+    """
+    return handshake.parent / f"residue-{runtime_id}.json"
+
+
 def write_handshake(path: Path, payload: dict[str, Any]) -> None:
     """Publish the port, atomically and owner-only.
 
@@ -612,6 +622,24 @@ async def _shutdown(state: RuntimeState, server, serving, settings: RuntimeSetti
 
     with contextlib.suppress(OSError):
         os.unlink(settings.handshake_path)
+
+    if not closed:
+        # Left behind on purpose, for the supervisor to find. The exit code
+        # says "the address may still be open", and an exit code only reaches
+        # whoever is the parent — which, for a runtime that outlives the Hermes
+        # process that started it, is usually nobody. Without this the next
+        # `learning_studio_stop` watched the control endpoint go quiet and
+        # reported a clean stop, which is the one thing that must not be said
+        # about a tunnel nobody could confirm was closed.
+        with contextlib.suppress(Exception):
+            write_handshake(
+                residue_path(settings.handshake_path, settings.runtime_id),
+                {
+                    "runtime_id": settings.runtime_id,
+                    "generation": settings.generation,
+                    "reason": "tunnel_cleanup_indeterminate",
+                },
+            )
 
     return closed
 

@@ -362,3 +362,61 @@ def test_a_concurrent_revocation_and_admission_never_both_win(store, sessions):
     # Whichever order the lock granted, a revoked launch holds no live session.
     assert store.admit(launch_id=grant.launch_id, telegram_user_id="1001") is None
     assert grant.session is None or grant.session.expires_at <= 0
+
+
+# ── Two expiries that both ran out must not add up to no expiry ───────────
+
+
+def test_a_grant_whose_window_closed_cannot_be_activated(store, clock):
+    """A button that arrives after its own window is not a launch.
+
+    Activating anyway produced the worst pair of facts available: a launch
+    reported open, and an entrance that admits nobody. The caller now learns it
+    could not be committed and rolls back.
+    """
+    created = store.create(
+        {"telegram_user_id": "1001", "learner_id": "learner-1001", "experience_id": "exp-1"}
+    )
+
+    clock.advance(grants_module.DEFAULT_GRANT_TTL_SECONDS + 1)
+
+    assert store.activate(created["launch_id"]) is False
+    assert store.admit(launch_id=created["launch_id"], telegram_user_id="1001") is None
+
+
+def test_an_expired_session_does_not_keep_a_grant_alive_for_ever(store, sessions, clock):
+    """A pointer to a session is not a session.
+
+    Retirement sets an expiry; it does not clear the field. So "has a session?"
+    answered yes for ever, and a launch that had been opened once stayed
+    admissible past its own window *and* past the session's — long enough to
+    mint a brand new one.
+    """
+    grant = granted(store)
+    open_session(store, sessions, grant)
+
+    clock.advance(grants_module.DEFAULT_GRANT_TTL_SECONDS + 1)
+    clock.advance(sessions._ttl + 1)
+
+    assert grant.session is not None, "the pointer is still there; that is the point"
+    assert grant.admissible(clock()) is False
+    assert store.admit(launch_id=grant.launch_id, telegram_user_id="1001") is None
+    assert open_session(store, sessions, grant) is None
+
+
+def test_progress_stops_being_reported_when_the_session_runs_out(store, sessions, clock):
+    """A learner's position must not outlive the thing that bounds it."""
+    grant = granted(store)
+    open_session(store, sessions, grant)
+    grant.session.position = 3
+
+    live = store.progress({"telegram_user_id": "1001", "experience_id": "exp-1"})
+    assert live["position"] == 3
+    assert live["state"] == "opened"
+
+    clock.advance(sessions._ttl + 1)
+
+    after = store.progress({"telegram_user_id": "1001", "experience_id": "exp-1"})
+    assert after["position"] == 0
+    assert after["answered"] == 0
+    assert after["state"] == "closed"

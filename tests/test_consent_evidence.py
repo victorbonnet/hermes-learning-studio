@@ -326,13 +326,79 @@ class Event:
     message_id: str | None = "555"
 
 
-def test_the_hook_records_an_incoming_message(hermes_home, monkeypatch):
+@pytest.fixture
+def allowlisted(monkeypatch):
+    """The learner in :class:`Source` is allowed to use the Studio."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "1001,2002")
+
+
+def test_the_hook_records_an_incoming_message(hermes_home, allowlisted, monkeypatch):
     from learning_studio import evidence as evidence_module
 
     store = EvidenceStore()
     monkeypatch.setattr(evidence_module, "STORE", store)
 
     assert capture_message_evidence(event=Event("quiz me on photosynthesis", Source())) is None
+    assert store.state(key(), "quiz me on photosynthesis") == "matched"
+
+
+# ── Only what could ever authorise a launch is kept ───────────────────────
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        Source(platform="slack"),
+        Source(platform="discord"),
+        Source(chat_type="group"),
+        Source(chat_type="supergroup"),
+        Source(chat_type="channel"),
+        Source(chat_type=""),
+        Source(user_id="9999"),
+    ],
+    ids=["slack", "discord", "group", "supergroup", "channel", "no-chat-type", "not-allowlisted"],
+)
+def test_the_hook_keeps_nothing_a_launch_could_never_use(
+    hermes_home, allowlisted, monkeypatch, source
+):
+    """The store is small, and everything it holds evicts something else.
+
+    It used to record every message the gateway saw, on every platform, from
+    every chat, from anybody. None of that could ever authorise a launch — a
+    launch goes to an allowlisted Telegram DM and nowhere else — but all of it
+    took space, so strangers talking in a room could push out the "yes" a
+    learner had just written in their own conversation.
+    """
+    from learning_studio import evidence as evidence_module
+
+    store = EvidenceStore()
+    monkeypatch.setattr(evidence_module, "STORE", store)
+
+    capture_message_evidence(event=Event("quiz me on photosynthesis", source))
+
+    assert len(store) == 0
+
+
+def test_unrelated_traffic_cannot_evict_a_learners_own_message(
+    hermes_home, allowlisted, monkeypatch
+):
+    """The eviction this filter exists to prevent, run end to end."""
+    from learning_studio import evidence as evidence_module
+
+    store = EvidenceStore()
+    monkeypatch.setattr(evidence_module, "STORE", store)
+
+    capture_message_evidence(event=Event("quiz me on photosynthesis", Source()))
+
+    for index in range(evidence_module.MAX_ENTRIES * 3):
+        capture_message_evidence(
+            event=Event(
+                "chatter",
+                Source(chat_type="group", chat_id=f"-100{index}", user_id="1001"),
+                message_id=str(9000 + index),
+            )
+        )
+
     assert store.state(key(), "quiz me on photosynthesis") == "matched"
 
 
@@ -418,3 +484,75 @@ def test_an_injected_store_is_used_even_once_it_is_empty(store, bound_session):
     assert len(store) == 0
     assert len(evidence_module.STORE) == 0
     assert decide(store, "quiz me on photosynthesis").may_create is False
+
+
+# ── Eviction must not re-arm a message that was already used ──────────────
+
+
+def test_a_tombstone_evicted_by_traffic_does_not_re_arm_the_message(store):
+    """The bounded table forgets; the conversation does not.
+
+    A tombstone names one message and there is room for a fixed number of
+    them. Spend enough messages and the oldest tombstone goes — and a
+    redelivery of that Telegram update then looked like something nobody had
+    used, which is a replayable consent. One integer per conversation answers
+    the same question for every message below it, and does not evict.
+    """
+    from learning_studio import evidence as evidence_module
+
+    first = key(message_id="500")
+    store.record(first, "quiz me on photosynthesis")
+    assert store.spend(first) is True
+
+    for index in range(evidence_module.MAX_TOMBSTONES + 50):
+        later = key(message_id=str(100_000 + index))
+        store.record(later, "another message entirely")
+        store.spend(later)
+
+    assert first not in store._spent, "the tombstone survived; the test proves nothing"
+
+    store.record(first, "quiz me on photosynthesis")
+
+    assert store.state(first, "quiz me on photosynthesis") == "spent"
+    assert store.reserve(first) is False
+
+
+def test_every_earlier_message_in_the_conversation_is_covered(store):
+    """One watermark stands for all of them, which is why it is one integer."""
+    used = key(message_id="900")
+    store.record(used, "quiz me on photosynthesis")
+    assert store.spend(used) is True
+
+    earlier = key(message_id="42")
+    store.record(earlier, "quiz me on photosynthesis")
+
+    assert store.state(earlier, "quiz me on photosynthesis") == "spent"
+
+    # A *newer* message is untouched: this bounds replay, not conversation.
+    newer = key(message_id="901")
+    store.record(newer, "quiz me on photosynthesis")
+    assert store.state(newer, "quiz me on photosynthesis") == "matched"
+
+
+def test_the_watermark_is_per_conversation(store):
+    """Another chat's numbering says nothing about this one's."""
+    theirs = key(message_id="900", chat_id="2002", user_id="2002")
+    store.record(theirs, "quiz me on photosynthesis")
+    assert store.spend(theirs) is True
+
+    mine = key(message_id="42")
+    store.record(mine, "quiz me on photosynthesis")
+
+    assert store.state(mine, "quiz me on photosynthesis") == "matched"
+
+
+def test_a_platform_without_ordered_ids_still_works(store):
+    """No order means no inference, and no silent refusal of valid messages."""
+    first = key(message_id="msg-abc")
+    store.record(first, "quiz me on photosynthesis")
+    assert store.spend(first) is True
+
+    second = key(message_id="msg-def")
+    store.record(second, "quiz me on photosynthesis")
+
+    assert store.state(second, "quiz me on photosynthesis") == "matched"
