@@ -103,6 +103,44 @@ def runtime_python() -> Path:
     return venv_dir() / "bin" / "python"
 
 
+@dataclass
+class VerifiedRuntimePython:
+    """A pinned interpreter executable whose identity survives path swaps."""
+
+    fd: int
+    display_path: Path
+
+    @property
+    def executable(self) -> str:
+        return f"/proc/self/fd/{self.fd}"
+
+    def close(self) -> None:
+        fd, self.fd = self.fd, -1
+        if fd >= 0:
+            os.close(fd)
+
+
+def open_verified_runtime_python() -> VerifiedRuntimePython:
+    """Open every component no-follow and retain the executable descriptor."""
+    from .state import ContainmentError, managed_dir, open_managed
+
+    with managed_dir() as runtime:
+        venv = open_managed(VENV_DIRNAME, os.O_RDONLY | _O_DIRECTORY, dir_fd=runtime)
+        try:
+            binaries = open_managed("bin", os.O_RDONLY | _O_DIRECTORY, dir_fd=venv)
+        finally:
+            os.close(venv)
+        try:
+            interpreter = open_managed("python", os.O_RDONLY, dir_fd=binaries)
+        finally:
+            os.close(binaries)
+    info = os.fstat(interpreter)
+    if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+        os.close(interpreter)
+        raise ContainmentError("the Learning Studio runtime interpreter is not an executable file")
+    return VerifiedRuntimePython(interpreter, runtime_python())
+
+
 def verified_runtime_python() -> Path:
     """The interpreter, with every component proved not to be a link.
 
@@ -125,28 +163,8 @@ def verified_runtime_python() -> Path:
     instead. The boundary here is a link planted from outside that directory,
     which is the one this closes.
     """
-    from .state import ContainmentError, managed_dir, open_managed
-
-    with managed_dir() as runtime:
-        venv = open_managed(VENV_DIRNAME, os.O_RDONLY | _O_DIRECTORY, dir_fd=runtime)
-        try:
-            binaries = open_managed("bin", os.O_RDONLY | _O_DIRECTORY, dir_fd=venv)
-        except OSError as exc:
-            os.close(venv)
-            raise ContainmentError("the Learning Studio runtime environment is incomplete") from exc
-        try:
-            interpreter = open_managed("python", os.O_RDONLY, dir_fd=binaries)
-            try:
-                info = os.fstat(interpreter)
-                if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
-                    raise ContainmentError(
-                        "the Learning Studio runtime interpreter is not an executable file"
-                    )
-            finally:
-                os.close(interpreter)
-        finally:
-            os.close(binaries)
-            os.close(venv)
+    verified = open_verified_runtime_python()
+    verified.close()
     return runtime_python()
 
 
@@ -260,8 +278,15 @@ def bootstrap(*, runner=subprocess.run, force: bool = False) -> BootstrapResult:
             detail=_tail(creation.stderr or creation.stdout),
         )
 
-    with contextlib.suppress(OSError, NotImplementedError):
-        target.chmod(DIRECTORY_MODE)
+    from .state import managed_dir, open_managed
+
+    with managed_dir() as runtime_fd:
+        target_fd = open_managed(VENV_DIRNAME, os.O_RDONLY | _O_DIRECTORY, dir_fd=runtime_fd)
+    try:
+        with contextlib.suppress(OSError, NotImplementedError):
+            os.fchmod(target_fd, DIRECTORY_MODE)
+    finally:
+        os.close(target_fd)
 
     installation = _run(
         [

@@ -322,6 +322,10 @@ def _launch_within(
     except _MayHaveBeenSent:
         raise
     except BaseException as exc:
+        # Delivery is already irreversible.  Even if commit itself partly
+        # failed and lost the reservation, seal the platform key so a retry
+        # cannot deliver a second button.
+        consent_policy.seal(decision, store=evidence)
         raise _MayHaveBeenSent(exc) from None
 
     return _result(

@@ -33,6 +33,15 @@ def scope(user: str = "1001", experience: str = "exp-1", profile: str = "default
     )
 
 
+def test_capacity_eviction_retires_the_session_object():
+    clock = Clock()
+    store = SessionStore(clock=clock, ttl_seconds=60, max_sessions=1)
+    _, first = store.create(scope(), component_count=1)
+    store.create(scope(experience="exp-2"), component_count=1)
+
+    assert first.expired(clock())
+
+
 @pytest.fixture
 def clock() -> Clock:
     return Clock()

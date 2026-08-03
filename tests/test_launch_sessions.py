@@ -420,3 +420,20 @@ def test_progress_stops_being_reported_when_the_session_runs_out(store, sessions
     assert after["position"] == 0
     assert after["answered"] == 0
     assert after["state"] == "closed"
+
+
+def test_expired_session_state_is_not_carried_into_a_fresh_session(clock):
+    store = grants_module.GrantStore(profile="default", generation=7, clock=clock, ttl_seconds=600)
+    sessions = SessionStore(clock=clock, ttl_seconds=60, max_sessions=50)
+    grant = granted(store)
+    _, old = open_session(store, sessions, grant)
+    old.position = 2
+    old.answers = {"component": {"option_id": "x"}}
+
+    clock.advance(61)
+    assert store.admit(launch_id=grant.launch_id, telegram_user_id="1001") is grant
+    opened = open_session(store, sessions, grant)
+    assert opened is not None
+    _, fresh = opened
+    assert fresh.position == 0
+    assert fresh.answers == {}

@@ -210,6 +210,12 @@ def commit(decision: Decision, *, store: EvidenceStore | None = None) -> bool:
     return evidence.commit(decision.key)
 
 
+def seal(decision: Decision, *, store: EvidenceStore | None = None) -> None:
+    """Make a delivered message non-replayable after indeterminate commit."""
+    evidence = STORE if store is None else store
+    evidence.seal(decision.key)
+
+
 def release(decision: Decision, *, store: EvidenceStore | None = None) -> bool:
     """Hand the message back, on a path that proved nothing was delivered."""
     evidence = STORE if store is None else store

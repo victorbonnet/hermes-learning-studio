@@ -376,7 +376,10 @@ class GrantStore:
                 return None
             if not grant.admissible(now):
                 return None
-            previous = grant.session
+            # Never resurrect state after the hard session expiry.  The raw
+            # pointer intentionally outlives the token for truthful history,
+            # but only a live session may be resumed.
+            previous = grant.live_session(now)
             token, session = create()
             if previous is not None:
                 _carry_forward(previous, session)

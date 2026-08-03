@@ -336,6 +336,10 @@ def _exempt(forbidden: str, path: Path) -> bool:
         return True
     if forbidden == "subprocess" and relative in _PROCESS_STARTERS:
         return True
+    if forbidden == "ctypes" and relative == "runtime/tunnel.py":
+        # Narrow Linux pidfd fallback for Python builds omitting os.pidfd_open.
+        return True
+
     if forbidden in ("fastapi", "starlette", "uvicorn"):
         return relative.split("/")[0] == _WEB_PACKAGE or relative in _WEB_RUNTIME
     return False

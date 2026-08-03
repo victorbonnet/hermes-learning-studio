@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import logging
 import os
 import re
@@ -260,6 +261,10 @@ class QuickTunnel:
     url: str = ""
     reason: str = ""
     process: object | None = field(default=None, repr=False)
+    #: Stable kernel handle for the session leader.  A pidfd pins the numeric
+    #: process-group name until cleanup finishes, closing the getpgid/killpg
+    #: reuse race while still allowing the whole descendant group to be ended.
+    pidfd: int | None = field(default=None, repr=False)
 
     @property
     def ready(self) -> bool:
@@ -293,22 +298,29 @@ class QuickTunnel:
         no process id here that was read from anywhere.
         """
         process = self.process
-        self.process = None
-        if self.state != "failed":
-            self.state = "stopped"
         if process is None:
             return
-
-        _signal_group(process, signal.SIGTERM)
-        if await _reaped(process, grace_seconds):
-            return
-
-        _signal_group(process, signal.SIGKILL)
-        if not await _reaped(process, grace_seconds):
-            # Reported rather than hidden: the caller has to be able to say
-            # "the address may still be open" instead of claiming it is closed.
-            logger.warning("the tunnel process did not exit after being killed")
-            raise TunnelError("tunnel_cleanup_indeterminate")
+        self._pin(process)
+        completed = False
+        try:
+            _signal_group(process, signal.SIGTERM)
+            if not await _reaped(process, grace_seconds):
+                _signal_group(process, signal.SIGKILL)
+                if not await _reaped(process, grace_seconds):
+                    logger.warning("the tunnel process did not exit after being killed")
+                    raise TunnelError("tunnel_cleanup_indeterminate")
+            completed = True
+        finally:
+            # Keep ownership reachable across cancellation or interruption. A
+            # later close can retry unless bounded cleanup actually completed.
+            if completed:
+                self.process = None
+                if self.pidfd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(self.pidfd)
+                    self.pidfd = None
+                if self.state != "failed":
+                    self.state = "stopped"
 
     def stop(self) -> None:
         """Synchronous best effort, for a caller with no event loop.
@@ -328,13 +340,36 @@ class QuickTunnel:
         flush, so the trade is a plainly good one.
         """
         process = self.process
-        self.process = None
-        if self.state != "failed":
-            self.state = "stopped"
         if process is None:
             return
+        self._pin(process)
         _signal_group(process, signal.SIGTERM)
         _signal_group(process, signal.SIGKILL)
+        if self.state != "failed":
+            self.state = "stopped"
+
+    def _pin(self, process) -> None:
+        if self.pidfd is not None:
+            return
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int) or pid <= 0:
+            return
+        try:
+            if hasattr(os, "pidfd_open"):
+                fd = os.pidfd_open(pid)
+            else:
+                # CPython builds may omit the wrapper although the running
+                # Linux kernel/libc provides pidfds. This narrow call obtains
+                # the same stable identity; no arbitrary native symbol or
+                # model-controlled argument is involved.
+                libc = ctypes.CDLL(None, use_errno=True)
+                fd = int(libc.pidfd_open(pid, 0))
+                if fd < 0:
+                    raise OSError(ctypes.get_errno(), "pidfd_open")
+        except OSError:
+            return
+        self.pidfd = fd
+        process._learning_studio_pidfd = fd
 
 
 def _signal_group(process, sig: int) -> None:
@@ -354,7 +389,8 @@ def _signal_group(process, sig: int) -> None:
     if getattr(process, "returncode", None) is not None:
         return
     pid = getattr(process, "pid", None)
-    if isinstance(pid, int) and pid > 0 and hasattr(os, "killpg"):
+    pidfd = getattr(process, "_learning_studio_pidfd", None)
+    if pidfd is not None and isinstance(pid, int) and pid > 0 and hasattr(os, "killpg"):
         try:
             if os.getpgid(pid) == pid:
                 os.killpg(pid, sig)
@@ -408,6 +444,7 @@ async def open_tunnel(
         return tunnel
 
     tunnel.process = process
+    tunnel._pin(process)
     try:
         url = await asyncio.wait_for(_read_url(process), timeout=timeout_seconds)
     except TimeoutError:

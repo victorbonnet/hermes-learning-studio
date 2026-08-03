@@ -13,7 +13,6 @@ import inspect
 import json
 import os
 import signal
-import sys
 from pathlib import Path
 
 import pytest
@@ -268,10 +267,10 @@ def test_the_pidfd_sender_is_probed_where_python_actually_puts_it():
     """
     import signal as signal_module
 
-    assert hasattr(os, "pidfd_open") == (sys.platform.startswith("linux"))
     assert not hasattr(os, "pidfd_send_signal"), "the probe below would be vacuous"
-    if sys.platform.startswith("linux"):
-        assert hasattr(signal_module, "pidfd_send_signal")
+    assert ownership.handle_supported() == (
+        hasattr(os, "pidfd_open") and hasattr(signal_module, "pidfd_send_signal")
+    )
 
     source = Path(ownership.__file__).read_text(encoding="utf-8")
     assert "signal.pidfd_send_signal" in source

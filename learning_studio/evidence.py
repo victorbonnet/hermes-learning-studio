@@ -80,7 +80,11 @@ MAX_TOMBSTONES = 512
 #: integer per conversation rather than one entry per message, so it survives
 #: the traffic that evicts tombstones and answers the same question for every
 #: message below it at once.
-MAX_WATERMARKS = 4096
+# Watermarks are intentionally not capacity-evicted.  The capture hook admits
+# only allowlisted Telegram DMs, so this is bounded by the profile's authorised
+# conversations rather than by message traffic.  Evicting one is unsafe: it
+# turns an already-consumed Telegram update back into fresh authority.
+MAX_WATERMARKS = 4096  # compatibility/test corpus size; no longer an eviction cap
 
 #: Longest message text retained. A learner's request is a sentence; anything
 #: past this is truncated before it is stored, because the only thing it is
@@ -234,7 +238,7 @@ class EvidenceStore:
         if not key.complete:
             return "unusable"
         needle = normalise(quote)
-        if len(needle) < MIN_MATCH_CHARS:
+        if len("".join(needle.split())) < MIN_MATCH_CHARS:
             return "unusable"
 
         now = float(self._clock())
@@ -288,9 +292,13 @@ class EvidenceStore:
         """Turn a reservation into a spend. The launch happened."""
         now = float(self._clock())
         with self._lock:
-            if key not in self._reserved:
+            # Delivery is the irreversible boundary.  A reservation may have
+            # disappeared because a store operation failed halfway through;
+            # that uncertainty must never re-arm the message.  Commit is thus
+            # monotonic and idempotent once the exact captured key is known.
+            if key not in self._reserved and key not in self._entries and key not in self._spent:
                 return False
-            del self._reserved[key]
+            self._reserved.pop(key, None)
             self._entries.pop(key, None)
             self._spent[key] = now
             while len(self._spent) > MAX_TOMBSTONES:
@@ -298,6 +306,22 @@ class EvidenceStore:
                 del self._spent[oldest]
             self._raise_watermark(key, now)
             return True
+
+    def seal(self, key: EvidenceKey) -> None:
+        """Permanently consume authority after delivery became irreversible.
+
+        Unlike ``commit``, this is recovery for an indeterminate finalization:
+        even if a failing store operation already lost the reservation, the
+        exact platform key must never become launchable again.
+        """
+        if not key.complete:
+            return
+        now = float(self._clock())
+        with self._lock:
+            self._reserved.pop(key, None)
+            self._entries.pop(key, None)
+            self._spent[key] = now
+            self._raise_watermark(key, now)
 
     def release(self, key: EvidenceKey) -> bool:
         """Give a reservation back, because nothing reached the learner.
@@ -355,9 +379,6 @@ class EvidenceStore:
         conversation = self._conversation(key)
         highest, _ = self._watermarks.get(conversation, (0, 0.0))
         self._watermarks[conversation] = (max(highest, ordinal), now)
-        while len(self._watermarks) > MAX_WATERMARKS:
-            oldest = min(self._watermarks, key=lambda c: self._watermarks[c][1])
-            del self._watermarks[oldest]
 
     def _below_watermark(self, key: EvidenceKey) -> bool:
         """Whether this message is at or below one already consumed here."""

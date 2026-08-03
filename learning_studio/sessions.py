@@ -198,6 +198,7 @@ class SessionStore:
             # Drop it here as well as in the sweep: an expired session must not
             # survive being asked for.
             self._sessions.pop(_digest(token), None)
+            session.expires_at = 0.0
             raise SessionError("session_expired")
         if session.scope.profile != profile:
             raise SessionError("session_wrong_profile")
@@ -214,7 +215,8 @@ class SessionStore:
         now = float(self._clock())
         stale = [digest for digest, s in self._sessions.items() if s.expired(now)]
         for digest in stale:
-            del self._sessions[digest]
+            session = self._sessions.pop(digest)
+            session.expires_at = 0.0
         return len(stale)
 
     def _enforce_capacity(self) -> None:
@@ -227,7 +229,10 @@ class SessionStore:
         """
         while len(self._sessions) >= self._max:
             oldest = min(self._sessions, key=lambda d: self._sessions[d].expires_at)
-            del self._sessions[oldest]
+            session = self._sessions.pop(oldest)
+            # GrantStore holds the object, not its token.  Retiring in place
+            # keeps both stores' view of liveness identical after eviction.
+            session.expires_at = 0.0
 
 
 def _digest(token: str) -> str:

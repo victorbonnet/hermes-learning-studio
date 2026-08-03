@@ -640,7 +640,9 @@ LAUNCH_SCHEMA: dict[str, Any] = {
                 # characters collapsed and three otherwise. Requiring at least
                 # one non-space character removes the reported gap without
                 # inventing a stricter rule than the one being enforced.
-                "pattern": "\\S",
+                # Runtime requires four non-whitespace characters after
+                # normalisation; advertise that same rule to providers.
+                "pattern": r"^(?:\s*\S){4}",
                 "description": (
                     "A few words copied exactly from the learner's CURRENT message - the "
                     "one you are replying to. Required for both kinds of launch. The Studio "

@@ -272,6 +272,7 @@ def ensure_running(
         else:
             return RuntimeHandle(record=previous, reply=reply, started=False)
 
+    verified_interpreter = None
     if python is not None:
         # A caller-supplied interpreter, which only the tests and the bootstrap
         # tool pass. Not resolved through the managed chain because it is not
@@ -287,19 +288,28 @@ def ensure_running(
         from .state import ContainmentError
 
         try:
-            interpreter = bootstrap.verified_runtime_python()
+            verified_interpreter = bootstrap.open_verified_runtime_python()
+            interpreter = Path(verified_interpreter.executable)
         except (OSError, ContainmentError) as exc:
             logger.warning("the runtime interpreter could not be verified: %s", type(exc).__name__)
             raise _unavailable(NOT_BOOTSTRAPPED, "runtime_not_bootstrapped") from exc
 
-    return _start(
-        config,
-        interpreter=interpreter,
-        previous=previous,
-        popen=popen,
-        clock=clock,
-        sleep=sleep,
-    )
+    try:
+        return _start(
+            config,
+            interpreter=interpreter,
+            previous=previous,
+            popen=popen,
+            clock=clock,
+            sleep=sleep,
+            pass_fds=(() if python is not None else (verified_interpreter.fd,)),
+            executable_identity=(
+                str(interpreter) if python is not None else str(verified_interpreter.display_path)
+            ),
+        )
+    finally:
+        if verified_interpreter is not None:
+            verified_interpreter.close()
 
 
 def _deferrable_signals() -> set:
@@ -357,6 +367,8 @@ def _start(
     popen,
     clock,
     sleep,
+    pass_fds=(),
+    executable_identity: str | None = None,
 ) -> RuntimeHandle:
     """Start one runtime, or leave the profile exactly as it was found."""
     from ..paths import profile_id
@@ -375,7 +387,7 @@ def _start(
         # `_await_handshake` is what produces the record this function returns.
         port=1,
         control_token=new_control_token(),
-        executable=str(interpreter),
+        executable=executable_identity or str(interpreter),
         started_at=time.time(),
         idle_timeout_seconds=config.runtime_idle_timeout_seconds,
         max_lifetime_seconds=config.runtime_max_lifetime_seconds,
@@ -406,6 +418,7 @@ def _start(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
+                pass_fds=pass_fds,
                 cwd=str(runtime_dir()),
             )
         record = dataclasses.replace(record_without_port, pid=child.pid)
@@ -430,8 +443,8 @@ def _start(
         # that this handler can only help once `child` is bound, which is what
         # `_interruptions_deferred` above exists to guarantee.
         #
-        # Cleanup only. The exception is re-raised immediately, because
-        # swallowing a cancellation is how a shutdown hangs.
+        # Cleanup only. Signal delivery is deferred across the spawn handoff;
+        # the exception is re-raised so shutdown/cancellation remains visible.
         _roll_back(child, record_without_port, handshake, config)
         raise
 

@@ -534,6 +534,23 @@ def test_every_earlier_message_in_the_conversation_is_covered(store):
     assert store.state(newer, "quiz me on photosynthesis") == "matched"
 
 
+def test_authorised_conversation_watermarks_are_not_capacity_evicted(store):
+    from learning_studio import evidence as evidence_module
+
+    first = key(message_id="500")
+    store.record(first, "quiz me on photosynthesis")
+    assert store.spend(first) is True
+
+    for index in range(evidence_module.MAX_WATERMARKS + 50):
+        other = key(chat_id=f"chat-{index}", message_id="1")
+        store.record(other, "quiz me on photosynthesis")
+        assert store.spend(other) is True
+
+    store.record(first, "quiz me on photosynthesis")
+    assert store.state(first, "quiz me on photosynthesis") == "spent"
+    assert store.reserve(first) is False
+
+
 def test_the_watermark_is_per_conversation(store):
     """Another chat's numbering says nothing about this one's."""
     theirs = key(message_id="900", chat_id="2002", user_id="2002")
