@@ -166,6 +166,7 @@ installable **Python package**, which drives the layout:
 │   │       ├── index.html      # Structure only — no data, nothing inline
 │   │       ├── app.css         # Telegram-themed, mobile-first, safe areas
 │   │       ├── i18n.js         # UI strings, separate from exercise content
+│   │       ├── icons.js        # Inline SVG: per-type card icons, score ring
 │   │       ├── renderers.js    # One renderer per component type
 │   │       └── app.js          # Launch, session, states, the only fetch caller
 │   └── skills/
@@ -1459,9 +1460,9 @@ with an older captured payload.
 | `GET` | `/api/session/summary` | The completion screen: score the finished session, once |
 | `GET` | `/api/assets/{id}` | One managed image, verified on the way out |
 | `GET` | `/`, `/index.html` | The Mini App document |
-| `GET` | `/static/{app.css,i18n.js,renderers.js,app.js}` | The frontend, from a closed allowlist |
+| `GET` | `/static/{app.css,i18n.js,icons.js,renderers.js,app.js}` | The frontend, from a closed allowlist |
 
-Every `/api/` route is authenticated. The five static files are the only public
+Every `/api/` route is authenticated. The six static files are the only public
 ones — see [The Mini App interface](#the-mini-app-interface) for why a webview
 shell cannot be — and no interactive docs or OpenAPI schema is published.
 Answers are recorded **in the session** while the exercise is in progress and
@@ -1553,15 +1554,16 @@ looks like a bypass switch ever appears.
 
 ## The Mini App interface
 
-The trusted renderer: five static files, no build step, no framework, and no
+The trusted renderer: six static files, no build step, no framework, and no
 Node required to run it. `learning_studio/web/static/` holds a document, a
-stylesheet, and three scripts — UI strings, card renderers, application — served
-by the same FastAPI app from an explicit allowlist.
+stylesheet, and four scripts — UI strings, the icon set, card renderers,
+application — served by the same FastAPI app from an explicit allowlist.
 
 ```
 GET /              → index.html      (also /index.html)
 GET /static/app.css
 GET /static/i18n.js
+GET /static/icons.js
 GET /static/renderers.js
 GET /static/app.js
 ```
@@ -1569,7 +1571,7 @@ GET /static/app.js
 **The shell is the one unauthenticated thing in this server**, and that is a
 consequence rather than a concession: the navigation that loads a webview cannot
 carry a request header, so there is no request in which the document could prove
-who wants it. What is public is five checked-in files that are byte-identical for
+who wants it. What is public is six checked-in files that are byte-identical for
 every caller and contain no learner data, no identifier, and no configured value.
 The document that arrives knows nothing; it has to ask, with headers, for
 everything it displays. No route that can return learner data lost a check.
@@ -1587,7 +1589,9 @@ elements the renderer created. There is no `innerHTML`, no `insertAdjacentHTML`,
 no `document.write`, no `eval`, and no `new Function` anywhere in the shipped
 JavaScript — a test greps for each of them, because the Content-Security-Policy
 cannot stop an injection that goes through the DOM API. `createElement` appears
-exactly once, in one helper.
+exactly once, in one helper, and `createElementNS` — the door SVG has to be
+built through — appears exactly once too, in `icons.js`, which is the only file
+that draws one.
 
 `code_response` is text on every leg of the journey: displayed in a textarea,
 submitted as a string, stored as a string. Nothing parses, compiles, or runs it,
@@ -1652,7 +1656,40 @@ operator reading a log, and translating the interface only to fall back to Engli
 on the unhappy path would be a strange kind of half-localized.
 
 Answers are confirmed as **recorded and not marked**, because that is what
-happened. A tick and a chime would imply a judgement nobody made.
+happened. The confirmation carries a tick and the interface's calm green, and
+the sentence under it still says *not marked yet*: the tick means *written
+down*, and the identical screen appears whatever was answered. A verdict here
+would be a guess ahead of the mark `GET /api/session/summary` actually makes.
+
+### What a card looks like
+
+Every card opens with a **type badge**: a small inline-SVG icon and, when the
+interface has a name for that kind of card, the name — *Multiple choice*, *Mise
+en ordre*, *Tarjeta de memoria*. The icon is chosen by component type, which is
+the application's own discriminator, so nothing an author writes can decide what
+is drawn; one drawing serves a family rather than a type, because thirty-one
+pictures would be thirty-one things to learn. The label is interface chrome and
+is translated with the rest of it; a type this build has never heard of gets a
+generic card icon and no label rather than a dotted key printed at a learner.
+
+The icons live in `icons.js`, are built with `createElementNS` and presentation
+attributes only, are stroked in `currentColor`, and carry `aria-hidden="true"` —
+they are a second way of saying what the label beside them already says. No file
+in the frontend contains a colour: `app.css` owns the palette, so the Telegram
+theme and the contrast-tested fallbacks both reach the drawings.
+
+Around them: one surface per screen, capped at a readable measure and centred,
+with the panels inside it — a statement to judge, an option, a pair, the back of
+a flashcard — sitting on the page colour, which is what gives a card its layers
+without a second palette. A chosen option is ringed in the accent colour rather
+than tinted, the primary action is full width, and a new card arrives with a few
+pixels of movement over `--motion`, which is `0ms` for anyone who asked for less
+of it and switched off outright there as well.
+
+The completion screen draws the mark as a **ring**: the same fraction the
+sentence under it states, coloured by the same tier, labelled with that same
+sentence so a screen reader hears prose rather than "chart", and not animated at
+all. It is a picture of what is already written, never a second source of truth.
 
 ### Localization
 
@@ -1685,8 +1722,9 @@ as well as a tap, stepping 5% (1% with Shift) in normalised coordinates.
 Also: a skip link, a focused card on every change, `role="status"` announcements
 that do not steal focus, a labelled progress bar, an accessible name on every
 field, mandatory `alt` text on every image with a legible fallback when the bytes
-do not arrive, 44px touch targets, `prefers-reduced-motion` honoured in CSS so it
-holds even if the script never runs, a `data-reduced-motion` hook for the
+do not arrive, 44px touch targets, decorative drawings marked `aria-hidden` so
+nothing is read out twice, `prefers-reduced-motion` honoured in CSS so it holds
+even if the script never runs, a `data-reduced-motion` hook for the
 component-level flag, safe-area insets, Telegram's stable viewport height, and
 wide tables that scroll inside themselves rather than scrolling the page.
 
@@ -1833,8 +1871,11 @@ This is what `references/flashcards-and-recall.md` has always asked for — "the
 reveal must be explicit and keyboard-operable" — and what the first version of
 this Mini App did not have.
 
-**The completion screen.** Under the score line (*"You got 3 of 4 marked
-answers right"*) sits one short sentence: an encouraging or constructive
+**The completion screen.** The mark is drawn as a ring around the fraction it
+counts — correct marked answers out of marked answers — coloured by the tier of
+the sentence beneath it and named, for a screen reader, with that sentence
+verbatim. Under the score line (*"You got 3 of 4 marked answers right"*) sits
+one short sentence: an encouraging or constructive
 reading of that same fraction — correct marked answers out of marked answers,
 not the points-weighted total, so the sentence cannot contradict the count
 printed above it — followed, only when something was missed, by how many

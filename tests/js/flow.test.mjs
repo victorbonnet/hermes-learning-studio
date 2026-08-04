@@ -467,6 +467,82 @@ test("nothing machine-graded gets no feedback paragraph at all", async () => {
   assert.doesNotMatch(text, /marked answers right/);
 });
 
+/** The completion screen's ring, and the arc that carries the fraction. */
+function ringOf(win) {
+  const ring = cardOf(win)
+    .all()
+    .find((node) => node.getAttribute("class") === "score-ring");
+  if (!ring) {
+    return null;
+  }
+  const arc = ring.all().find((node) => node.getAttribute("class") === "ring-arc");
+  return {
+    node: ring,
+    tone: ring.getAttribute("data-tone"),
+    label: ring.getAttribute("aria-label"),
+    offset: Number(arc.getAttribute("stroke-dashoffset")),
+    length: Number(arc.getAttribute("stroke-dasharray")),
+    value: ring.all().find((node) => node.getAttribute("class") === "ring-value").textContent,
+  };
+}
+
+test("the completion screen draws the mark as a ring of the right fraction", async () => {
+  const some = ringOf(
+    (await finishWithMarks({ correct_component_count: 1, graded_component_count: 4, component_count: 4 }))
+      .win
+  );
+  const all = ringOf(
+    (await finishWithMarks({ correct_component_count: 4, graded_component_count: 4, component_count: 4 }))
+      .win
+  );
+
+  assert.ok(some && all, "the completion screen has no ring");
+  assert.equal(some.value, "1/4");
+  assert.equal(all.value, "4/4");
+  assert.notEqual(some.offset, all.offset, "every score drew the same ring");
+  assert.equal(all.offset, 0, "a perfect score does not close the ring");
+  assert.ok(Math.abs(some.offset - some.length * 0.75) < 0.02);
+});
+
+test("the ring is coloured by the same tier as the sentence under it", async () => {
+  const cases = [
+    { correct: 4, graded: 4, tone: "ok" }, // excellent
+    { correct: 3, graded: 4, tone: "ok" }, // well done
+    { correct: 2, graded: 4, tone: "accent" }, // the foundations are there
+    { correct: 1, graded: 4, tone: "danger" }, // a tricky exercise
+  ];
+
+  for (const item of cases) {
+    const context = await finishWithMarks({
+      correct_component_count: item.correct,
+      graded_component_count: item.graded,
+      component_count: item.graded,
+    });
+    const ring = ringOf(context.win);
+
+    assert.equal(ring.tone, item.tone, `${item.correct} of ${item.graded}`);
+    // The ring is a picture of the sentence, so it is named with it rather than
+    // with a description of a doughnut.
+    assert.equal(ring.label, `You got ${item.correct} of ${item.graded} marked answers right.`);
+    assert.equal(ring.node.getAttribute("role"), "img");
+    assert.match(cardOf(context.win).textContent, new RegExp(`${item.correct} of ${item.graded}`));
+  }
+});
+
+test("nothing machine-graded gets no ring either", async () => {
+  const context = await finishWithMarks({
+    scored: false,
+    overall_score: 0,
+    overall_max_score: 0,
+    graded_component_count: 0,
+    correct_component_count: 0,
+    components: [],
+  });
+
+  assert.equal(ringOf(context.win), null, "a ring was drawn for a mark nobody made");
+  assert.match(cardOf(context.win).textContent, /Nothing here is machine-graded/);
+});
+
 test("the completion announcement carries the feedback sentence, not just the title", async () => {
   const context = await finishWithMarks({
     correct_component_count: 2,
@@ -520,6 +596,30 @@ test("the confirmation says the answer was recorded and not marked", async () =>
   assert.match(cardOf(context.win).textContent, /Answer recorded/);
   assert.match(cardOf(context.win).textContent, /Not marked yet/);
   assert.match(context.node("announcer").textContent, /recorded/i);
+});
+
+test("the confirmation is a tick and a reassurance, never a verdict", async () => {
+  const context = await boot({ types: ["short_answer", "true_false"] });
+
+  completeCard(cardOf(context.win), FIXTURES.short_answer.payload);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  const card = cardOf(context.win);
+  const pill = card.all().find((node) => node.className === "recorded-pill");
+  assert.ok(pill, "the confirmation lost its calm treatment");
+
+  const tick = pill.children.find((node) => node.tagName === "svg");
+  assert.ok(tick, "the confirmation carries no tick");
+  assert.equal(tick.getAttribute("data-icon"), "check");
+  assert.equal(tick.getAttribute("aria-hidden"), "true", "the tick is read out as well as shown");
+
+  // A tick that meant "right" would be a mark, and nothing has been marked yet:
+  // the same screen appears whatever was answered.
+  const shown = card.textContent;
+  for (const verdict of ["Correct", "Incorrect", "correct", "wrong"]) {
+    assert.ok(!shown.includes(verdict), `the confirmation says "${verdict}"`);
+  }
 });
 
 test("no state leaves an uninterpolated placeholder on screen", async () => {

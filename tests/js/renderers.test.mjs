@@ -149,10 +149,14 @@ test("no card exposes an answer key, rubric, hint, or branch field", async () =>
   for (const componentType of TYPES) {
     const { card } = renderType(componentType);
     await settle();
-    // The type discriminator is the app's own marker and legitimately contains
-    // words like "rubric" (`rubric_response` is a component type). Everything
-    // else in the card came from the payload.
-    const markup = card.element.serialize().replace(/ data-component-type="[^"]*"/, "");
+    // The type discriminator and the icon key are the app's own markers and
+    // legitimately contain words like "rubric" (`rubric_response` is a
+    // component type, and its icon family is named after it). Everything else
+    // in the card came from the payload.
+    const markup = card.element
+      .serialize()
+      .replace(/ data-component-type="[^"]*"/, "")
+      .replace(/ data-icon="[^"]*"/g, "");
 
     for (const forbidden of ["evaluation", "rubric", "branching", "reference_solution"]) {
       assert.ok(!markup.includes(forbidden), `${componentType} mentions ${forbidden}`);
