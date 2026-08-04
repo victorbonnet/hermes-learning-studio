@@ -215,6 +215,33 @@ function fakeApi({
         notice: "Nothing has been marked.",
       });
     }
+    if (path === "/api/session/summary") {
+      // Mirrors the shape `service.record_attempt` returns: every answered
+      // component gets a mark component-by-component, and the fake marks the
+      // first one right and the rest wrong so a test can tell them apart.
+      const scoredComponents = answers.map((answer, index) => ({
+        component_id: answer.component_id,
+        component_type: componentAt(index) ? componentAt(index).type : "unknown",
+        graded: true,
+        correct: index === 0,
+        score: index === 0 ? 1 : 0,
+        max_score: 1,
+        feedback: null,
+      }));
+      return jsonResponse(200, {
+        experience_id: EXPERIENCE_ID,
+        attempt_id: "attempt-fake",
+        scored: true,
+        overall_score: scoredComponents.length ? 1 : 0,
+        overall_max_score: scoredComponents.length,
+        graded_component_count: scoredComponents.length,
+        correct_component_count: scoredComponents.length ? 1 : 0,
+        component_count: components.length,
+        components: scoredComponents,
+        review: null,
+        notice: "Scored from this attempt.",
+      });
+    }
     if (path.startsWith("/api/assets/")) {
       return {
         ok: true,
@@ -313,7 +340,25 @@ test("the exercise runs to completion, one deliberate tap at a time", async () =
   );
   assert.equal(stateOf(context.win), "complete");
   assert.match(cardOf(context.win).textContent, /Answered: 3 of 3/);
-  assert.match(cardOf(context.win).textContent, /Nothing has been marked/);
+  assert.match(cardOf(context.win).textContent, /You got 1 of 3 marked answers right/);
+});
+
+test("the completion screen shows a per-component breakdown from the summary route", async () => {
+  const context = await boot({ types: ["multiple_choice", "true_false", "short_answer"] });
+
+  await answerCurrent(context);
+  await answerCurrent(context);
+  await answerCurrent(context);
+
+  const card = cardOf(context.win);
+  assert.equal(card.children[0].getAttribute("data-state"), "complete");
+
+  const items = card.all().filter((node) => node.getAttribute && node.getAttribute("data-outcome"));
+  assert.equal(items.length, 3);
+  assert.deepEqual(
+    items.map((node) => node.getAttribute("data-outcome")),
+    ["correct", "incorrect", "incorrect"]
+  );
 });
 
 test("every renderer survives a real submit, for all thirty-one types", async () => {
@@ -341,7 +386,7 @@ test("the confirmation says the answer was recorded and not marked", async () =>
   await settle(20);
 
   assert.match(cardOf(context.win).textContent, /Answer recorded/);
-  assert.match(cardOf(context.win).textContent, /does not score answers yet/);
+  assert.match(cardOf(context.win).textContent, /Not marked yet/);
   assert.match(context.node("announcer").textContent, /recorded/i);
 });
 

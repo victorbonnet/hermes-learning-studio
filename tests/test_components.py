@@ -538,6 +538,7 @@ def test_rubric_scoring_without_a_rubric_is_rejected():
         ("matching", "ordered"),
         ("free_response", "normalised"),
         ("hotspot", "numeric"),
+        ("table_grid", "set"),
     ],
 )
 def test_a_scoring_mode_that_cannot_mark_this_component_is_rejected(component_type, mode):
@@ -590,6 +591,53 @@ def test_an_unknown_scoring_mode_is_rejected():
 
     with pytest.raises(ComponentError, match="must be one of"):
         build_component(payload, "component")
+
+
+@pytest.mark.parametrize(
+    "component_type", ["multi_select", "classification", "matching", "categorization", "table_grid"]
+)
+def test_scoring_block_partial_credit_is_rejected_for_set_family_types(component_type):
+    """These types read ``partial_credit`` from the answer block, not scoring.
+
+    Admitting it in scoring too would let a manifest author set a flag the
+    evaluator silently ignores; the schema refuses it instead.
+    """
+    payload = example(component_type)
+    mode = "exact" if component_type == "table_grid" else "set"
+    payload["evaluation"]["scoring"] = {"mode": mode, "partial_credit": True}
+
+    with pytest.raises(ComponentError, match="unknown field"):
+        build_component(payload, "component")
+
+
+@pytest.mark.parametrize("component_type", ["fill_blank", "sequence_order"])
+def test_scoring_block_partial_credit_still_works_for_text_and_ordered_types(component_type):
+    payload = example(component_type)
+    mode = payload["evaluation"]["scoring"]["mode"]
+    payload["evaluation"]["scoring"] = {"mode": mode, "partial_credit": True}
+
+    assert build_component(payload, "component").type == component_type
+
+
+@pytest.mark.parametrize(
+    "component_type", ["multi_select", "classification", "matching", "categorization"]
+)
+def test_answer_block_partial_credit_still_works_for_set_family_types(component_type):
+    """The answer block is where these types actually declare partial credit."""
+    payload = example(component_type)
+    payload["answer"]["partial_credit"] = True
+
+    assert build_component(payload, "component").type == component_type
+
+
+def test_labeling_keeps_reading_partial_credit_from_the_scoring_block():
+    """``labeling`` has no answer-block flag, so it is the one set-family type
+    that legitimately reads ``scoring.partial_credit``, like the ordered
+    family does."""
+    payload = example("labeling")
+    payload["evaluation"]["scoring"] = {"mode": "set", "partial_credit": True}
+
+    assert build_component(payload, "component").type == "labeling"
 
 
 def test_a_malformed_rubric_is_rejected():

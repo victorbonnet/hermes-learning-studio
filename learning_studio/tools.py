@@ -31,12 +31,16 @@ from .identity import IdentityError, resolve_principal
 from .paths import PathResolutionError
 from .runtime.errors import RuntimeUnavailable
 from .schemas import (
+    ATTEMPTS_TOOL_NAME,
+    ERASE_LEARNER_TOOL_NAME,
     GET_TOOL_NAME,
     IMPORT_ASSET_TOOL_NAME,
     LAUNCH_TOOL_NAME,
     PREPARE_TOOL_NAME,
     RESULTS_TOOL_NAME,
+    REVIEW_PLAN_TOOL_NAME,
     SAVE_TOOL_NAME,
+    SET_REVIEW_REMINDERS_TOOL_NAME,
     STATUS_TOOL_NAME,
     STOP_TOOL_NAME,
     TOOL_SCHEMAS,
@@ -270,11 +274,67 @@ def handle_stop(params: Any = None, **_kwargs: Any) -> str:
     return _run(STOP_TOOL_NAME, params, call)
 
 
+# ── The evaluation runtime: attempts, review plans, erasure ───────────────
+
+
+def handle_attempts(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_attempts``."""
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        del args
+        return service.attempts_overview(principal=principal)
+
+    return _run(ATTEMPTS_TOOL_NAME, params, call)
+
+
+def handle_review_plan(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_review_plan``."""
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        del args
+        return service.review_plan(principal=principal)
+
+    return _run(REVIEW_PLAN_TOOL_NAME, params, call)
+
+
+def handle_set_review_reminders(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_set_review_reminders``."""
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        return service.set_review_reminders(principal=principal, enabled=bool(args["enabled"]))
+
+    return _run(SET_REVIEW_REMINDERS_TOOL_NAME, params, call)
+
+
+def handle_erase_learner(params: Any = None, **_kwargs: Any) -> str:
+    """Handler for ``learning_studio_erase_learner``.
+
+    ``confirmed`` is checked here rather than left to the schema, for the
+    same reason a track's own ``confirmed`` flag is: a schema can require the
+    field to be *present*, never that it is ``true``, and an erasure this
+    consequential must refuse outright rather than silently do nothing.
+    """
+
+    def call(principal, args: dict[str, Any]) -> dict[str, Any]:
+        if args.get("confirmed") is not True:
+            raise service.ValidationError(
+                "Erasure needs the learner's explicit confirmation. Ask them, then call this "
+                "again with confirmed=true."
+            )
+        return service.erase_learner(principal=principal)
+
+    return _run(ERASE_LEARNER_TOOL_NAME, params, call)
+
+
 HANDLERS.update(
     {
         LAUNCH_TOOL_NAME: handle_launch,
         STATUS_TOOL_NAME: handle_status,
         RESULTS_TOOL_NAME: handle_results,
         STOP_TOOL_NAME: handle_stop,
+        ATTEMPTS_TOOL_NAME: handle_attempts,
+        REVIEW_PLAN_TOOL_NAME: handle_review_plan,
+        SET_REVIEW_REMINDERS_TOOL_NAME: handle_set_review_reminders,
+        ERASE_LEARNER_TOOL_NAME: handle_erase_learner,
     }
 )

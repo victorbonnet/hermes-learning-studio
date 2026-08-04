@@ -1209,7 +1209,7 @@ SPECS: tuple[ComponentSpec, ...] = (
     # ── Structured information ────────────────────────────────────────────
     ComponentSpec(
         type="table_grid",
-        scoring_modes=("set", "exact", "normalised"),
+        scoring_modes=("exact", "normalised"),
         pointer_interaction=True,
         leak_paths=("cells[].accepted",),
         family="structured",
@@ -1243,6 +1243,7 @@ SPECS: tuple[ComponentSpec, ...] = (
                 ),
             ),
             Bool("case_sensitive"),
+            Bool("accent_sensitive"),
             Bool("partial_credit"),
         ),
         refs=(
@@ -1409,29 +1410,45 @@ _RUBRIC = shared(
 )
 
 
-def _scoring(modes: tuple[str, ...]) -> Field:
+def _scoring(modes: tuple[str, ...], *, partial_credit: bool) -> Field:
     """The scoring block for one set of allowed modes.
 
-    Emitted per mode-set rather than once for everything: the type already
-    decides what "scored" can mean, so the schema says so too. There are far
-    fewer distinct sets than there are component types, so this stays a
-    handful of definitions rather than 31.
+    Emitted per ``(modes, partial_credit)`` pair rather than once for
+    everything: the type already decides what "scored" can mean, so the
+    schema says so too. There are far fewer distinct combinations than there
+    are component types, so this stays a handful of definitions rather than
+    31.
+
+    ``partial_credit`` is admitted here only for the types whose *evaluator*
+    actually reads it from this block (the text and ordered families). The
+    set-family types — multi_select, classification, categorization,
+    matching, table_grid — read their own ``partial_credit`` flag from the
+    *answer* block instead (see :func:`_evaluation`'s caller), because that
+    flag is the manifest author's judgement about the answer key, not a
+    scoring-time parameter; admitting it here too would let an author set it
+    in a place the evaluator silently ignores. ``labeling`` is the one
+    set-family type with no answer-block flag of its own, so it keeps reading
+    ``scoring.partial_credit`` like the text/ordered families do.
     """
-    name = "scoring_" + "_".join(modes)
+    name = "scoring_" + "_".join(modes) + ("" if partial_credit else "_no_partial")
     if name in _SHARED:
         return replace(_SHARED[name], ref=name)
+    members = [Enum("mode", required=True, choices=modes)]
+    if partial_credit:
+        members.append(Bool("partial_credit"))
+    members.extend(
+        (
+            Int("points", minimum=0, maximum=1000),
+            Number("tolerance", minimum=0.0, maximum=1000000.0),
+            Text("units", max_chars=40),
+        )
+    )
     return shared(
         name,
         Obj(
             "scoring",
             description="How the response is judged. Evaluator-only.",
-            members=(
-                Enum("mode", required=True, choices=modes),
-                Bool("partial_credit"),
-                Int("points", minimum=0, maximum=1000),
-                Number("tolerance", minimum=0.0, maximum=1000000.0),
-                Text("units", max_chars=40),
-            ),
+            members=tuple(members),
         ),
     )
 
@@ -1499,7 +1516,8 @@ _EVALUATION_TAIL: tuple[Field, ...] = (_HINTS, _FEEDBACK, _BRANCHING, _NOTES)
 
 def _evaluation(spec: ComponentSpec) -> Field:
     """The evaluation block for one component type, shared by shape."""
-    scoring = _scoring(spec.scoring_modes)
+    answer_has_partial_credit = any(field.name == "partial_credit" for field in spec.answer or ())
+    scoring = _scoring(spec.scoring_modes, partial_credit=not answer_has_partial_credit)
     if spec.self_report:
         # No rubric at all. Grading how confident somebody says they feel is a
         # category error, and a field that exists invites the attempt.
@@ -1512,6 +1530,8 @@ def _evaluation(spec: ComponentSpec) -> Field:
         kind, members, required = "keyed", (_RUBRIC, scoring, *_EVALUATION_TAIL), False
 
     name = f"evaluation_{kind}_{'_'.join(spec.scoring_modes)}"
+    if answer_has_partial_credit:
+        name += "_no_partial"
     if name in _SHARED:
         return replace(_SHARED[name], ref=name, required=required)
     return shared(

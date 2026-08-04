@@ -87,6 +87,16 @@ def deps(hermes_home, clock, config, allowlist) -> Dependencies:
             component_key=component_key,
             config=config,
         ),
+        record_attempt=lambda principal, experience_id, responses, started_at, completed_at: (
+            service.record_attempt(
+                principal=principal,
+                experience_id=experience_id,
+                responses=responses,
+                started_at=started_at,
+                completed_at=completed_at,
+                config=config,
+            )
+        ),
     )
 
 
@@ -136,6 +146,7 @@ PROTECTED_ROUTES = [
     ("GET", "/api/session/component"),
     ("POST", "/api/session/answer"),
     ("GET", "/api/session/result"),
+    ("GET", "/api/session/summary"),
     ("GET", "/api/assets/some-asset-id"),
 ]
 
@@ -270,6 +281,105 @@ def test_a_full_exercise_can_be_served_and_answered(client, experience_id):
     assert result["progress"]["answered"] == 3
     assert sorted(result["answered_components"]) == ["q-one", "q-three", "q-two"]
     assert result["scored"] is False
+
+
+def complete_exercise(client, token: str) -> None:
+    """Answer every component of the ``experience_id`` fixture, in order."""
+    for _ in range(3):
+        current = client.get("/api/session/component", headers=session_headers(token)).json()
+        component = current["component"]
+        answered = client.post(
+            "/api/session/answer",
+            json={
+                "component_id": component["component_id"],
+                "response": response_for(
+                    component["type"], component["payload"].get("content", {})
+                ),
+            },
+            headers=session_headers(token),
+        )
+        assert answered.status_code == 200, answered.text
+
+
+# ── Scoring: GET /api/session/summary ───────────────────────────────────────
+
+
+def test_summary_refuses_before_the_exercise_is_finished(client, experience_id):
+    token, _ = open_session(client, experience_id)
+
+    response = client.get("/api/session/summary", headers=session_headers(token))
+
+    assert response.status_code == 409
+
+
+def test_summary_scores_a_finished_session(client, experience_id):
+    token, _ = open_session(client, experience_id)
+    complete_exercise(client, token)
+
+    summary = client.get("/api/session/summary", headers=session_headers(token))
+
+    assert summary.status_code == 200
+    body = summary.json()
+    assert body["scored"] is True
+    assert body["component_count"] == 3
+    # multiple_choice and true_false are answered correctly by response_for;
+    # short_answer's built response ("word") does not match its accepted forms.
+    assert body["graded_component_count"] == 3
+    assert body["correct_component_count"] == 2
+    assert body["overall_score"] == 2.0
+    # short_answer's fixture declares a point weight of 2 (1 + 2 + 1).
+    assert body["overall_max_score"] == 4.0
+    types = {c["component_type"]: c for c in body["components"]}
+    assert types["multiple_choice"]["correct"] is True
+    assert types["short_answer"]["correct"] is False
+    assert types["true_false"]["correct"] is True
+
+
+def test_summary_is_computed_once_and_cached(client, experience_id):
+    token, _ = open_session(client, experience_id)
+    complete_exercise(client, token)
+
+    first = client.get("/api/session/summary", headers=session_headers(token)).json()
+    second = client.get("/api/session/summary", headers=session_headers(token)).json()
+
+    assert first["attempt_id"] == second["attempt_id"]
+    with service.storage.connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS n FROM attempts").fetchone()["n"]
+    assert count == 1
+
+
+def test_summary_leaks_no_hidden_field(client, experience_id):
+    token, _ = open_session(client, experience_id)
+    complete_exercise(client, token)
+
+    body = client.get("/api/session/summary", headers=session_headers(token)).json()
+
+    blob = json.dumps(body)
+    leaked = {c for c in all_canaries() if c in blob}
+    # Only the matched feedback branch for each graded, correctly-typed
+    # component may legitimately appear.
+    assert leaked <= {
+        CANARY + "-multiple_choice-feedback-correct",
+        CANARY + "-multiple_choice-feedback-incorrect",
+        CANARY + "-multiple_choice-per-option",
+        CANARY + "-short_answer-feedback-correct",
+        CANARY + "-short_answer-feedback-incorrect",
+        CANARY + "-true_false-feedback-correct",
+        CANARY + "-true_false-feedback-incorrect",
+    }
+
+
+def test_result_reports_scored_only_after_summary_is_fetched(client, experience_id):
+    token, _ = open_session(client, experience_id)
+    complete_exercise(client, token)
+
+    before = client.get("/api/session/result", headers=session_headers(token)).json()
+    assert before["scored"] is False
+
+    client.get("/api/session/summary", headers=session_headers(token))
+
+    after = client.get("/api/session/result", headers=session_headers(token)).json()
+    assert after["scored"] is True
 
 
 def test_the_session_token_is_returned_once_and_is_opaque(client, experience_id):

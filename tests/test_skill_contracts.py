@@ -525,15 +525,21 @@ def test_the_skill_keeps_the_conversational_fallback_mandatory(skill_md: str):
     )
 
 
-def test_the_skill_says_running_an_exercise_records_nothing(skill_md: str):
-    """The single most tempting thing to imply once a screen exists."""
+def test_the_skill_distinguishes_mini_app_scoring_from_chat_marking(skill_md: str):
+    """The single most tempting thing to blur once a screen exists.
+
+    An exercise run in the Mini App is scored and durably stored; one run in
+    chat is marked by the agent in the moment and produces no durable attempt.
+    Blurring the two would let a chat-marked exercise be reported as though it
+    fed the same mastery and review-plan machinery a Mini App attempt does.
+    """
     assert_states(
         skill_md,
         (
-            r"nothing they do is recorded|attempts and scores are not stored",
-            r"no score, no mark, no attempt|no review schedule",
+            r"in the mini app[^.]{0,80}(is scored|scored and)",
+            r"in conversation[^.]{0,120}no durable attempt",
         ),
-        "nothing recorded",
+        "mini app vs chat scoring",
     )
 
 

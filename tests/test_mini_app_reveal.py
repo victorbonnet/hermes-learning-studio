@@ -88,6 +88,16 @@ def deps(hermes_home, clock, config, allowlist) -> Dependencies:
                 config=config,
             )
         ),
+        record_attempt=lambda principal, experience_id, responses, started_at, completed_at: (
+            service.record_attempt(
+                principal=principal,
+                experience_id=experience_id,
+                responses=responses,
+                started_at=started_at,
+                completed_at=completed_at,
+                config=config,
+            )
+        ),
     )
 
 

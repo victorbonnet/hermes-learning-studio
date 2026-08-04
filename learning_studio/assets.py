@@ -585,6 +585,55 @@ def read_managed_asset(row: Any) -> bytes:
             os.close(fd)
 
 
+def remove_managed_asset_file(row: Any) -> None:
+    """Unlink one learner's managed asset bytes, identity-checked.
+
+    The one place the plugin ever removes a published file: learner erasure,
+    called after the owning row is already gone from the database. Unlike
+    :func:`retire_managed_asset` — which truncates a possibly-still-referenced
+    inode and leaves a tombstone — erasure is the case where the file itself
+    must disappear.
+
+    The unlink is by basename, so the module's race discipline applies: the
+    name is opened through the inode-pinned directory descriptor with
+    ``O_NOFOLLOW``, and the opened inode is checked against the directory
+    entry and the row's recorded size before the entry is removed. The
+    residual window between that check and ``unlink`` can only be exploited
+    by a writer with write access to the private managed-assets directory —
+    who would already hold the files. A file that is already missing is not
+    an error: the database no longer references it either.
+    """
+    name = str(row["storage_name"])
+    if not name or Path(name).name != name or "/" in name or "\\" in name:
+        raise AssetError("Managed asset integrity validation failed")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    with _open_managed_assets_directory() as (_root, directory_fd):
+        try:
+            fd = os.open(name, flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise AssetError("Managed asset integrity validation failed") from exc
+        try:
+            info = os.fstat(fd)
+            linked = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            expected_size = int(row["byte_size"])
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_size != expected_size
+                or (linked.st_dev, linked.st_ino) != (info.st_dev, info.st_ino)
+            ):
+                raise AssetError("Managed asset integrity validation failed")
+        finally:
+            os.close(fd)
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise AssetError("Managed asset integrity validation failed") from exc
+
+
 def safe_metadata(
     row: Any, *, deduplicated: bool, metadata_conflicts: list[str] | None = None
 ) -> dict[str, Any]:

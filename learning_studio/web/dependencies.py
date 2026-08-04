@@ -97,6 +97,10 @@ class Dependencies:
     #: :func:`learning_studio.service.reveal_component_answer`, which returns one
     #: string and has no way to return the hidden record.
     reveal_answer: Callable[..., Any] = field(default=lambda *_: _unwired("reveal_answer"))
+    #: Score a finished session and store the durable attempt. See
+    #: :func:`learning_studio.service.record_attempt`; nothing the learner
+    #: wrote is stored, only the marks the evaluation engine produced.
+    record_attempt: Callable[..., Any] = field(default=lambda *_: _unwired("record_attempt"))
     #: ``alias -> canonical`` for one component. Returns the mapping and nothing
     #: else; an unknown component yields an empty map rather than an error.
     #:
@@ -195,6 +199,16 @@ def build_dependencies(
                 principal=principal,
                 experience_id=experience_id,
                 component_key=component_key,
+                config=resolved,
+            )
+        ),
+        record_attempt=lambda principal, experience_id, responses, started_at, completed_at: (
+            service.record_attempt(
+                principal=principal,
+                experience_id=experience_id,
+                responses=responses,
+                started_at=started_at,
+                completed_at=completed_at,
                 config=resolved,
             )
         ),

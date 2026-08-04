@@ -5,12 +5,14 @@ learning: structured study sessions built on active recall and spaced
 repetition.
 
 > **Status: early development.** This is not the feature-complete public
-> release. What exists today is a bundled skill plus eight tools: two that
+> release. What exists today is a bundled skill plus twelve tools: two that
 > remember a learner's **context** — their goals, level, preferences, and
 > confirmed learning tracks — one that validates and stores the **exercises** an
-> agent designs, a secure managed-image importer, and four that **open** a
-> stored exercise on the learner's screen and close it again. All storage is
-> profile-scoped.
+> agent designs, a secure managed-image importer, four that **open** a stored
+> exercise on the learner's screen and close it again, and four that make up
+> the **evaluation runtime** — durable attempts, objective-level mastery, a
+> spaced-repetition review plan, an opt-in reminder flag, and full erasure. All
+> storage is profile-scoped.
 >
 > The exercise itself is a **Telegram Mini App** served by a
 > Telegram-authenticated FastAPI service — all thirty-one component types,
@@ -20,10 +22,17 @@ repetition.
 > button in their private chat. See
 > [Opening an exercise](#opening-an-exercise).
 >
-> What is still missing: **nothing is marked and nothing is kept.** There is no
-> scoring engine, no durable attempt or score storage, no progress history and
-> no scheduler. Responses live in the learner's session and are gone when it
-> ends. See [Roadmap](#roadmap) for what is still to come.
+> **Exercises run in the Mini App are now scored, and the outcome is stored
+> durably.** When a learner finishes, every closed-answer component (multiple
+> choice, ordering, matching, cloze, and the rest — see
+> [Scoring](#scoring-and-the-evaluation-runtime)) is marked automatically and
+> the attempt is written to SQLite: overall score, a per-component breakdown,
+> objective mastery, a structured misconception bank, and a spaced-repetition
+> review schedule. Rubric-graded open work (`free_response`,
+> `image_observation`, `case_study`, `self_explanation`, `rubric_response`, and
+> `code_response` authored in rubric mode) is recorded as attempted but is not
+> automatically graded — see that section for why. See
+> [Roadmap](#roadmap) for what is still deliberately not here.
 
 ## Install
 
@@ -140,7 +149,9 @@ installable **Python package**, which drives the layout:
 │   ├── components.py           # The trusted component registry (31 types)
 │   ├── manifest.py             # The experience envelope and its validation
 │   ├── assets.py               # Lazy image validation and atomic managed copies
-│   ├── service.py              # Reads, writes, ownership, consent gates
+│   ├── evaluation.py           # Pure scoring engine + SM-2 review scheduling
+│   ├── service.py              # Reads, writes, ownership, consent gates,
+│   │                           # durable attempts, mastery, misconceptions
 │   ├── schemas.py              # JSON schemas for the four tools
 │   ├── tools.py                # Tool handlers
 │   ├── telegram_auth.py        # Mini App initData verification (stdlib only)
@@ -442,15 +453,20 @@ no address. Those live in the runtime process and end with it.
 
 ## Tools
 
-Eight tools, all in the `plugin_learning_studio` toolset. None takes a learner
-argument: identity is resolved from the Hermes session, so a call always reads
-and writes the record of whoever sent the current message.
+Twelve tools, all in the `plugin_learning_studio` toolset. None takes a
+learner argument: identity is resolved from the Hermes session, so a call
+always reads and writes the record of whoever sent the current message.
 
 The four runtime tools take even less. Between them their payloads carry one
 opaque experience id, one enumerated word, one boolean and one quotation —
 there is no property anywhere for a host, port, URL, executable, command,
 process id, timeout, environment variable, chat, account, or profile. Those
 come from the operator's `config.yaml` and from Hermes' own session context.
+
+The four evaluation-runtime tools take almost nothing at all: three of them
+take no arguments, and the fourth takes one boolean. Nothing here accepts a
+learner's submitted text, a rubric selection, or a raw score — see
+[Scoring and the evaluation runtime](#scoring-and-the-evaluation-runtime).
 
 ### `learning_studio_get_context`
 
@@ -526,26 +542,75 @@ process, and nothing about anyone's performance.
 
 ### `learning_studio_results`
 
-Takes an `experience_id` and reports whether the learner opened it, which
-component they reached, how many they answered, and whether they finished.
-**That is the whole of what exists.** There is no score, no mark, no mastery
-estimate, no durable attempt and no review schedule, and the response says so
-rather than omitting the fields and letting a reader assume. It does not return
-the learner's answers.
+Takes an `experience_id` and reports two independent things, kept apart rather
+than blended:
 
-The answer is explicitly **tri-state**. `availability` is `known` only when a
-runtime actually told it something; otherwise `opened` is `null`, not `false`.
-That distinction matters: `false` is a finding — the learner did not open it —
-and it is only reported when something observed that. With no runtime, or an
-unreachable one, or one with no record of the launch, the honest answer is that
-the evidence is gone, and an agent reading `false` there would tell somebody
-they had ignored an exercise nobody can show they ever saw.
+- **Session progress** — whether the learner opened it, which component they
+  reached, how many they answered, whether they finished — known only while a
+  runtime that served the session is still up.
+- **Scoring** — `scored` and `attempt`, read from durable storage via the same
+  path `learning_studio_attempts` uses, and available whether or not a runtime
+  is currently running. `attempt` is `null` until the learner has finished the
+  exercise in the Mini App; once they have, it carries the overall score, a
+  per-component correct/incorrect breakdown, and any spaced-repetition update
+  it produced. It never carries a stored answer key, a rubric, or the
+  learner's own submitted text.
+
+It does not return the learner's answers either way.
+
+Session progress is explicitly **tri-state**. `availability` is `known` only
+when a runtime actually told it something; otherwise `opened` is `null`, not
+`false`. That distinction matters: `false` is a finding — the learner did not
+open it — and it is only reported when something observed that. With no
+runtime, or an unreachable one, or one with no record of the launch, the honest
+answer is that the evidence is gone, and an agent reading `false` there would
+tell somebody they had ignored an exercise nobody can show they ever saw.
+Scoring is unaffected by any of this: it does not come from the runtime.
 
 ### `learning_studio_stop`
 
 Takes no arguments and closes this profile's runtime and its public address.
 Idempotent, and it can stop nothing but its own profile's runtime. The runtime
 also stops itself — see [Lifetime](#lifetime) — so this is for finishing early.
+Any exercise the learner had already finished was scored and stored durably
+before the runtime is touched, independent of this call.
+
+### `learning_studio_attempts`
+
+Takes no arguments and reports durable, objective-level progress for the
+person the agent is talking to: how many exercises they have completed and
+been scored on, per-objective `mastery_fraction` (points earned over points
+available, from graded components only), and a structured misconception
+bank — `(objective, component_type, occurrences, last_seen_at)` rows, never a
+stored answer or the learner's own words. Also reports
+`review_reminders_enabled`.
+
+### `learning_studio_review_plan`
+
+Takes no arguments and reports the spaced-repetition review plan: objectives
+`due` now and `upcoming`, with the interval each is on, computed from a
+standard SM-2 state machine over the learner's attempt history (see
+[Scoring and the evaluation runtime](#scoring-and-the-evaluation-runtime)).
+Advice for the agent to act on in conversation — never a trigger for anything
+automatic. Also reports `review_reminders_enabled` and a fixed notice that
+this plugin never sends a reminder on its own.
+
+### `learning_studio_set_review_reminders`
+
+Takes one required boolean, `enabled`. Sets `review_reminders_enabled` for the
+learner, defaulting to `false` for everyone and changed only by an explicit
+call — never inferred, never turned on by completing an exercise or asking
+about progress. Turning it on does not, by itself, send anything; see
+[Review reminders are opt-in and this plugin sends none itself](#review-reminders-are-opt-in-and-this-plugin-sends-none-itself).
+
+### `learning_studio_erase_learner`
+
+Takes one required boolean, `confirmed`, which must be `true` or the call is
+refused outright. Deletes every row this plugin holds for the learner — tracks,
+context, objectives, prepared exercises, attempts, scores, review state, the
+misconception bank, and the reminder preference — in one transaction. Deleting
+the learner's own row is the whole operation: every other table cascades from
+it by foreign key, so nothing is left behind by accident. Irreversible.
 
 ## Opening an exercise
 
@@ -1390,16 +1455,23 @@ with an older captured payload.
 | `GET` | `/api/session/component` | The component currently in view |
 | `POST` | `/api/session/answer` | Record a response and advance |
 | `POST` | `/api/session/reveal` | Turn a flashcard over, after an attempt |
-| `GET` | `/api/session/result` | Progress summary for the session |
+| `GET` | `/api/session/result` | Progress, and whether it has been scored yet |
+| `GET` | `/api/session/summary` | The completion screen: score the finished session, once |
 | `GET` | `/api/assets/{id}` | One managed image, verified on the way out |
 | `GET` | `/`, `/index.html` | The Mini App document |
 | `GET` | `/static/{app.css,i18n.js,renderers.js,app.js}` | The frontend, from a closed allowlist |
 
 Every `/api/` route is authenticated. The five static files are the only public
 ones — see [The Mini App interface](#the-mini-app-interface) for why a webview
-shell cannot be — and no interactive docs or OpenAPI schema is published. Answers are recorded **in the session** and nothing is marked:
-grading and durable attempt storage arrive with the evaluation runtime, and
-every completion response says so rather than implying a score exists.
+shell cannot be — and no interactive docs or OpenAPI schema is published.
+Answers are recorded **in the session** while the exercise is in progress and
+nothing is marked per answer; `GET /api/session/summary` requires the session
+to be complete, scores it exactly once — calling it again returns the same
+cached result rather than scoring a second time or writing a second durable
+attempt — and is what actually calls
+[`service.record_attempt`](#scoring-and-the-evaluation-runtime). See
+[Scoring and the evaluation runtime](#scoring-and-the-evaluation-runtime) for
+what is and is not machine-graded.
 
 An asset is served only when the caller owns it *and* the session's own
 experience references it, and its bytes are re-hashed against the recorded
@@ -1625,8 +1697,10 @@ rendered.
 ### The response contract
 
 Each card submits a `response` to `POST /api/session/answer`. Field names mirror
-the component's own answer schema, so a later evaluation runtime compares like
-with like. Nothing is scored yet; this is the wire format that scoring will read.
+the component's own answer schema, so the evaluation runtime compares like with
+like: this is exactly the shape `evaluation.score_component` reads when
+`GET /api/session/summary` scores the finished session — see
+[Scoring and the evaluation runtime](#scoring-and-the-evaluation-runtime).
 
 | Types | Response |
 | --- | --- |
@@ -1811,6 +1885,142 @@ forbidden sinks, client/server route agreement, locale parity, every registry
 type has a renderer) and `tests/test_mini_app_ui.py` (routes, headers, policy),
 and by looking at the thing on a phone.
 
+## Scoring and the evaluation runtime
+
+When a learner finishes an exercise in the Mini App, `GET
+/api/session/summary` scores the attempt and stores it durably. Everything
+below is implemented in `learning_studio/evaluation.py` (a pure scoring
+function, no storage, no network) and wired up by
+`learning_studio.service.record_attempt`, which is the only thing that writes
+a durable attempt.
+
+### The scoring engine
+
+One function, `evaluation.score_component`, scores every one of the 31
+component types. It dispatches on the *stored* `evaluation.scoring.mode` —
+the mode the manifest's author picked when they wrote the exercise, already
+constrained to what that type can legally be scored with — not on the
+component type directly:
+
+- **`exact` / `normalised` / `numeric`** — text and single-choice answers.
+  `normalised` collapses whitespace and applies the declared
+  `case_sensitive`/`accent_sensitive` flags; `numeric` parses a leading number
+  from the submission and compares it to the accepted values within
+  `scoring.tolerance`.
+- **`set`** — multi-select, classification, matching, categorization, and
+  labeling. Partial credit, where the type's own answer block declares a
+  `partial_credit` flag, is *matched-minus-false-positive, divided by the
+  number of expected entries, floored at zero* — not the only reasonable
+  formula, but a documented, deterministic, and tested one.
+- **`table_grid`** (`exact` or `normalised`, never `set`) — scored per cell
+  against that cell's own accepted forms: a grid is independent text answers
+  in a shape, not an unordered collection, so the set algorithm does not
+  apply. `partial_credit` is the fraction of cells matched, and is declared
+  in the answer block like the set-family types above.
+- **`ordered`** — sentence/sequence order, timeline, and process-flow score
+  the fraction of positions where the submission agrees with the expected
+  order at that same index ("correctly placed", not edit distance). With
+  `partial_credit`, the denominator is the longer of the expected and
+  submitted lengths, so padding a submission with extra items cannot recover
+  credit lost to wrong positions.
+  `decision_path`'s response contract is a *set* of `{step_id, option_id}`
+  pairs rather than a sequence, so it is scored per-step instead.
+- **`rubric`** — `free_response`, `image_observation`, `case_study`,
+  `self_explanation`, `rubric_response`, and `code_response` authored with
+  `scoring.mode: rubric`. This engine does not run a model over a learner's
+  prose to invent a mark: without an explicit `rubric_levels` input (which
+  the current tool surface has no path to supply — there is no reviewer
+  workflow yet), the attempt is recorded as made and left **ungraded**. Given
+  `rubric_levels`, the aggregation is deterministic: sum the points of the
+  chosen level per criterion, out of the sum of each criterion's highest
+  level.
+- **`self_check`** — `flashcard`, `confidence_rating`, `reflection`. Never
+  machine-graded, by design: nobody should override a learner's own read of
+  their recall. A flashcard's self-rating (`again`/`hard`/`good`/`easy`) still
+  feeds the spaced-repetition schedule below.
+- **`hotspot`** (its own case): a submitted point is scored inside a region
+  expanded by the declared `tolerance` for rectangle and circle regions;
+  polygon regions are checked without the expansion, since growing an
+  arbitrary polygon by a scalar margin needs a straight-skeleton offset this
+  engine does not implement — an accepted, documented limitation, not a
+  silent gap.
+
+Every scoring decision above is exhaustively unit-tested per component type in
+`tests/test_evaluation.py`, against the same canaried fixtures
+(`tests/component_examples.py`) the registry and leak tests use.
+
+### Durable attempts, and what they do not contain
+
+`record_attempt` runs inside one transaction: it loads the hidden evaluation
+record for every component of the experience, scores each submitted response,
+and writes one `attempts` row plus one `attempt_components` row per scored
+component. What is **not** written: the learner's submitted text. A component
+result carries `graded`, `correct`, `score`, `max_score`, and — copied
+verbatim from the manifest's own `evaluation.feedback`, and only the branch
+that matches the outcome — `feedback`. Nothing else from the hidden half of a
+component (answer key, rubric, hints, branching, evaluator notes) is ever
+reachable from a durable attempt, a tool response, or the completion screen; a
+test walks every string in these responses and asserts none of it is a
+canary planted in a hidden field.
+
+### Objective mastery and the misconception bank
+
+When an experience is attached to an objective, every attempt against it
+contributes to that objective's `mastery_fraction` — `learning_studio_attempts`
+reports the sum of scores over the sum of point ceilings, aggregated across
+attempts, per objective. A wrong, *graded* component increments a structured
+misconception row keyed by `(objective, component_type)` — never the
+learner's answer, never free text. Turning that pair into something worth
+saying ("you keep placing the base case after the recursive step") is the
+agent's job, using the objective's own wording; the row supplies the count,
+not the sentence.
+
+### Spaced repetition (SM-2)
+
+Review scheduling is a standard [SM-2](https://en.wikipedia.org/wiki/SuperMemo#Description_of_SM-2_algorithm)
+implementation (`evaluation.sm2_update`), chosen over a bespoke scheme because
+it is small, well understood, and needs only one quality signal per review. A
+quality value (0–5) is derived, not asked for: a graded component's quality is
+its score fraction scaled to 0–5; a flashcard's is its self-rating mapped
+through a fixed table (`again`→0, `hard`→3, `good`→4, `easy`→5). An objective
+touched by several components in one attempt uses the mean of every quality
+signal produced. The result — an interval, an ease factor, a repetition
+count, and a next review date — is stored per `(learner, objective)` in
+`review_state`, and `learning_studio_review_plan` reports what is `due` now
+and what is `upcoming`.
+
+### Review reminders are opt-in and this plugin sends none itself
+
+`review_reminders_enabled` defaults to `false` for every learner and is
+changed only by `learning_studio_set_review_reminders`, called only after the
+learner has said so explicitly. Turning it on does not, by itself, cause
+anything to be sent — **this plugin has no scheduler, no daemon, and no code
+path that sends a message on its own.** A reminder can only ever reach a
+learner because an operator has separately configured a Hermes cron job that
+periodically asks the agent to check the review plan and act on it in
+conversation, for a learner who has opted in. A suggested prompt for that job:
+
+```
+Check learning_studio_review_plan for every learner who has
+review_reminders_enabled set. For each one with an objective due for
+review, send them a short, friendly message in their own conversation
+asking if they'd like to review it now. Do not open an exercise or
+send anything else automatically — wait for them to say yes.
+```
+
+This plugin does not create that cron job, does not know whether one exists,
+and works identically whether or not it does.
+
+### Erasure
+
+`learning_studio_erase_learner` (`confirmed: true` required) deletes the
+learner's own row from `learners`; every attempt, score, review-state row,
+misconception row, and reminder preference — along with everything else the
+plugin already stored for that learner — cascades from it by foreign key, in
+the same transaction. `tests/test_migrations.py` and `tests/test_attempts.py`
+assert the cascade reaches every table this PR adds and leaves the database
+passing `PRAGMA foreign_key_check`.
+
 ## Roadmap
 
 Secure managed image import **is** here: `learning_studio_import_asset`
@@ -1824,22 +2034,29 @@ behind the `web` extra — including managed asset delivery. See
 
 The card renderers and the Mini App frontend **are** here: all thirty-one
 component types render, submit, and are keyboard-operable, in three interface
-languages. See [The Mini App interface](#the-mini-app-interface).
+languages, including the completion screen. See
+[The Mini App interface](#the-mini-app-interface).
 
 Starting the runtime, opening a Cloudflare Quick Tunnel, and sending a Telegram
 Web App button **are** here, with `learning_studio_launch`, `_status`,
 `_results` and `_stop`. See [Opening an exercise](#opening-an-exercise).
 
-Deliberately **not** here: image-generation providers, slash commands, scoring,
-durable attempt or score storage, progress dashboards, any scheduler or spaced
-repetition daemon, custom domains, permanent named tunnels, Cloudflare account
-provisioning, and automatic installation of anything.
+**The evaluation runtime is here.** A pure scoring function for all 31
+component types, durable attempts, objective-level mastery, a structured
+misconception bank, a standard SM-2 spaced-repetition schedule, and an
+opt-in-only reminder flag — with `learning_studio_attempts`,
+`_review_plan`, `_set_review_reminders`, and `_erase_learner`. See
+[Scoring and the evaluation runtime](#scoring-and-the-evaluation-runtime).
 
-**Nothing is marked and nothing is kept.** Responses live in the learner's
-session and end with it; `learning_studio_results` reports whether they opened
-the exercise and how far they got, and nothing else exists to report. The skill
-says so, in those terms, and instructs the agent to say so too rather than
-implying a report card is coming.
+Deliberately **not** here: image-generation providers, slash commands, an
+LLM- or human-graded pass over open-ended rubric responses (`free_response`,
+`image_observation`, `case_study`, `self_explanation`, `rubric_response`,
+rubric-mode `code_response` — recorded as attempted, not automatically
+graded), progress dashboards, any scheduler or reminder-sending daemon of this
+plugin's own (an operator wires a Hermes cron job instead — see
+[Review reminders are opt-in and this plugin sends none itself](#review-reminders-are-opt-in-and-this-plugin-sends-none-itself)),
+custom domains, permanent named tunnels, Cloudflare account provisioning, and
+automatic installation of anything.
 
 ## Development
 

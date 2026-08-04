@@ -809,6 +809,162 @@ _MIGRATION_009 = (
 )
 
 
+# Version 10 adds the evaluation runtime: durable attempts, per-component
+# results, spaced-repetition review state, a structured misconception bank,
+# and one opt-in preference flag.
+#
+# Four tables, and every one of them keeps the same promises the rest of the
+# schema already makes:
+#
+# - **No learner-owned row without an ownership column.** Every table here
+#   carries ``profile_id`` and ``learner_id``, and every foreign key includes
+#   them, so a query that forgets a ``WHERE`` clause fails loudly rather than
+#   returning someone else's data.
+# - **Erasure is one deletion away.** Every table's ownership chain resolves
+#   back to ``learners`` through ``ON DELETE CASCADE`` — ``attempts`` and
+#   ``attempt_components`` through ``experiences``, ``review_state`` and
+#   ``misconceptions`` through ``objectives`` when an objective is named and
+#   directly otherwise — so ``DELETE FROM learners WHERE id = ? AND
+#   profile_id = ?`` removes every row this migration adds, in the caller's
+#   one transaction, the same way it already removes tracks, contexts,
+#   experiences and managed assets.
+# - **No raw learner response text.** ``attempt_components`` stores a mark —
+#   ``graded``, ``correct``, ``score``, ``max_score`` — and never the
+#   submitted value that produced it. What a self-report actually said
+#   (a flashcard's self-rating, a confidence rating) is a closed vocabulary
+#   or a bounded integer, not free text, and even that is not retained once
+#   it has fed ``review_state`` — see ``learning_studio.service.record_attempt``.
+_MIGRATION_010 = (
+    """
+    CREATE TABLE attempts (
+        id                    TEXT    PRIMARY KEY,
+        profile_id            TEXT    NOT NULL,
+        learner_id            TEXT    NOT NULL,
+        experience_id         TEXT    NOT NULL,
+        track_id              TEXT,
+        objective_id          TEXT,
+        component_count       INTEGER NOT NULL CHECK (component_count >= 0),
+        graded_count          INTEGER NOT NULL CHECK (graded_count >= 0),
+        correct_count         INTEGER NOT NULL CHECK (correct_count >= 0),
+        overall_score         REAL,
+        overall_max_score     REAL,
+        started_at            TEXT    NOT NULL,
+        completed_at          TEXT    NOT NULL,
+        created_at            TEXT    NOT NULL,
+        UNIQUE (id, profile_id, learner_id),
+        FOREIGN KEY (learner_id, profile_id)
+            REFERENCES learners (id, profile_id) ON DELETE CASCADE,
+        FOREIGN KEY (experience_id, profile_id, learner_id)
+            REFERENCES experiences (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    "CREATE INDEX idx_attempts_owner ON attempts (profile_id, learner_id, completed_at)",
+    "CREATE INDEX idx_attempts_objective ON attempts (profile_id, learner_id, objective_id)",
+    """
+    CREATE TABLE attempt_components (
+        id             TEXT    PRIMARY KEY,
+        attempt_id     TEXT    NOT NULL,
+        profile_id     TEXT    NOT NULL,
+        learner_id     TEXT    NOT NULL,
+        experience_id  TEXT    NOT NULL,
+        component_id   TEXT    NOT NULL,
+        component_type TEXT    NOT NULL,
+        objective_id   TEXT,
+        graded         INTEGER NOT NULL CHECK (graded IN (0, 1)),
+        correct        INTEGER CHECK (correct IN (0, 1)),
+        score          REAL,
+        max_score      REAL,
+        created_at     TEXT    NOT NULL,
+        UNIQUE (attempt_id, component_id),
+        FOREIGN KEY (attempt_id, profile_id, learner_id)
+            REFERENCES attempts (id, profile_id, learner_id) ON DELETE CASCADE,
+        FOREIGN KEY (component_id, experience_id, profile_id, learner_id)
+            REFERENCES experience_components (id, experience_id, profile_id, learner_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX idx_attempt_components_owner
+        ON attempt_components (profile_id, learner_id, attempt_id)
+    """,
+    """
+    CREATE INDEX idx_attempt_components_objective
+        ON attempt_components (profile_id, learner_id, objective_id, component_type)
+    """,
+    # One row per (learner, objective): the spaced-repetition state machine's
+    # own memory, distinct from — and never derived from — Hermes memory.
+    """
+    CREATE TABLE review_state (
+        id              TEXT    PRIMARY KEY,
+        profile_id      TEXT    NOT NULL,
+        learner_id      TEXT    NOT NULL,
+        objective_id    TEXT    NOT NULL,
+        interval_days   INTEGER NOT NULL CHECK (interval_days >= 1),
+        ease_factor     REAL    NOT NULL CHECK (ease_factor >= 1.3),
+        repetitions     INTEGER NOT NULL CHECK (repetitions >= 0),
+        last_quality    INTEGER NOT NULL CHECK (last_quality BETWEEN 0 AND 5),
+        last_reviewed_at TEXT   NOT NULL,
+        next_review_at  TEXT    NOT NULL,
+        created_at      TEXT    NOT NULL,
+        updated_at      TEXT    NOT NULL,
+        UNIQUE (profile_id, learner_id, objective_id),
+        FOREIGN KEY (objective_id, profile_id, learner_id)
+            REFERENCES objectives (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX idx_review_state_due
+        ON review_state (profile_id, learner_id, next_review_at)
+    """,
+    # Structured, never free text: a category is (objective, component type),
+    # counted. "ser/estar confusion" is the kind of label an agent derives
+    # from that pair and the objective's own wording when it reads this back
+    # — never a string stored here.
+    """
+    CREATE TABLE misconceptions (
+        id             TEXT    PRIMARY KEY,
+        profile_id     TEXT    NOT NULL,
+        learner_id     TEXT    NOT NULL,
+        objective_id   TEXT,
+        component_type TEXT    NOT NULL,
+        occurrences    INTEGER NOT NULL CHECK (occurrences >= 1),
+        last_seen_at   TEXT    NOT NULL,
+        created_at     TEXT    NOT NULL,
+        updated_at     TEXT    NOT NULL,
+        FOREIGN KEY (learner_id, profile_id)
+            REFERENCES learners (id, profile_id) ON DELETE CASCADE,
+        FOREIGN KEY (objective_id, profile_id, learner_id)
+            REFERENCES objectives (id, profile_id, learner_id) ON DELETE CASCADE
+    )
+    """,
+    # A NULL objective_id means "not attributed to one objective"; the
+    # expression index treats every such row as sharing one identity per
+    # (learner, component_type) rather than as distinct, which plain
+    # ``UNIQUE`` cannot do since SQL does not equate two NULLs.
+    """
+    CREATE UNIQUE INDEX idx_misconceptions_identity
+        ON misconceptions (profile_id, learner_id, COALESCE(objective_id, ''), component_type)
+    """,
+    "CREATE INDEX idx_misconceptions_owner ON misconceptions (profile_id, learner_id)",
+    # One flag, defaulting closed. The plugin never sends anything on its
+    # own; this is only ever read by the operator's own cron-triggered check,
+    # documented in the README, and only ever set by
+    # ``learning_studio_set_review_reminders`` on the learner's own say-so.
+    """
+    CREATE TABLE learner_preferences (
+        learner_id                 TEXT    PRIMARY KEY,
+        profile_id                 TEXT    NOT NULL,
+        review_reminders_enabled   INTEGER NOT NULL DEFAULT 0
+                                   CHECK (review_reminders_enabled IN (0, 1)),
+        created_at                 TEXT    NOT NULL,
+        updated_at                 TEXT    NOT NULL,
+        FOREIGN KEY (learner_id, profile_id)
+            REFERENCES learners (id, profile_id) ON DELETE CASCADE
+    )
+    """,
+)
+
+
 #: Ordered, contiguous from 1. The list order is the application order.
 MIGRATIONS: list[Migration] = [
     Migration(version=1, statements=_MIGRATION_001),
@@ -820,6 +976,7 @@ MIGRATIONS: list[Migration] = [
     Migration(version=7, statements=_MIGRATION_007),
     Migration(version=8, statements=_MIGRATION_008),
     Migration(version=9, statements=_MIGRATION_009),
+    Migration(version=10, statements=_MIGRATION_010),
 ]
 
 SCHEMA_VERSION = MIGRATIONS[-1].version

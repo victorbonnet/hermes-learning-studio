@@ -56,6 +56,7 @@ from .models import (
     validate_field_value,
     validate_track_name,
 )
+from .responses import SKIPPED_RESPONSE
 
 #: Returned whenever a caller names an object they do not own, or one that
 #: does not exist. The two cases are deliberately indistinguishable.
@@ -2959,6 +2960,635 @@ def read_managed_asset(
         byte_size=int(row["byte_size"]),
         data=data,
     )
+
+
+# ── The evaluation runtime: scoring, durable attempts, mastery, review ────
+#
+# Everything below shares one shape: read the hidden half inside a
+# transaction, score it with the pure functions in
+# :mod:`learning_studio.evaluation`, and write back only a mark — never the
+# submitted response, never the stored answer or rubric. What crosses back
+# out to a caller is built field by field, the same discipline
+# :func:`_experience_payload` already applies to the learner-visible half of
+# an experience.
+
+NOT_FOUND_ATTEMPT_MESSAGE = "No such recorded attempt for this learner."
+
+
+def _attempt_component_rows(
+    conn: sqlite3.Connection, *, profile: str, learner_id: str, experience_id: str
+) -> list[sqlite3.Row]:
+    """Every component of one experience, with its hidden evaluation record.
+
+    A ``LEFT JOIN`` rather than an inner one: a self-report or rubric-only
+    component may have no ``answer`` at all, but every component that carries
+    *any* hidden data — which is every scored type — has an evaluation row,
+    so this only matters for a component with neither, which scores as
+    "nothing to grade" rather than being silently dropped from the attempt.
+    """
+    return conn.execute(
+        "SELECT c.id AS row_id, c.component_key, c.component_type, e.evaluation"
+        "  FROM experience_components AS c"
+        "  LEFT JOIN experience_component_evaluations AS e"
+        "    ON e.component_id = c.id AND e.profile_id = c.profile_id"
+        "   AND e.learner_id = c.learner_id"
+        " WHERE c.experience_id = ? AND c.profile_id = ? AND c.learner_id = ?"
+        " ORDER BY c.position",
+        (experience_id, profile, learner_id),
+    ).fetchall()
+
+
+def record_attempt(
+    *,
+    principal: Principal,
+    experience_id: str,
+    responses: dict[str, Any],
+    started_at: str,
+    completed_at: str | None = None,
+    config: LearningStudioConfig | None = None,
+) -> dict[str, Any]:
+    """Score a finished session and store the durable attempt.
+
+    ``responses`` is ``component_key -> canonical response``, exactly what
+    :func:`learning_studio.responses.validate_component_response` already
+    produced for each answer the Mini App API accepted — the aliases are
+    already resolved and the shape is already checked, so scoring here never
+    has to trust anything about the request itself again.
+
+    Nothing the learner wrote is stored by this call. What is stored, per
+    component, is a mark: graded or not, correct or not, a score and a
+    ceiling. Objective mastery, the misconception bank, and spaced-repetition
+    review state are updated from those marks in the same transaction, so an
+    attempt is never partially recorded.
+    """
+    from . import evaluation as scoring
+
+    config = config or load_config()
+    profile = principal.profile
+    completed_at = completed_at or _now()
+
+    storage.initialize(config)
+    with storage.connect(config) as conn, storage.transaction(conn):
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            raise NotFoundError(NOT_FOUND_EXPERIENCE_MESSAGE)
+
+        experience_row = conn.execute(
+            "SELECT track_id, objective_id FROM experiences"
+            " WHERE id = ? AND profile_id = ? AND learner_id = ?",
+            (str(experience_id), profile, learner_id),
+        ).fetchone()
+        if experience_row is None:
+            raise NotFoundError(NOT_FOUND_EXPERIENCE_MESSAGE)
+        track_id = experience_row["track_id"]
+        objective_id = experience_row["objective_id"]
+
+        rows = _attempt_component_rows(
+            conn, profile=profile, learner_id=learner_id, experience_id=str(experience_id)
+        )
+
+        now = _now()
+        attempt_id = _new_id()
+        scored: list[tuple[sqlite3.Row, scoring.ComponentResult]] = []
+        objective_results: list[scoring.ComponentResult] = []
+        graded_count = 0
+        correct_count = 0
+        score_sum = 0.0
+        max_sum = 0.0
+
+        for row in rows:
+            response = responses.get(str(row["component_key"]))
+            if response is None or response == SKIPPED_RESPONSE:
+                continue
+            hidden = json.loads(str(row["evaluation"])) if row["evaluation"] else {}
+            try:
+                result = scoring.score_component(
+                    component_type=str(row["component_type"]), hidden=hidden, response=response
+                )
+            except scoring.EvaluationError:
+                continue
+            scored.append((row, result))
+            if objective_id:
+                objective_results.append(result)
+            if result.graded:
+                graded_count += 1
+                if result.correct:
+                    correct_count += 1
+                if result.score is not None:
+                    score_sum += result.score
+                if result.max_score is not None:
+                    max_sum += result.max_score
+
+        conn.execute(
+            "INSERT INTO attempts"
+            " (id, profile_id, learner_id, experience_id, track_id, objective_id,"
+            "  component_count, graded_count, correct_count, overall_score, overall_max_score,"
+            "  started_at, completed_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                attempt_id,
+                profile,
+                learner_id,
+                str(experience_id),
+                track_id,
+                objective_id,
+                len(rows),
+                graded_count,
+                correct_count,
+                score_sum if graded_count else None,
+                max_sum if graded_count else None,
+                started_at,
+                completed_at,
+                now,
+            ),
+        )
+
+        component_summaries: list[dict[str, Any]] = []
+        for row, result in scored:
+            conn.execute(
+                "INSERT INTO attempt_components"
+                " (id, attempt_id, profile_id, learner_id, experience_id, component_id,"
+                "  component_type, objective_id, graded, correct, score, max_score, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _new_id(),
+                    attempt_id,
+                    profile,
+                    learner_id,
+                    str(experience_id),
+                    row["row_id"],
+                    str(row["component_type"]),
+                    objective_id,
+                    1 if result.graded else 0,
+                    None if result.correct is None else (1 if result.correct else 0),
+                    result.score,
+                    result.max_score,
+                    now,
+                ),
+            )
+            if result.graded and result.correct is False:
+                _record_misconception(
+                    conn,
+                    profile=profile,
+                    learner_id=learner_id,
+                    objective_id=objective_id,
+                    component_type=str(row["component_type"]),
+                    now=now,
+                )
+            component_summaries.append(
+                {
+                    "component_id": str(row["component_key"]),
+                    "component_type": str(row["component_type"]),
+                    "graded": result.graded,
+                    "correct": result.correct,
+                    "score": result.score,
+                    "max_score": result.max_score,
+                    "feedback": result.feedback,
+                }
+            )
+
+        review = None
+        if objective_id and objective_results:
+            review = _update_review_state(
+                conn,
+                profile=profile,
+                learner_id=learner_id,
+                objective_id=str(objective_id),
+                results=objective_results,
+                now=now,
+            )
+
+    return {
+        "attempt_id": attempt_id,
+        "experience_id": str(experience_id),
+        "objective_id": objective_id,
+        "component_count": len(rows),
+        "graded_component_count": graded_count,
+        "correct_component_count": correct_count,
+        "overall_score": score_sum if graded_count else None,
+        "overall_max_score": max_sum if graded_count else None,
+        "components": component_summaries,
+        "review": review,
+    }
+
+
+def _record_misconception(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    learner_id: str,
+    objective_id: str | None,
+    component_type: str,
+    now: str,
+) -> None:
+    """Bump a structured (objective, component type) miss counter.
+
+    Never the learner's text, never the stored answer: only which objective
+    and which kind of component a wrong, graded response came from. An agent
+    reading this back turns the pair into a description using the
+    objective's own wording — this row supplies the count, not the words.
+    """
+    conn.execute(
+        "INSERT INTO misconceptions"
+        " (id, profile_id, learner_id, objective_id, component_type, occurrences,"
+        "  last_seen_at, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)"
+        " ON CONFLICT (profile_id, learner_id, COALESCE(objective_id, ''), component_type)"
+        " DO UPDATE SET occurrences = occurrences + 1, last_seen_at = excluded.last_seen_at,"
+        " updated_at = excluded.updated_at",
+        (_new_id(), profile, learner_id, objective_id, component_type, now, now, now),
+    )
+
+
+def _update_review_state(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    learner_id: str,
+    objective_id: str,
+    results: list[Any],
+    now: str,
+) -> dict[str, Any] | None:
+    """Apply one SM-2 step for this objective, from this attempt's marks."""
+    from . import evaluation as scoring
+
+    quality = scoring.objective_quality(results)
+    if quality is None:
+        return None
+
+    row = conn.execute(
+        "SELECT interval_days, ease_factor, repetitions FROM review_state"
+        " WHERE profile_id = ? AND learner_id = ? AND objective_id = ?",
+        (profile, learner_id, objective_id),
+    ).fetchone()
+    state = (
+        scoring.ReviewState(
+            interval_days=int(row["interval_days"]),
+            ease_factor=float(row["ease_factor"]),
+            repetitions=int(row["repetitions"]),
+        )
+        if row is not None
+        else scoring.INITIAL_REVIEW_STATE
+    )
+    updated = scoring.sm2_update(quality=quality, state=state)
+    next_review_at = (datetime.now(UTC) + timedelta(days=updated.interval_days)).isoformat()
+
+    conn.execute(
+        "INSERT INTO review_state"
+        " (id, profile_id, learner_id, objective_id, interval_days, ease_factor,"
+        "  repetitions, last_quality, last_reviewed_at, next_review_at, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT (profile_id, learner_id, objective_id) DO UPDATE SET"
+        " interval_days = excluded.interval_days, ease_factor = excluded.ease_factor,"
+        " repetitions = excluded.repetitions, last_quality = excluded.last_quality,"
+        " last_reviewed_at = excluded.last_reviewed_at, next_review_at = excluded.next_review_at,"
+        " updated_at = excluded.updated_at",
+        (
+            _new_id(),
+            profile,
+            learner_id,
+            objective_id,
+            updated.interval_days,
+            updated.ease_factor,
+            updated.repetitions,
+            quality,
+            now,
+            next_review_at,
+            now,
+            now,
+        ),
+    )
+    return {
+        "objective_id": objective_id,
+        "interval_days": updated.interval_days,
+        "next_review_at": next_review_at,
+    }
+
+
+def _attempt_projection(
+    conn: sqlite3.Connection, *, profile: str, learner_id: str, attempt: sqlite3.Row
+) -> dict[str, Any]:
+    """Build the learner-safe view of one attempt row and its components."""
+    components = conn.execute(
+        "SELECT ac.component_type, ac.graded, ac.correct, ac.score, ac.max_score,"
+        "       c.component_key"
+        "  FROM attempt_components AS ac"
+        "  JOIN experience_components AS c ON c.id = ac.component_id"
+        " WHERE ac.attempt_id = ? AND ac.profile_id = ? AND ac.learner_id = ?",
+        (str(attempt["id"]), profile, learner_id),
+    ).fetchall()
+    return {
+        "attempt_id": str(attempt["id"]),
+        "experience_id": str(attempt["experience_id"]),
+        "objective_id": attempt["objective_id"],
+        "completed_at": attempt["completed_at"],
+        "component_count": int(attempt["component_count"]),
+        "graded_component_count": int(attempt["graded_count"]),
+        "correct_component_count": int(attempt["correct_count"]),
+        "overall_score": attempt["overall_score"],
+        "overall_max_score": attempt["overall_max_score"],
+        "components": [
+            {
+                "component_id": str(row["component_key"]),
+                "component_type": str(row["component_type"]),
+                "graded": bool(row["graded"]),
+                "correct": None if row["correct"] is None else bool(row["correct"]),
+                "score": row["score"],
+                "max_score": row["max_score"],
+            }
+            for row in components
+        ],
+    }
+
+
+def attempt_summary(
+    *, principal: Principal, attempt_id: str, config: LearningStudioConfig | None = None
+) -> dict[str, Any]:
+    """Read back one durable attempt: summary-level marks, never the response."""
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            raise NotFoundError(NOT_FOUND_ATTEMPT_MESSAGE)
+        attempt = conn.execute(
+            "SELECT * FROM attempts WHERE id = ? AND profile_id = ? AND learner_id = ?",
+            (str(attempt_id), profile, learner_id),
+        ).fetchone()
+        if attempt is None:
+            raise NotFoundError(NOT_FOUND_ATTEMPT_MESSAGE)
+        return _attempt_projection(conn, profile=profile, learner_id=learner_id, attempt=attempt)
+
+
+def latest_attempt_for_experience(
+    *, principal: Principal, experience_id: str, config: LearningStudioConfig | None = None
+) -> dict[str, Any] | None:
+    """The most recent durable attempt for one experience, or ``None``.
+
+    Used to answer "how did they do?" for a specific exercise without the
+    caller needing to already hold an attempt id — ``learning_studio_results``
+    is the one tool-facing caller.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            return None
+        attempt = conn.execute(
+            "SELECT * FROM attempts"
+            " WHERE experience_id = ? AND profile_id = ? AND learner_id = ?"
+            " ORDER BY completed_at DESC LIMIT 1",
+            (str(experience_id), profile, learner_id),
+        ).fetchone()
+        if attempt is None:
+            return None
+        return _attempt_projection(conn, profile=profile, learner_id=learner_id, attempt=attempt)
+
+
+def attempts_overview(
+    *, principal: Principal, config: LearningStudioConfig | None = None
+) -> dict[str, Any]:
+    """Everything durably known about a learner's practice, summary-level only.
+
+    Attempt counts, per-objective progress, the misconception bank, and the
+    current review plan — never a stored answer, never a learner's own text.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            return {
+                "ok": True,
+                "attempts_count": 0,
+                "objectives": [],
+                "misconceptions": [],
+                "review_reminders_enabled": False,
+            }
+
+        attempts_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM attempts WHERE profile_id = ? AND learner_id = ?",
+            (profile, learner_id),
+        ).fetchone()["n"]
+
+        objective_rows = conn.execute(
+            "SELECT a.objective_id, o.behavior, o.condition, o.standard,"
+            "       COUNT(*) AS attempts,"
+            "       SUM(a.graded_count) AS graded, SUM(a.correct_count) AS correct,"
+            "       SUM(a.overall_score) AS score_sum, SUM(a.overall_max_score) AS max_sum"
+            "  FROM attempts AS a"
+            "  JOIN objectives AS o ON o.id = a.objective_id AND o.profile_id = a.profile_id"
+            "                      AND o.learner_id = a.learner_id"
+            " WHERE a.profile_id = ? AND a.learner_id = ? AND a.objective_id IS NOT NULL"
+            " GROUP BY a.objective_id"
+            " ORDER BY MAX(a.completed_at) DESC",
+            (profile, learner_id),
+        ).fetchall()
+
+        misconception_rows = conn.execute(
+            "SELECT objective_id, component_type, occurrences, last_seen_at"
+            "  FROM misconceptions WHERE profile_id = ? AND learner_id = ?"
+            " ORDER BY occurrences DESC, last_seen_at DESC LIMIT 20",
+            (profile, learner_id),
+        ).fetchall()
+
+        preference = conn.execute(
+            "SELECT review_reminders_enabled FROM learner_preferences"
+            " WHERE learner_id = ? AND profile_id = ?",
+            (learner_id, profile),
+        ).fetchone()
+
+    return {
+        "ok": True,
+        "attempts_count": int(attempts_count),
+        "objectives": [
+            {
+                "objective_id": str(row["objective_id"]),
+                "behavior": str(row["behavior"]),
+                "condition": str(row["condition"]),
+                "standard": str(row["standard"]),
+                "attempts": int(row["attempts"]),
+                "graded_component_count": int(row["graded"] or 0),
+                "correct_component_count": int(row["correct"] or 0),
+                "mastery_fraction": (
+                    (row["score_sum"] / row["max_sum"]) if row["max_sum"] not in (None, 0) else None
+                ),
+            }
+            for row in objective_rows
+        ],
+        "misconceptions": [
+            {
+                "objective_id": row["objective_id"],
+                "component_type": str(row["component_type"]),
+                "occurrences": int(row["occurrences"]),
+                "last_seen_at": str(row["last_seen_at"]),
+            }
+            for row in misconception_rows
+        ],
+        "review_reminders_enabled": bool(preference["review_reminders_enabled"])
+        if preference
+        else False,
+    }
+
+
+def review_plan(
+    *, principal: Principal, config: LearningStudioConfig | None = None
+) -> dict[str, Any]:
+    """Suggested review dates per objective, from the spaced-repetition state.
+
+    Advice only. This plugin never sends anything on its own; a reminder is
+    only ever delivered because an operator wired a cron job that asks the
+    agent to check this, and only for a learner who opted in — see
+    ``review_reminders_enabled`` below and
+    :func:`set_review_reminders`.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            return {"ok": True, "due": [], "upcoming": [], "review_reminders_enabled": False}
+
+        now = _now()
+        rows = conn.execute(
+            "SELECT r.objective_id, r.next_review_at, r.interval_days, r.repetitions,"
+            "       o.behavior, o.condition, o.standard"
+            "  FROM review_state AS r"
+            "  JOIN objectives AS o ON o.id = r.objective_id AND o.profile_id = r.profile_id"
+            "                      AND o.learner_id = r.learner_id"
+            " WHERE r.profile_id = ? AND r.learner_id = ?"
+            " ORDER BY r.next_review_at",
+            (profile, learner_id),
+        ).fetchall()
+        preference = conn.execute(
+            "SELECT review_reminders_enabled FROM learner_preferences"
+            " WHERE learner_id = ? AND profile_id = ?",
+            (learner_id, profile),
+        ).fetchone()
+
+    due, upcoming = [], []
+    for row in rows:
+        entry = {
+            "objective_id": str(row["objective_id"]),
+            "behavior": str(row["behavior"]),
+            "condition": str(row["condition"]),
+            "standard": str(row["standard"]),
+            "next_review_at": str(row["next_review_at"]),
+            "interval_days": int(row["interval_days"]),
+        }
+        (due if str(row["next_review_at"]) <= now else upcoming).append(entry)
+
+    return {
+        "ok": True,
+        "due": due,
+        "upcoming": upcoming,
+        "review_reminders_enabled": bool(preference["review_reminders_enabled"])
+        if preference
+        else False,
+        "reminders_notice": (
+            "This plugin never sends a reminder on its own. A learner who opts in with "
+            "learning_studio_set_review_reminders can only be reminded if the operator has "
+            "wired a Hermes cron job that periodically asks the agent to check this plan."
+        ),
+    }
+
+
+def set_review_reminders(
+    *, principal: Principal, enabled: bool, config: LearningStudioConfig | None = None
+) -> dict[str, Any]:
+    """Set the one flag that governs whether a review reminder may ever be sent.
+
+    Defaults to ``False`` for every learner and is changed only by an explicit
+    call naming this learner's own preference — never inferred, never turned
+    on by preparing or completing an exercise.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn, storage.transaction(conn):
+        learner_id = _get_or_create_learner(conn, principal)
+        now = _now()
+        conn.execute(
+            "INSERT INTO learner_preferences"
+            " (learner_id, profile_id, review_reminders_enabled, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT (learner_id) DO UPDATE SET"
+            " review_reminders_enabled = excluded.review_reminders_enabled,"
+            " updated_at = excluded.updated_at",
+            (learner_id, profile, 1 if enabled else 0, now, now),
+        )
+
+    return {"ok": True, "review_reminders_enabled": bool(enabled)}
+
+
+def erase_learner(
+    *, principal: Principal, config: LearningStudioConfig | None = None
+) -> dict[str, Any]:
+    """Remove every row this plugin holds for one learner, in one transaction.
+
+    Deleting the ``learners`` row is the whole operation: every other table a
+    learner owns — tracks, contexts, objectives, memory candidates,
+    experiences and their components, managed assets, attempts, attempt
+    components, review state, misconceptions, and the reminder preference —
+    references it through a foreign key declared ``ON DELETE CASCADE``, so
+    one deletion inside one transaction removes all of them or none of them.
+
+    The managed asset *files* are unlinked after the commit — a rolled-back
+    transaction must never leave files without their rows — and the pages
+    the deletion freed are physically reclaimed (WAL checkpoint plus
+    ``VACUUM``) so the erasure is not merely logical. Both steps are
+    best-effort: the committed deletion is the authoritative part.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn, storage.transaction(conn):
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            return {"ok": True, "erased": False, "message": "Nothing is stored for this learner."}
+        asset_rows = conn.execute(
+            "SELECT storage_name, byte_size FROM managed_assets"
+            " WHERE profile_id = ? AND learner_id = ?",
+            (profile, learner_id),
+        ).fetchall()
+        conn.execute("DELETE FROM learners WHERE id = ? AND profile_id = ?", (learner_id, profile))
+
+    from . import assets
+
+    for asset in asset_rows:
+        with contextlib.suppress(assets.AssetError):
+            assets.remove_managed_asset_file(asset)
+    _reclaim_deleted_pages(config)
+
+    return {"ok": True, "erased": True}
+
+
+def _reclaim_deleted_pages(config: LearningStudioConfig) -> None:
+    """Physically reclaim pages freed by an erasure, best-effort.
+
+    SQLite keeps deleted rows in the WAL until a checkpoint and in free pages
+    until a ``VACUUM``; an "erased" promise that left either on disk would be
+    a promise about a logical state. Both run here, outside any transaction,
+    on the already-committed deletion, and a failure changes nothing about
+    the erasure itself — so it is suppressed rather than reported.
+    """
+    try:
+        with storage.connect(config) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+    except sqlite3.Error:
+        return
 
 
 # ── Input validation helpers ──────────────────────────────────────────────

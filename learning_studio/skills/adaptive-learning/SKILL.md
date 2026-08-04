@@ -17,8 +17,10 @@ it too narrowly.
 
 ## Runtime status: read this first
 
-Eight tools exist. Four are about what you know and what you build; four are
-about putting it on the learner's screen.
+Twelve tools exist. Four are about what you know and what you build; four put
+an exercise on the learner's screen; four are the evaluation runtime — durable
+attempts, objective-level progress, a spaced-repetition review plan, and
+erasure.
 
 | Tool | What it does |
 | --- | --- |
@@ -28,16 +30,22 @@ about putting it on the learner's screen.
 | `learning_studio_import_asset` | Validate a real host image and return an opaque managed asset id |
 | `learning_studio_launch` | Open a prepared exercise on the learner's screen |
 | `learning_studio_status` | Whether an exercise can be opened here, and why not |
-| `learning_studio_results` | Whether they opened it and how far they got — nothing more, and `null` when even that is unknown |
+| `learning_studio_results` | Session progress for one exercise, plus its scored outcome once the learner has finished it |
 | `learning_studio_stop` | Close the runtime early |
+| `learning_studio_attempts` | Durable, objective-level progress and the misconception bank, across everything the learner has done |
+| `learning_studio_review_plan` | What is due for review and what is coming up, from the spaced-repetition state |
+| `learning_studio_set_review_reminders` | Turn the learner's own opt-in to review reminders on or off |
+| `learning_studio_erase_learner` | Permanently delete everything this plugin holds about the learner |
 
-**Exercises can now be opened.** `learning_studio_prepare` stores a validated
-exercise; `learning_studio_launch` starts the interface, opens a temporary
-public address for it, and sends the learner a button in the private Telegram
-conversation you are already in. They tap it and work through the cards —
-selection, cloze, ordering, matching, flashcards with an explicit reveal,
-images, hotspots, tables, scenarios, reflection — keyboard-operable, in three
-interface languages.
+**Exercises can now be opened, answered, and scored.** `learning_studio_prepare`
+stores a validated exercise; `learning_studio_launch` starts the interface,
+opens a temporary public address for it, and sends the learner a button in the
+private Telegram conversation you are already in. They tap it and work through
+the cards — selection, cloze, ordering, matching, flashcards with an explicit
+reveal, images, hotspots, tables, scenarios, reflection — keyboard-operable, in
+three interface languages. When they finish, the Mini App scores the attempt
+and shows them a completion screen: overall score, a per-component
+correct/incorrect breakdown with feedback, and a review-plan preview.
 
 Three things about that are worth knowing before you use it.
 
@@ -45,17 +53,28 @@ Three things about that are worth knowing before you use it.
 without the learner doing anything, and again at an absolute time limit
 whatever they are doing. That is not a bug to work around: it is a public
 entrance to somebody's learning record, and it is not left open. If they come
-back later, launch again.
+back later, launch again. **Scoring does not depend on the runtime staying
+up** — a finished attempt is stored durably the moment the Mini App reports it,
+and `learning_studio_results`/`learning_studio_attempts` read it from storage
+whether or not a runtime is currently running.
 
-**Nothing they do is recorded.** No score, no mark, no attempt, no progress
-history, no review schedule. `learning_studio_results` tells you whether they
-opened it and how far through they got, and that is the whole of what exists.
-Say so plainly rather than implying a report card is coming.
+**What is scored, and what is not.** Selection, ordering, matching, cloze, and
+similar closed-answer components are marked automatically the moment the
+exercise finishes — see `learning_studio_results`. Open-ended work judged
+against a rubric (`free_response`, `image_observation`, `case_study`,
+`self_explanation`, `rubric_response`, and `code_response` when authored with
+`scoring.mode: rubric`) is recorded as attempted but is **not** automatically
+graded — this plugin does not run a model over a learner's prose to invent a
+mark. Self-reports (`flashcard`, `confidence_rating`, `reflection`) are never
+machine-graded by design; a flashcard's self-rating still feeds the review
+schedule. Say this plainly rather than implying every card gets a grade.
 
-And read that result carefully: `opened` can be `null`, which means *nobody
-knows* — the runtime that held the answer has gone. That is not "they did not
-open it". Do not tell somebody they ignored an exercise when the honest answer
-is that the evidence is no longer there.
+And when a runtime is not up, `learning_studio_results`' *session progress*
+fields (`opened`, `position`, `answered`, `completed`) can be `null`, which
+means *nobody knows* — the runtime that held that answer has gone. That is not
+"they did not open it". Do not tell somebody they ignored an exercise when the
+honest answer is that the evidence is no longer there. The `scored`/`attempt`
+fields are unaffected: they come from durable storage, not from the runtime.
 
 **It can be unavailable, and the reason matters to the learner.** Opening an
 exercise needs two things an operator sets up once: a prepared runtime
@@ -88,8 +107,10 @@ thinking that produces one. So:
   prepared exercise is not an open one, and a launch that refused is not a
   launch. If it refused, do not tell the learner to tap anything — there is
   nothing there to tap — say the exercise is here in the conversation instead,
-  and carry on. Do not report a score you did not receive, and do not report one
-  at all: none is produced.
+  and carry on. **Never report a score you did not receive from a tool result.**
+  When an exercise ran in the Mini App, `learning_studio_results` reports the
+  real one once it exists; when it ran in conversation, you are the marker, and
+  a mark you produced yourself is not a stored attempt — say so.
 - **You write manifests; you never write frontend code.** The renderer is trusted
   precisely because the only thing it displays is validated, inert data from the
   registry. Generated HTML, CSS or JavaScript is not an exercise format here, and
@@ -99,10 +120,16 @@ thinking that produces one. So:
   irregular verbs, revise for an exam, or be tested on what they read is asking
   for the workflow below. Load the skill and get on with it; do not make somebody
   guess an internal skill name, a tool name, or the phrase "Mini App".
-- Say plainly that **attempts and scores are not stored** — only context,
-  tracks, objectives, and the exercises you prepare are — and that a review
-  schedule is advice the learner has to keep themselves. This is true whether
-  the exercise ran on screen or in the conversation.
+- Say plainly what actually happens: an exercise run **in the Mini App** is
+  scored and the attempt is stored durably, feeding objective mastery, the
+  misconception bank, and a spaced-repetition review plan. An exercise run **in
+  conversation** is marked by you, in the moment, and none of that exists for
+  it — no durable attempt, no mastery update, no review schedule — unless you
+  say so and the learner should not be told otherwise. Either way, a review
+  plan is advice; nothing is sent to the learner unless they have explicitly
+  opted in with `learning_studio_set_review_reminders`, and even then only
+  because an operator wired a Hermes cron job to check it — see "Review plans
+  and opt-in reminders" below.
 
 ### Preparing an exercise
 
@@ -456,23 +483,62 @@ that is what you are doing.
 
 ### 7. Interpret results honestly
 
+For an exercise run in the Mini App, `learning_studio_results` reports the
+scored attempt once it exists, and `learning_studio_attempts` reports
+objective-level mastery and the misconception bank across every attempt the
+learner has made. Read `attempts_overview.misconceptions` as *(objective,
+component type, how many times)* — never a diagnosis on its own. Turn it into
+something useful to say using the named objective's own wording ("you keep
+placing the base case after the recursive step" for a `sequence_order`
+objective about recursion), not an invented label; nothing in that response
+ever quotes a stored answer or the learner's own words.
+
 Read the pattern, not the percentage:
 
 - **Wrong for a reason** — a consistent misconception — needs re-teaching, not
   repetition. Three failures all placing photosynthesis in the mitochondrion is
-  one gap, not three.
+  one gap, not three, and `learning_studio_attempts` is what actually shows you
+  that pattern now, rather than you having to remember it across a session.
 - **Right but slow** indicates incomplete automaticity **only when speed or
   automatic recall is part of the stated objective**; then keep it in rotation.
   Otherwise latency is not evidence of weak mastery — learners read, type, and
   think at different speeds, and treating that as a deficit penalises the
-  learner for something the objective never asked for.
+  learner for something the objective never asked for. Nothing here measures
+  latency at all; do not infer it from anything these tools return.
 - **Right but hesitant** should be re-asked later in the session, phrased
   differently.
 - **Inconsistent** usually means the item is ambiguous. Suspect your item
   before you conclude anything about the learner.
-- A small sample says little. Do not narrate a trend from four answers.
+- A small sample says little. `mastery_fraction` from one attempt is not a
+  verdict; do not narrate a trend from four answers, however precisely the
+  fraction is reported.
+- **Open-ended work is not machine-scored.** A `mastery_fraction` never
+  reflects an unread `free_response` or `case_study` answer — those are
+  recorded as attempted, not graded, until a human or agent reviews them. Do
+  not read a high fraction from mostly closed-answer components as covering
+  the open-ended ones too.
 
 Report what actually happened, including when an exercise did not work.
+
+### Review plans and opt-in reminders
+
+`learning_studio_review_plan` reports which objectives are due for review now
+and which are coming up, computed from a standard SM-2 spaced-repetition
+schedule over the learner's own attempts. Treat it as **advice for you to act
+on in conversation** — "you're due to revisit conjugation of irregular verbs,
+want to?" — never as a trigger for anything automatic.
+
+**This plugin never sends a reminder on its own, under any circumstances.**
+`learning_studio_set_review_reminders` records one flag,
+`review_reminders_enabled`, defaulting to `false` for every learner. Call it
+only after the learner has said in so many words whether they want reminders —
+never because they finished an exercise, never because you inferred they
+would probably like one. Turning the flag on does not, by itself, cause
+anything to be sent: a reminder can only ever reach the learner if the
+*operator* has separately configured a Hermes cron job that periodically asks
+the agent to check `learning_studio_review_plan` and act on it — this plugin
+provides no scheduler and creates no cron job itself. If asked how to set that
+up, point to the README rather than promising it happens automatically.
 
 ### 8. Adapt
 
@@ -512,11 +578,16 @@ manifest. If the answer *is* the image, the alt text must not give it away.
 Two stores, two purposes. Keep them separate.
 
 **Detailed learning state belongs in Studio SQLite**, reached through
-`learning_studio_save_context` and `learning_studio_prepare`: context,
-confirmed tracks, objectives, their revision history, and prepared exercises.
-Attempts, scores, timings, and scheduling state have no store yet — that
-arrives with the exercise runtime — so today they are simply not persisted.
-Say so rather than implying otherwise.
+`learning_studio_save_context`, `learning_studio_prepare`,
+`learning_studio_attempts`, and `learning_studio_review_plan`: context,
+confirmed tracks, objectives, their revision history, prepared exercises, and
+— for exercises run in the Mini App — durable attempts, per-component marks,
+objective mastery, the misconception bank, and spaced-repetition review state.
+Attempts and scores are never written to Hermes memory or any global memory
+store, are not exposed by any Hermes memory tool, and are never quoted back to
+you as raw learner text: what comes back is marks, counts, and dates. A
+learner may have this erased in full, in one operation, with
+`learning_studio_erase_learner` — call it only on their explicit request.
 
 **Durable preferences and goals may become Hermes memory candidates** — a
 confirmed long-term goal, a standing preference about feedback style, a target

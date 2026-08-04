@@ -169,7 +169,7 @@ def test_migrations_are_contiguous_and_the_version_is_the_last_one():
     versions = [m.version for m in storage.MIGRATIONS]
 
     assert versions == list(range(1, len(versions) + 1))
-    assert storage.SCHEMA_VERSION == versions[-1] == 9
+    assert storage.SCHEMA_VERSION == versions[-1] == 10
 
 
 def test_a_v8_database_upgrades_with_a_separate_alias_binding_store(hermes_home: Path):
@@ -178,7 +178,7 @@ def test_a_v8_database_upgrades_with_a_separate_alias_binding_store(hermes_home:
     storage.initialize()
 
     with storage.connect() as conn:
-        assert storage.read_schema_version(conn) == 9
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
         columns = _columns(conn, "experience_component_alias_bindings")
         assert {
             "component_id",
@@ -214,6 +214,16 @@ def test_a_v8_alias_record_upgrades_unbound_and_new_records_are_bound(
             (old["experience_id"],),
         )
         conn.execute("DROP TABLE experience_component_alias_bindings")
+        # Migration 10's tables were created by the real `initialize()` call
+        # above and must go too, or reapplying it below finds them already there.
+        for table in (
+            "attempts",
+            "attempt_components",
+            "review_state",
+            "misconceptions",
+            "learner_preferences",
+        ):
+            conn.execute(f"DROP TABLE {table}")
         conn.execute("UPDATE schema_version SET version = 8 WHERE id = 1")
         old_evaluator = conn.execute(
             "SELECT evaluation FROM experience_component_evaluations WHERE experience_id = ?",
@@ -295,7 +305,7 @@ def test_a_v7_database_upgrades_to_managed_assets_without_rewriting_prior_state(
     storage.initialize()
 
     with storage.connect() as conn:
-        assert storage.read_schema_version(conn) == 9
+        assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
         assert (
             conn.execute("SELECT id FROM learners WHERE id = 'L-before-assets'").fetchone()["id"]
             == "L-before-assets"
@@ -1326,7 +1336,7 @@ def test_a_v5_database_receives_lifecycle_and_provenance_cleanup(hermes_home: Pa
         ).fetchall()
         version = storage.read_schema_version(conn)
 
-    assert version == 9
+    assert version == storage.SCHEMA_VERSION
     assert [dict(row) for row in rows] == [
         {
             "id": "authority-v5",
@@ -1454,7 +1464,7 @@ def test_a_v6_database_purges_only_legacy_accessibility_data(hermes_home: Path):
         ]
         foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert version == 9
+    assert version == storage.SCHEMA_VERSION
     assert values == ["goal-value"]
     assert revisions == ["goal-revision"]
     assert candidates == ["goal-candidate"]
@@ -1647,4 +1657,144 @@ def test_every_historical_version_upgrades_and_passes_a_foreign_key_check(
 
     with storage.connect() as conn:
         assert storage.read_schema_version(conn) == storage.SCHEMA_VERSION
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+# ── Migration 10: the evaluation runtime ───────────────────────────────────
+
+
+def test_a_v9_database_upgrades_with_the_evaluation_runtime_tables(hermes_home: Path):
+    _build_database_at(9)
+
+    storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 10
+        for table in (
+            "attempts",
+            "attempt_components",
+            "review_state",
+            "misconceptions",
+            "learner_preferences",
+        ):
+            assert (
+                conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+                ).fetchone()
+                is not None
+            ), table
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_a_failing_migration_ten_rolls_back_every_new_table(hermes_home: Path, monkeypatch):
+    _build_database_at(9)
+    real = list(storage.MIGRATIONS)
+    broken_ten = storage.Migration(
+        version=10,
+        statements=(*real[9].statements, "THIS IS NOT SQL"),
+    )
+    monkeypatch.setattr(storage, "MIGRATIONS", [*real[:9], broken_ten])
+
+    with pytest.raises(storage.MigrationError):
+        storage.initialize()
+
+    with storage.connect() as conn:
+        assert storage.read_schema_version(conn) == 9
+        for table in (
+            "attempts",
+            "attempt_components",
+            "review_state",
+            "misconceptions",
+            "learner_preferences",
+        ):
+            assert (
+                conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+                ).fetchone()
+                is None
+            ), table
+
+
+def test_erasing_a_learner_removes_evaluation_runtime_rows_too(hermes_home: Path):
+    """Migration 10's tables cascade from ``learners`` like everything else."""
+    from tests.component_examples import example, manifest
+
+    prepared = service.prepare_experience(
+        principal=LEARNER, manifest=manifest([example("multiple_choice", id="q1")])
+    )
+    now = "2025-01-01T00:00:00+00:00"
+    with storage.connect() as conn, storage.transaction(conn):
+        learner_row = conn.execute(
+            "SELECT id FROM learners WHERE profile_id = ?", (LEARNER.profile,)
+        ).fetchone()
+        learner_id = learner_row["id"]
+        component_row = conn.execute(
+            "SELECT id FROM experience_components WHERE experience_id = ?",
+            (prepared["experience_id"],),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO tracks"
+            " (id, learner_id, profile_id, name, status, confirmed_at, created_at, updated_at)"
+            " VALUES ('trk-1', ?, ?, 'Track', 'active', ?, ?, ?)",
+            (learner_id, LEARNER.profile, now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO objectives"
+            " (id, track_id, learner_id, profile_id, behavior, condition, standard, status,"
+            "  created_at, updated_at)"
+            " VALUES ('obj-1', 'trk-1', ?, ?, 'b', 'c', 's', 'active', ?, ?)",
+            (learner_id, LEARNER.profile, now, now),
+        )
+        conn.execute(
+            "INSERT INTO attempts"
+            " (id, profile_id, learner_id, experience_id, track_id, objective_id,"
+            "  component_count, graded_count, correct_count, overall_score, overall_max_score,"
+            "  started_at, completed_at, created_at)"
+            " VALUES ('att-1', ?, ?, ?, NULL, NULL, 1, 1, 1, 1.0, 1.0, ?, ?, ?)",
+            (LEARNER.profile, learner_id, prepared["experience_id"], now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO attempt_components"
+            " (id, attempt_id, profile_id, learner_id, experience_id, component_id,"
+            "  component_type, objective_id, graded, correct, score, max_score, created_at)"
+            " VALUES ('ac-1', 'att-1', ?, ?, ?, ?, 'multiple_choice', NULL, 1, 1, 1.0, 1.0, ?)",
+            (LEARNER.profile, learner_id, prepared["experience_id"], component_row["id"], now),
+        )
+        conn.execute(
+            "INSERT INTO review_state"
+            " (id, profile_id, learner_id, objective_id, interval_days, ease_factor,"
+            "  repetitions, last_quality, last_reviewed_at, next_review_at, created_at, updated_at)"
+            " VALUES ('rs-1', ?, ?, 'obj-1', 1, 2.5, 1, 4, ?, ?, ?, ?)",
+            (LEARNER.profile, learner_id, now, now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO misconceptions"
+            " (id, profile_id, learner_id, objective_id, component_type, occurrences,"
+            "  last_seen_at, created_at, updated_at)"
+            " VALUES ('mc-1', ?, ?, 'obj-1', 'multiple_choice', 1, ?, ?, ?)",
+            (LEARNER.profile, learner_id, now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO learner_preferences"
+            " (learner_id, profile_id, review_reminders_enabled, created_at, updated_at)"
+            " VALUES (?, ?, 1, ?, ?)",
+            (learner_id, LEARNER.profile, now, now),
+        )
+
+    with storage.connect() as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "DELETE FROM learners WHERE id = ? AND profile_id = ?", (learner_id, LEARNER.profile)
+        )
+        conn.commit()
+
+    with storage.connect() as conn:
+        for table in (
+            "attempts",
+            "attempt_components",
+            "review_state",
+            "misconceptions",
+            "learner_preferences",
+        ):
+            assert conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"] == 0, table
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

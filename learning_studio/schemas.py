@@ -572,10 +572,11 @@ LAUNCH_SCHEMA: dict[str, Any] = {
         "already in - the destination comes from the session, never from you, and there is "
         "no argument for it. You must quote the learner's own words from the message you "
         "are replying to: the Studio checks that quotation against the message the platform "
-        "actually delivered, so an exercise cannot be opened on words nobody wrote. Nothing "
-        "about how they do will be stored: no score, no attempt, no progress record. Only "
-        "claim an exercise opened if this call succeeds and reports button_delivered; if it "
-        "refuses, run the exercise in conversation instead and say that is what you are "
+        "actually delivered, so an exercise cannot be opened on words nobody wrote. Scoring "
+        "happens once the learner finishes it in the Mini App, not here - this response's "
+        "scored/attempt fields report the most recent completed attempt, if any exists yet. "
+        "Only claim an exercise opened if this call succeeds and reports button_delivered; if "
+        "it refuses, run the exercise in conversation instead and say that is what you are "
         "doing."
     ),
     "parameters": {
@@ -670,12 +671,15 @@ STATUS_SCHEMA: dict[str, Any] = {
 RESULTS_SCHEMA: dict[str, Any] = {
     "name": RESULTS_TOOL_NAME,
     "description": (
-        "Report what happened to an exercise you opened: whether the learner opened it, how "
-        "far through they are, and whether they finished. That is all this can know. "
-        "Nothing is marked and no attempt is stored in this release, so there is no score, "
-        "no mastery estimate, and no review schedule to fetch - do not describe one. It does "
-        "not return the learner's answers either; ask them how it went. The exercise must be "
-        "one prepared for the person you are talking to."
+        "Report what happened to one exercise you opened: session progress (whether the "
+        "learner opened it, how far through they are, whether they finished) and, "
+        "separately, whether it has been scored. Session progress is only known while a "
+        "runtime that served it is still running; the scored result is read from durable "
+        "storage and is available whether or not a runtime is up, once the learner has "
+        "finished the exercise in the Mini App. It "
+        "does not return the learner's answers either way; ask them how it went. The exercise "
+        "must be one prepared for the person you are talking to. Use learning_studio_attempts "
+        "for progress across everything they have done, not just this one exercise."
     ),
     "parameters": {
         "type": "object",
@@ -693,10 +697,100 @@ STOP_SCHEMA: dict[str, Any] = {
         "Takes no arguments and can stop nothing but this profile's own runtime. Safe to "
         "call when nothing is running. The runtime also stops itself once it has been idle "
         "or has been open for its maximum time, so this is for finishing early rather than "
-        "for tidying up. Stopping loses no record of how anyone did, because no score or "
-        "attempt was being kept in the first place."
+        "for tidying up. Stopping loses no record of how anyone did: any exercise the learner "
+        "had already finished in the Mini App was scored and stored durably before the "
+        "runtime is ever touched, independent of this call."
     ),
     "parameters": _NO_PARAMETERS,
+}
+
+
+ATTEMPTS_TOOL_NAME = "learning_studio_attempts"
+REVIEW_PLAN_TOOL_NAME = "learning_studio_review_plan"
+SET_REVIEW_REMINDERS_TOOL_NAME = "learning_studio_set_review_reminders"
+ERASE_LEARNER_TOOL_NAME = "learning_studio_erase_learner"
+
+
+ATTEMPTS_SCHEMA: dict[str, Any] = {
+    "name": ATTEMPTS_TOOL_NAME,
+    "description": (
+        "Report durable, objective-level progress for the person you are talking to: how "
+        "many exercises they have completed and been scored on, per-objective mastery as a "
+        "fraction of points earned, and a structured list of where they most often go wrong "
+        "- by objective and component type, never by quoting anything they wrote or any "
+        "answer key. Also reports whether they have opted in to review reminders. Nothing "
+        "here names a specific answer; turn a misconception entry into something useful to "
+        "say using the named objective's own wording, not a fabricated diagnosis. Takes no "
+        "arguments: it always reports on the person you are talking to and can see no other."
+    ),
+    "parameters": _NO_PARAMETERS,
+}
+
+
+REVIEW_PLAN_SCHEMA: dict[str, Any] = {
+    "name": REVIEW_PLAN_TOOL_NAME,
+    "description": (
+        "Report the spaced-repetition review plan: which objectives are due for review now, "
+        "which are coming up, and when, derived from the learner's own past attempts. This "
+        "is advice for you to act on in conversation - asking whether they want to revisit "
+        "something - never a trigger for anything automatic. This plugin never sends a "
+        "reminder on its own; it only reports whether the learner has opted in with "
+        "learning_studio_set_review_reminders, and reminders can only ever reach them through "
+        "an operator-configured Hermes cron job that periodically asks you to check this "
+        "plan and act on it in conversation. Takes no arguments."
+    ),
+    "parameters": _NO_PARAMETERS,
+}
+
+
+SET_REVIEW_REMINDERS_SCHEMA: dict[str, Any] = {
+    "name": SET_REVIEW_REMINDERS_TOOL_NAME,
+    "description": (
+        "Set whether the learner wants to be reminded about due reviews. Defaults to off for "
+        "everyone and is never turned on by anything else - not by completing an exercise, "
+        "not by asking about their progress. Call this only after the learner has said in so "
+        "many words whether they want reminders; you are asserting that they did, and nothing "
+        "here can verify it. Turning this on does not, by itself, cause any message to be "
+        "sent - see learning_studio_review_plan."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["enabled"],
+        "properties": {
+            "enabled": {
+                "type": "boolean",
+                "description": "Whether the learner just said they want review reminders.",
+            }
+        },
+    },
+}
+
+
+ERASE_LEARNER_SCHEMA: dict[str, Any] = {
+    "name": ERASE_LEARNER_TOOL_NAME,
+    "description": (
+        "Permanently delete everything this plugin holds about the person you are talking "
+        "to: tracks, context, objectives, prepared exercises, attempts, scores, review state, "
+        "the misconception bank, and the reminder preference - all of it, in one operation "
+        "that cannot be undone. Call this only when the learner has explicitly asked for "
+        "their data to be deleted, never on a guess. Requires confirmed=true as your assertion "
+        "that they said so in so many words; without it nothing is deleted."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["confirmed"],
+        "properties": {
+            "confirmed": {
+                "type": "boolean",
+                "description": (
+                    "Set only when the learner has explicitly asked to have their data "
+                    "erased. You are asserting this; nothing here can check it."
+                ),
+            }
+        },
+    },
 }
 
 
@@ -706,5 +800,9 @@ TOOL_SCHEMAS.update(
         STATUS_TOOL_NAME: STATUS_SCHEMA,
         RESULTS_TOOL_NAME: RESULTS_SCHEMA,
         STOP_TOOL_NAME: STOP_SCHEMA,
+        ATTEMPTS_TOOL_NAME: ATTEMPTS_SCHEMA,
+        REVIEW_PLAN_TOOL_NAME: REVIEW_PLAN_SCHEMA,
+        SET_REVIEW_REMINDERS_TOOL_NAME: SET_REVIEW_REMINDERS_SCHEMA,
+        ERASE_LEARNER_TOOL_NAME: ERASE_LEARNER_SCHEMA,
     }
 )
