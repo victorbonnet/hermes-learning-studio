@@ -4,7 +4,7 @@ This module is the one place in the plugin that answers an unauthenticated
 request, so it is worth being explicit about what that concession is and what
 it is not.
 
-**What is public.** Five files: a document, a stylesheet, and three scripts.
+**What is public.** Six files: a document, a stylesheet, and four scripts.
 They are the same bytes for every caller, they are checked into this repository,
 and none of them contains a learner's name, an experience identifier, a session
 token, or a configured value. The shell has to be public because a webview
@@ -88,12 +88,13 @@ class StaticAsset:
 
 
 #: The allowlist. Order is load order for the scripts, which is also the
-#: dependency order: strings, then renderers, then the application that uses
-#: both.
+#: dependency order: strings, then the icon set, then the renderers that draw
+#: with it, then the application that uses all three.
 STATIC_ASSETS: tuple[StaticAsset, ...] = (
     StaticAsset("/index.html", "index.html", "text/html; charset=utf-8", document=True),
     StaticAsset("/static/app.css", "app.css", "text/css; charset=utf-8"),
     StaticAsset("/static/i18n.js", "i18n.js", "text/javascript; charset=utf-8"),
+    StaticAsset("/static/icons.js", "icons.js", "text/javascript; charset=utf-8"),
     StaticAsset("/static/renderers.js", "renderers.js", "text/javascript; charset=utf-8"),
     StaticAsset("/static/app.js", "app.js", "text/javascript; charset=utf-8"),
 )

@@ -77,6 +77,7 @@ function evaluate(win, filename) {
 export function loadRenderers(overrides = {}) {
   const win = createWindow(overrides);
   evaluate(win, "i18n.js");
+  evaluate(win, "icons.js");
   evaluate(win, "renderers.js");
   return win;
 }
@@ -106,6 +107,7 @@ export function loadApp({ telegram = null, fetch = null, location = null } = {})
   }
 
   evaluate(win, "i18n.js");
+  evaluate(win, "icons.js");
   evaluate(win, "renderers.js");
   evaluate(win, "app.js");
   return { win, booted: win.LearningStudioApp.booted || Promise.resolve() };

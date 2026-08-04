@@ -161,6 +161,7 @@ body {
 .progress-fill {
   height: 100%;
   width: 0;
+  border-radius: 999px;
   background: var(--accent);
   transition: width var(--motion) ease-out;
 }
@@ -196,10 +197,43 @@ body {
 
 /* ── Text ────────────────────────────────────────────────────────────── */
 
+/* The badge at the top of a card: an icon for the family of card this is, and
+   the interface's name for it. Muted rather than accented — it is a label, and
+   the question under it is what a learner should read first. */
+.type-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px 5px 9px;
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.type-label {
+  overflow-wrap: anywhere;
+}
+
+/* Every inline drawing in this interface. Sized by whatever holds it, coloured
+   by `currentColor`, so an icon is never a colour of its own. */
+.icon {
+  display: block;
+  flex: 0 0 auto;
+}
+
+.type-badge .icon {
+  width: 18px;
+  height: 18px;
+}
+
 .prompt {
   margin: 0;
-  font-size: 1.15rem;
+  font-size: 1.2rem;
   font-weight: 600;
+  line-height: 1.35;
   /* Exercise text is arbitrary learner-facing content: a long unbroken token
      must wrap rather than force the page to scroll sideways. */
   overflow-wrap: anywhere;
@@ -213,9 +247,13 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* A passage the card is *about* — a statement to judge, a cue to recall, the
+   back of a flashcard. It sits on the page colour inside the card's own
+   surface, which is what makes it read as a quotation rather than as more of
+   the interface. */
 .statement {
   padding: var(--gap);
-  background: var(--surface);
+  background: var(--bg);
   border-radius: var(--radius);
   font-size: 1.05rem;
 }
@@ -230,7 +268,7 @@ body {
 
 .notice {
   padding: 8px 10px;
-  background: var(--surface);
+  background: var(--bg);
   border-radius: 8px;
 }
 
@@ -254,11 +292,68 @@ body {
   margin: 0;
   padding: 10px 12px;
   border-radius: var(--radius);
-  background: var(--surface);
+  background: var(--bg);
   border-left: 4px solid var(--ok);
 }
 
+/* The confirmation that an answer was written down. Calm and positive, and
+   deliberately not a verdict: nothing has been marked at this point, and the
+   sentence under it says so. */
+.recorded-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  background: var(--bg);
+  border-left: 4px solid var(--ok);
+  font-weight: 600;
+}
+
+.recorded-pill .icon {
+  width: 22px;
+  height: 22px;
+  color: var(--ok);
+}
+
 /* ── Completion screen ─────────────────────────────────────────────────── */
+
+/* The mark, drawn. The arc's colour is the tier's, applied here rather than in
+   the script so the palette stays in one file and a theme change follows it. */
+.score-ring {
+  align-self: center;
+  width: 116px;
+  height: 116px;
+}
+
+.ring-track {
+  stroke: var(--border);
+}
+
+.ring-arc {
+  stroke: var(--muted);
+}
+
+.score-ring[data-tone="ok"] .ring-arc {
+  stroke: var(--ok);
+}
+
+.score-ring[data-tone="accent"] .ring-arc {
+  stroke: var(--accent);
+}
+
+.score-ring[data-tone="danger"] .ring-arc {
+  stroke: var(--danger);
+}
+
+.ring-value {
+  fill: var(--fg);
+  font-family: inherit;
+  font-size: 23px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 
 .summary-list {
   margin: 0;
@@ -272,7 +367,7 @@ body {
 .summary-item {
   padding: 10px 12px;
   border-radius: var(--radius);
-  background: var(--surface);
+  background: var(--bg);
   border-left: 4px solid var(--border);
 }
 
@@ -308,38 +403,44 @@ body {
 .choices {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   border: 0;
   margin: 0;
   padding: 0;
 }
 
 .choices legend {
-  padding: 0;
+  padding: 0 0 4px;
 }
 
 .choice {
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
+  align-items: center;
+  gap: 12px;
   min-height: var(--tap);
-  padding: 10px 12px;
+  padding: 11px 14px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg);
   cursor: pointer;
-  transition: background var(--motion) ease-out;
+  transition:
+    border-color var(--motion) ease-out,
+    box-shadow var(--motion) ease-out;
 }
 
+/* A chosen option, said twice: the native control is checked, and the whole
+   row is ringed in the accent colour. The background deliberately does not
+   change — the card behind it is already tinted, and a third shade there was
+   the difference between "selected" and "slightly different". */
 .choice:has(input:checked) {
   border-color: var(--accent);
-  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 
 .choice input {
-  margin: 3px 0 0;
-  width: 20px;
-  height: 20px;
+  margin: 0;
+  width: 21px;
+  height: 21px;
   flex: 0 0 auto;
   accent-color: var(--accent);
 }
@@ -428,12 +529,17 @@ button {
   padding: 12px 16px;
   border-radius: var(--radius);
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: var(--bg);
   color: var(--fg);
   cursor: pointer;
 }
 
+/* The one thing a card asks you to do next: full width, comfortable height,
+   and the accent colour, which is the Telegram client's own button colour when
+   it sends one. */
 button.primary {
+  width: 100%;
+  min-height: 48px;
   background: var(--accent);
   color: var(--accent-fg);
   border-color: transparent;
@@ -510,10 +616,11 @@ button.small {
 .pair {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 10px;
+  gap: 6px;
+  padding: 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  background: var(--bg);
 }
 
 .pair .text {
@@ -559,7 +666,7 @@ table.grid input {
   height: auto;
   max-width: 100%;
   border-radius: var(--radius);
-  background: var(--surface);
+  background: var(--bg);
 }
 
 .figure figcaption {
@@ -569,7 +676,7 @@ table.grid input {
 
 .image-status {
   padding: var(--gap);
-  background: var(--surface);
+  background: var(--bg);
   border-radius: var(--radius);
   color: var(--muted);
   font-size: 0.9rem;
@@ -582,7 +689,7 @@ table.grid input {
 .image-alt {
   margin: 0;
   padding: var(--gap);
-  background: var(--surface);
+  background: var(--bg);
   border-left: 4px solid var(--border);
   border-radius: var(--radius);
   color: var(--fg);
@@ -593,7 +700,7 @@ table.grid input {
 .reveal:not(:empty) {
   margin: 0;
   padding: var(--gap);
-  background: var(--surface);
+  background: var(--bg);
   border-left: 4px solid var(--ok);
   border-radius: var(--radius);
   display: flex;
@@ -616,7 +723,7 @@ input[readonly] {
   padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--surface);
+  background: var(--bg);
   overflow: hidden;
   line-height: 0;
 }
@@ -681,16 +788,53 @@ input[readonly] {
 
 /* ── States ──────────────────────────────────────────────────────────── */
 
+/* Every screen this app shows — a question, the confirmation after one, an
+   error, the completion — is one of these: a single surface with room around
+   its contents, capped at a comfortable reading measure and centred, so the
+   interface does not turn into a full-bleed wall of text on a wide phone or a
+   tablet. Panels *inside* it sit on the page colour, which is what gives the
+   card its layers without a second palette. */
 .state {
   display: flex;
   flex-direction: column;
   gap: var(--gap);
   align-items: flex-start;
+  width: 100%;
+  max-width: 560px;
+  margin: 0 auto;
+  padding: var(--page-pad);
+  background: var(--surface);
+  border-radius: var(--radius);
 }
 
 .state h2 {
   margin: 0;
   font-size: 1.15rem;
+}
+
+/* The entrance. Applied by `app.js` when a screen is painted, and over
+   `--motion`, which is 0ms for anyone who asked for less movement — with the
+   animation switched off outright below, because an instant transform is still
+   a transform. */
+.card-enter {
+  animation: card-in var(--motion) ease-out both;
+}
+
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+[data-reduced-motion="true"].card-enter,
+[data-reduced-motion="true"] .card-enter {
+  animation: none;
 }
 
 .state p {
@@ -719,7 +863,15 @@ input[readonly] {
     animation: none;
   }
 
+  .card-enter {
+    animation: none;
+  }
+
   .progress-fill {
+    transition: none;
+  }
+
+  .choice {
     transition: none;
   }
 }

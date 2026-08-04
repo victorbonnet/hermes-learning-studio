@@ -35,6 +35,7 @@
   "use strict";
 
   var I18n = global.LearningStudioI18n;
+  var Icons = global.LearningStudioIcons;
   var Renderers = global.LearningStudioRenderers;
 
   var INIT_DATA_HEADER = "X-Telegram-Init-Data";
@@ -267,6 +268,15 @@
       var config = options || {};
       releaseImages();
       showFieldError("");
+      if (element.classList) {
+        // The entrance: a few pixels and a fade, over `--motion`, so a new card
+        // reads as having arrived rather than as the old one having changed
+        // words. `--motion` is 0ms under `prefers-reduced-motion` and under the
+        // component-level flag, and `app.css` also switches the animation off
+        // outright there — a transform that completes instantly is still a
+        // transform.
+        element.classList.add("card-enter");
+      }
       nodes.card.replaceChildren(element);
       if (config.focus) {
         config.focus();
@@ -650,13 +660,25 @@
      * not here, per answer -- so a tick or a cross on this card would be
      * guessing ahead of the mark that ``GET /api/session/summary`` is what
      * actually produces. The next card is one deliberate tap away.
+     *
+     * The tick beside "Answer recorded" says *written down*, not *right*: it is
+     * the same confirmation this screen has always carried, drawn rather than
+     * only written. What keeps that from reading as a verdict is the sentence
+     * under it, which stays exactly as it was -- not marked yet -- and the fact
+     * that a wrong answer gets this identical screen.
      */
     function acknowledge(nextComponent) {
       var message = el("section", {
         className: "state",
         attrs: { "data-state": "recorded" },
         children: [
-          el("p", { className: "feedback", text: t("feedback.recorded") }),
+          el("p", {
+            className: "recorded-pill",
+            children: [
+              Icons ? Icons.icon("check") : null,
+              el("span", { text: t("feedback.recorded") }),
+            ],
+          }),
           el("p", { className: "hint", text: t("feedback.pending") }),
         ],
       });
@@ -701,6 +723,25 @@
       });
     }
 
+    //: Which of the palette's three states a tier is drawn in. Only tokens the
+    //: contrast tests already cover: there is no fourth colour for "nearly".
+    var RING_TONES = {
+      "complete.feedback.excellent": "ok",
+      "complete.feedback.good": "ok",
+      "complete.feedback.mixed": "accent",
+      "complete.feedback.rough": "danger",
+    };
+
+    /** The mark as a ring, in the tier's own colour. */
+    function ring(correct, graded, tier, label) {
+      return Icons.ring({
+        correct: correct,
+        graded: graded,
+        tone: RING_TONES[tier] || "accent",
+        label: label,
+      });
+    }
+
     /** The completion screen: what was scored, what was not, what is next. */
     function renderCompletion(data) {
       var total = data.component_count || 0;
@@ -711,12 +752,6 @@
       var sentence = "";
       if (graded > 0) {
         var correct = data.correct_component_count || 0;
-        body.push(
-          el("p", {
-            className: "feedback",
-            text: t("complete.score", { correct: correct, graded: graded }),
-          })
-        );
         // A short, honest sentence under the mark: what the fraction means in
         // plain words, and how many marked answers are worth another look.
         // Composed from the marks the server already returned — never from an
@@ -741,6 +776,15 @@
             tier = "complete.feedback.rough";
           }
         }
+        var score = t("complete.score", { correct: correct, graded: graded });
+        // The same fraction, drawn: a ring, coloured by the same tier as the
+        // sentence under it, with the sentence itself as its accessible name.
+        // It is a picture of what is already written rather than a second
+        // claim, which is why labelling it repeats the score line verbatim.
+        if (Icons) {
+          body.push(ring(correct, graded, tier, score));
+        }
+        body.push(el("p", { className: "feedback", text: score }));
         var incorrect = Math.max(0, graded - correct);
         if (tier !== null || incorrect > 0) {
           sentence = tier === null ? "" : t(tier);

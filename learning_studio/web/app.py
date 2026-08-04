@@ -12,7 +12,7 @@ for *that* Telegram account.
 exception to the rule above so much as a consequence of how a webview loads a
 page: the navigation that fetches the document cannot carry a header, so there
 is no request in which the shell could prove who wants it. What is served is
-five checked-in files that are byte-identical for every caller and contain no
+six checked-in files that are byte-identical for every caller and contain no
 learner data, no identifier, and no configured value — see
 :mod:`learning_studio.web.static_files`. The document that comes back knows
 nothing; it has to ask, with headers, for everything it displays.

@@ -43,12 +43,15 @@ opens a temporary public address for it, and sends the learner a button in the
 private Telegram conversation you are already in. They tap it and work through
 the cards — selection, cloze, ordering, matching, flashcards with an explicit
 reveal, images, hotspots, tables, scenarios, reflection — keyboard-operable, in
-three interface languages. When they finish, the Mini App scores the attempt
-and shows them a completion screen: overall score, a short feedback sentence
-under it (encouraging or constructive, in the learner's interface language, and
-naming how many marked answers are worth another look when any were missed), a
-per-component correct/incorrect breakdown with feedback, and a review-plan
-preview.
+three interface languages. Each card opens with a small icon and the name of the
+kind of card it is, in the learner's own interface language, and every answer is
+confirmed as recorded and **not** marked, because nothing is marked until the
+end. When they finish, the Mini App scores the attempt and shows them a
+completion screen: the overall score, drawn as a ring around the fraction of
+marked answers they got right, a short feedback sentence under it (encouraging
+or constructive, in the learner's interface language, and naming how many marked
+answers are worth another look when any were missed), a per-component
+correct/incorrect breakdown with feedback, and a review-plan preview.
 
 Three things about that are worth knowing before you use it.
 

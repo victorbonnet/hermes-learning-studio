@@ -11,9 +11,19 @@ uv run python tools/preview_gallery.py --out dist/preview-fr --locale fr --conte
 # then open dist/preview/index.html (light) or dist/preview/dark.html
 ```
 
-The gallery renders the **shipped** `renderers.js`, `i18n.js`, and `app.css`
-against payloads built by the **shipped** `build_component`, so what is pictured
-is what a learner sees — not a mock-up of it.
+The third image needs one extra step, because a generated placeholder always
+loads: after generating a gallery, replace `window.PREVIEW_PLACEHOLDER` in
+`fixtures.js` with a data URL that cannot decode —
+`"data:image/png;base64,Cg=="` will do — and every card takes the failure path.
+
+```bash
+uv run python tools/preview_gallery.py --out dist/preview-fallback \
+  --types image_observation diagram labeling
+```
+
+The gallery renders the **shipped** `renderers.js`, `icons.js`, `i18n.js`, and
+`app.css` against payloads built by the **shipped** `build_component`, so what is
+pictured is what a learner sees — not a mock-up of it.
 
 Nothing in any of them is real. The exercise content comes from
 `tests/component_examples.py`, whose subjects are deliberately unrelated to one
@@ -27,10 +37,14 @@ account is involved in producing these.
 | `cards-dark-fr.png` | Dark theme, **French UI with English content**: the flashcard's *Turn the card over* control, and two ordering cards visibly *not* in their correct order |
 | `image-fallback.png` | What a learner sees when a managed image cannot be loaded: the exercise's own `alt_text`, shown as text rather than promised and withheld |
 
-The second image carries three claims worth checking by eye:
+The second image carries four claims worth checking by eye:
 
 - the interface is French while the exercise stays in the language it was written
-  in — that distinction is the whole reason `i18n.js` exists;
+  in — that distinction is the whole reason `i18n.js` exists. The badge at the
+  top of each card is interface chrome, so it is French too: *Carte mémoire*,
+  *Chronologie*, *Mise en ordre*;
+- each badge's icon says what kind of card this is before the question is read,
+  and comes from `icons.js` keyed by component type — never from a payload;
 - the flashcard has an explicit, keyboard-operable **Retourner la carte**. It
   uncovers nothing that was already in the page: the back of the card is not
   there, and pressing it asks the server;

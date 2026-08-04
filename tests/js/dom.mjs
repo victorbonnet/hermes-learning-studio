@@ -72,8 +72,15 @@ class Style {
 }
 
 class Element {
-  constructor(tagName, ownerDocument) {
-    this.tagName = String(tagName).toLowerCase();
+  /**
+   * `namespaceURI` is set for anything built with `createElementNS` — the icon
+   * set and the score ring. Its tag name keeps the case it was given, because
+   * SVG has camel-cased elements and a shim that lower-cased them would make a
+   * real mistake pass here.
+   */
+  constructor(tagName, ownerDocument, namespaceURI = null) {
+    this.namespaceURI = namespaceURI;
+    this.tagName = namespaceURI ? String(tagName) : String(tagName).toLowerCase();
     this.ownerDocument = ownerDocument;
     this.attributes = {};
     this.children = [];
@@ -246,6 +253,10 @@ class FakeDocument {
 
   createElement(tagName) {
     return new Element(tagName, this);
+  }
+
+  createElementNS(namespaceURI, tagName) {
+    return new Element(tagName, this, String(namespaceURI));
   }
 
   getElementById(id) {

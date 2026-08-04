@@ -51,6 +51,11 @@
 
   var MAX_TEXT = 4000; // The API's own per-string ceiling.
 
+  //: The icon set, loaded before this file. Read through a variable rather than
+  //: reached for at each call site so that a build where it is missing fails in
+  //: one obvious place instead of thirty-one obscure ones.
+  var Icons = global.LearningStudioIcons;
+
   function doc() {
     return global.document;
   }
@@ -1624,6 +1629,33 @@
     };
   }
 
+  /**
+   * The badge at the top of a card: which kind of card this is.
+   *
+   * The icon is chosen by *component type* — the application's own
+   * discriminator, never anything out of a payload — so a card cannot be made
+   * to draw something an author picked. It is `aria-hidden`, because it is a
+   * second way of saying what the label beside it already says.
+   *
+   * The label is `card.type.<type>` when the interface has a name for this kind
+   * of card, and nothing at all when it does not: a type this build has never
+   * heard of gets the generic icon rather than a dotted key printed at a
+   * learner.
+   */
+  function typeBadge(component, ctx) {
+    var drawing = Icons ? Icons.icon(Icons.iconFor(component.type)) : null;
+    if (!drawing) {
+      return null;
+    }
+    var children = [drawing];
+    var key = "card.type." + component.type;
+    var label = ctx.t(key);
+    if (label && label !== key) {
+      children.push(chrome(ctx, "span", { className: "type-label", text: label }));
+    }
+    return el("div", { className: "type-badge", children: children });
+  }
+
   /** The accessibility metadata that travels with a component, made visible. */
   function alternatives(component, ctx) {
     var access = component.accessibility || {};
@@ -1692,7 +1724,10 @@
     var section = el("section", {
       className: "state",
       attrs: { "data-component-type": component.type },
-      children: [content(ctx, "h2", { className: "prompt", text: view.prompt })]
+      children: [
+        typeBadge(view, ctx),
+        content(ctx, "h2", { className: "prompt", text: view.prompt }),
+      ]
         .concat(alternatives(view, ctx))
         .concat(built.body),
     });
