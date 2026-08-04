@@ -258,6 +258,51 @@ body {
   border-left: 4px solid var(--ok);
 }
 
+/* ── Completion screen ─────────────────────────────────────────────────── */
+
+.summary-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.summary-item {
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border-left: 4px solid var(--border);
+}
+
+.summary-item[data-outcome="correct"] {
+  border-left-color: var(--ok);
+}
+
+.summary-item[data-outcome="incorrect"] {
+  border-left-color: var(--danger);
+}
+
+.summary-item .outcome {
+  margin: 0;
+  font-weight: 600;
+}
+
+.summary-item[data-outcome="correct"] .outcome {
+  color: var(--ok);
+}
+
+.summary-item[data-outcome="incorrect"] .outcome {
+  color: var(--danger);
+}
+
+.summary-item .detail {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
 /* ── Choices ─────────────────────────────────────────────────────────── */
 
 .choices {

@@ -65,8 +65,14 @@
       "conflict.body": "Reopen the exercise to pick up where you are.",
       "complete.title": "Exercise finished",
       "complete.body": "Answered: {answered} of {count}",
-      "complete.not_scored":
-        "Nothing has been marked. Your responses were kept for this session only.",
+      "complete.score": "You got {correct} of {graded} marked answers right.",
+      "complete.no_score": "Nothing here is machine-graded. Your responses were recorded.",
+      "complete.ungraded": "{count} more response(s) were recorded but are not machine-graded.",
+      "complete.review": "Next review suggested: {date}",
+      "complete.guidance": "Ask for another exercise any time to keep practising.",
+      "complete.correct": "Correct",
+      "complete.incorrect": "Incorrect",
+      "complete.recorded_item": "Recorded",
 
       "action.submit": "Submit",
       "action.continue": "Continue",
@@ -76,7 +82,7 @@
       "action.close": "Close",
 
       "feedback.recorded": "Answer recorded.",
-      "feedback.not_scored": "Not marked — this exercise does not score answers yet.",
+      "feedback.pending": "Not marked yet — you'll see your score when you finish.",
 
       "invalid.required": "Answer this to continue.",
       "invalid.choose_one": "Choose one option.",
@@ -189,8 +195,15 @@
       "conflict.body": "Rouvrez l'exercice pour reprendre où vous en êtes.",
       "complete.title": "Exercice terminé",
       "complete.body": "Réponses : {answered} sur {count}",
-      "complete.not_scored":
-        "Rien n'a été corrigé. Vos réponses n'ont été conservées que pour cette session.",
+      "complete.score": "Vous avez {correct} bonnes réponses sur {graded} notées.",
+      "complete.no_score": "Rien ici n'est corrigé automatiquement. Vos réponses ont été enregistrées.",
+      "complete.ungraded":
+        "{count} réponse(s) supplémentaire(s) ont été enregistrées mais ne sont pas corrigées automatiquement.",
+      "complete.review": "Prochaine révision suggérée : {date}",
+      "complete.guidance": "Demandez un autre exercice à tout moment pour continuer à vous entraîner.",
+      "complete.correct": "Correct",
+      "complete.incorrect": "Incorrect",
+      "complete.recorded_item": "Enregistré",
 
       "action.submit": "Valider",
       "action.continue": "Continuer",
@@ -200,7 +213,7 @@
       "action.close": "Fermer",
 
       "feedback.recorded": "Réponse enregistrée.",
-      "feedback.not_scored": "Non corrigé — cet exercice ne note pas encore les réponses.",
+      "feedback.pending": "Pas encore corrigé — vous verrez votre score à la fin.",
 
       "invalid.required": "Répondez pour continuer.",
       "invalid.choose_one": "Choisissez une option.",
@@ -313,8 +326,15 @@
       "conflict.body": "Vuelve a abrir el ejercicio para continuar donde estás.",
       "complete.title": "Ejercicio terminado",
       "complete.body": "Respondidas: {answered} de {count}",
-      "complete.not_scored":
-        "No se ha corregido nada. Tus respuestas se guardaron solo para esta sesión.",
+      "complete.score": "Acertaste {correct} de {graded} respuestas corregidas.",
+      "complete.no_score": "Nada aquí se corrige automáticamente. Tus respuestas se registraron.",
+      "complete.ungraded":
+        "Se registraron {count} respuesta(s) más, pero no se corrigen automáticamente.",
+      "complete.review": "Próximo repaso sugerido: {date}",
+      "complete.guidance": "Pide otro ejercicio cuando quieras para seguir practicando.",
+      "complete.correct": "Correcto",
+      "complete.incorrect": "Incorrecto",
+      "complete.recorded_item": "Registrado",
 
       "action.submit": "Enviar",
       "action.continue": "Continuar",
@@ -324,7 +344,7 @@
       "action.close": "Cerrar",
 
       "feedback.recorded": "Respuesta registrada.",
-      "feedback.not_scored": "Sin corregir: este ejercicio todavía no puntúa las respuestas.",
+      "feedback.pending": "Todavía sin corregir — verás tu puntuación al terminar.",
 
       "invalid.required": "Responde para continuar.",
       "invalid.choose_one": "Elige una opción.",

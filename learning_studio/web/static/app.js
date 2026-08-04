@@ -46,6 +46,7 @@
     answer: "/api/session/answer",
     reveal: "/api/session/reveal",
     result: "/api/session/result",
+    summary: "/api/session/summary",
     assets: "/api/assets/",
   };
 
@@ -642,11 +643,13 @@
     }
 
     /**
-     * Confirm the answer was recorded, and say plainly that it was not marked.
+     * Confirm the answer was recorded, and say plainly that it is not marked
+     * yet.
      *
-     * This server does not score anything yet. A tick and a cheerful noise
-     * would imply a judgement that nobody made, so the card says what actually
-     * happened and the next card is one deliberate tap away.
+     * Scoring happens once for the whole session, on the completion screen --
+     * not here, per answer -- so a tick or a cross on this card would be
+     * guessing ahead of the mark that ``GET /api/session/summary`` is what
+     * actually produces. The next card is one deliberate tap away.
      */
     function acknowledge(nextComponent) {
       var message = el("section", {
@@ -654,38 +657,114 @@
         attrs: { "data-state": "recorded" },
         children: [
           el("p", { className: "feedback", text: t("feedback.recorded") }),
-          el("p", { className: "hint", text: t("feedback.not_scored") }),
+          el("p", { className: "hint", text: t("feedback.pending") }),
         ],
       });
       paint(message);
-      announce(t("feedback.recorded") + " " + t("feedback.not_scored"));
+      announce(t("feedback.recorded") + " " + t("feedback.pending"));
       setAction(nextComponent ? t("action.continue") : t("action.finish"), function () {
         return showComponent(nextComponent);
       });
       return Promise.resolve();
     }
 
+    /**
+     * One row of the per-component breakdown.
+     *
+     * ``feedback`` is the one piece of evaluator-only text the server ever
+     * discloses, and only for *this* learner's *own* completed attempt -- see
+     * ``learning_studio.evaluation``. Nothing here shows an answer key or a
+     * rubric; a component with no mark at all (a self-report, or a rubric
+     * response nobody has graded) says only that it was recorded.
+     */
+    function summaryItem(component) {
+      var outcome =
+        component.graded === true
+          ? component.correct
+            ? "correct"
+            : "incorrect"
+          : "ungraded";
+      var label =
+        outcome === "correct"
+          ? t("complete.correct")
+          : outcome === "incorrect"
+            ? t("complete.incorrect")
+            : t("complete.recorded_item");
+      var children = [el("p", { className: "outcome", text: label })];
+      if (component.feedback) {
+        children.push(el("p", { className: "detail", text: String(component.feedback) }));
+      }
+      return el("li", {
+        className: "summary-item",
+        attrs: { "data-outcome": outcome },
+        children: children,
+      });
+    }
+
+    /** The completion screen: what was scored, what was not, what is next. */
+    function renderCompletion(data) {
+      var total = data.component_count || 0;
+      var graded = data.graded_component_count || 0;
+      var ungraded = Math.max(0, total - graded);
+
+      var body = [el("p", { text: t("complete.body", { answered: total, count: total }) })];
+      if (graded > 0) {
+        body.push(
+          el("p", {
+            className: "feedback",
+            text: t("complete.score", { correct: data.correct_component_count || 0, graded: graded }),
+          })
+        );
+      } else {
+        body.push(el("p", { className: "hint", text: t("complete.no_score") }));
+      }
+      if (ungraded > 0 && graded > 0) {
+        body.push(el("p", { className: "hint", text: t("complete.ungraded", { count: ungraded }) }));
+      }
+
+      var components = data.components || [];
+      if (components.length) {
+        body.push(
+          el("ul", {
+            className: "summary-list",
+            attrs: { "aria-label": t("complete.title") },
+            children: components.map(summaryItem),
+          })
+        );
+      }
+
+      if (data.review && data.review.next_review_at) {
+        body.push(
+          el("p", {
+            className: "hint",
+            text: t("complete.review", { date: String(data.review.next_review_at).slice(0, 10) }),
+          })
+        );
+      }
+      body.push(el("p", { className: "hint", text: t("complete.guidance") }));
+
+      paint(
+        el("section", {
+          className: "state",
+          attrs: { "data-state": "complete" },
+          children: [el("h2", { text: t("complete.title") })].concat(body),
+        })
+      );
+      announce(t("complete.title"));
+      nodes["progress-text"].textContent = "";
+      setAction(t("action.close"), function () {
+        if (telegram && typeof telegram.close === "function") {
+          telegram.close();
+        }
+      });
+    }
+
     function showResult() {
-      return request("GET", API.result).then(function (result) {
+      return request("GET", API.summary).then(function (result) {
         if (!result.ok) {
           return fail(result, "session");
         }
-        var answered = result.data.answered_components || [];
-        var total = (result.data.progress && result.data.progress.component_count) || 0;
-        paint(
-          state(
-            "complete",
-            [el("p", { className: "hint", text: t("complete.not_scored") })],
-            { answered: answered.length, count: total }
-          )
-        );
-        announce(t("complete.title"));
-        nodes["progress-text"].textContent = "";
-        setAction(t("action.close"), function () {
-          if (telegram && typeof telegram.close === "function") {
-            telegram.close();
-          }
-        });
+        renderCompletion(result.data);
         return undefined;
       });
     }

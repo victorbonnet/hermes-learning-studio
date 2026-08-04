@@ -21,6 +21,10 @@ provides_tools:
   - learning_studio_status
   - learning_studio_results
   - learning_studio_stop
+  - learning_studio_attempts
+  - learning_studio_review_plan
+  - learning_studio_set_review_reminders
+  - learning_studio_erase_learner
 # One hook, and it only observes. `pre_gateway_dispatch` fires with the real
 # incoming MessageEvent before the agent runs, which is how launching learns
 # what the learner actually said rather than taking the model's word for it.

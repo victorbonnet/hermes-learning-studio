@@ -24,12 +24,12 @@ def _call(handler, **params) -> dict:
 # ── Registration ──────────────────────────────────────────────────────────
 
 
-def test_exactly_eight_tools_are_registered(ctx):
+def test_exactly_twelve_tools_are_registered(ctx):
     from learning_studio import register
 
     register(ctx)
 
-    assert len(ctx.tools) == 8
+    assert len(ctx.tools) == 12
 
 
 def test_the_tool_names_are_the_agreed_ones(ctx):
@@ -38,12 +38,16 @@ def test_the_tool_names_are_the_agreed_ones(ctx):
     register(ctx)
 
     assert sorted(tool.name for tool in ctx.tools) == [
+        "learning_studio_attempts",
+        "learning_studio_erase_learner",
         "learning_studio_get_context",
         "learning_studio_import_asset",
         "learning_studio_launch",
         "learning_studio_prepare",
         "learning_studio_results",
+        "learning_studio_review_plan",
         "learning_studio_save_context",
+        "learning_studio_set_review_reminders",
         "learning_studio_status",
         "learning_studio_stop",
     ]
@@ -77,7 +81,11 @@ def test_handlers_tolerate_the_kwargs_hermes_passes(ctx, hermes_home, gateway_se
 
     #: Arguments each tool needs to reach a successful result. The context
     #: tools take none; preparing an exercise needs the exercise.
-    required = {"learning_studio_prepare": {"manifest": manifest()}}
+    required = {
+        "learning_studio_prepare": {"manifest": manifest()},
+        "learning_studio_set_review_reminders": {"enabled": True},
+        "learning_studio_erase_learner": {"confirmed": True},
+    }
 
     #: Tools that cannot succeed in a bare test environment, and are exercised
     #: for the same property elsewhere. Launching and reporting name an exercise
@@ -584,3 +592,59 @@ def test_an_internal_failure_returns_a_safe_message(hermes_home, gateway_session
     assert "on fire" not in result["error"]
     assert str(hermes_home) not in result["error"]
     assert "could not complete" in result["error"]
+
+
+# ── The evaluation runtime's handlers ──────────────────────────────────────
+
+
+def test_attempts_and_review_plan_handlers_return_an_empty_but_ok_shape(
+    hermes_home, gateway_session
+):
+    attempts = _call(tools.handle_attempts)
+    assert attempts["ok"] is True
+    assert attempts["attempts_count"] == 0
+    assert attempts["review_reminders_enabled"] is False
+
+    plan = _call(tools.handle_review_plan)
+    assert plan["ok"] is True
+    assert plan["due"] == []
+    assert plan["upcoming"] == []
+
+
+def test_set_review_reminders_round_trips_through_the_handler(hermes_home, gateway_session):
+    on = _call(tools.handle_set_review_reminders, enabled=True)
+    assert on["ok"] is True
+    assert on["review_reminders_enabled"] is True
+
+    assert _call(tools.handle_attempts)["review_reminders_enabled"] is True
+
+    off = _call(tools.handle_set_review_reminders, enabled=False)
+    assert off["review_reminders_enabled"] is False
+
+
+def test_set_review_reminders_requires_the_enabled_field(hermes_home, gateway_session):
+    result = _call(tools.handle_set_review_reminders)
+    assert result["ok"] is False
+
+
+def test_erase_learner_refuses_without_explicit_confirmation(hermes_home, gateway_session):
+    _call(tools.handle_save_context, temporary_context={"goal": "keep me"})
+
+    missing = _call(tools.handle_erase_learner)
+    assert missing["ok"] is False
+
+    declined = _call(tools.handle_erase_learner, confirmed=False)
+    assert declined["ok"] is False
+
+    # Nothing was erased by either refusal.
+    result = _call(tools.handle_get_context)
+    assert result["temporary_context"]["goal"]["value"] == "keep me"
+
+
+def test_erase_learner_succeeds_only_with_confirmed_true(hermes_home, gateway_session):
+    _call(tools.handle_save_context, temporary_context={"goal": "erase me"})
+
+    result = _call(tools.handle_erase_learner, confirmed=True)
+
+    assert result == {"ok": True, "erased": True}
+    assert _call(tools.handle_get_context)["temporary_context"] == {}

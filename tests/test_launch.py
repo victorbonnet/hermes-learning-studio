@@ -294,12 +294,39 @@ def test_the_result_never_carries_the_public_address(
     assert "1001" not in body, "the learner's Telegram id reached the agent"
 
 
-def test_the_result_says_nothing_is_scored(runtime, telegram_session, principal, experience_id):
+def test_the_result_says_not_yet_scored_for_a_freshly_opened_exercise(
+    runtime, telegram_session, principal, experience_id
+):
     result = launch(principal, experience_id, deliver=Deliveries())
 
     assert result["scored"] is False
-    assert result["attempts_stored"] is False
-    assert "no attempt, score, mastery" in result["notice"]
+    assert result["attempt"] is None
+    assert "Not scored yet" in result["notice"]
+
+
+def test_a_completed_attempt_is_reported_as_scored(
+    runtime, telegram_session, principal, experience_id
+):
+    """Scoring comes from durable storage, independent of the launch call."""
+    service.record_attempt(
+        principal=principal,
+        experience_id=experience_id,
+        responses={"q-one": {"option_id": "matrix"}},
+        started_at="2025-01-01T00:00:00+00:00",
+        config=config(),
+    )
+
+    result = launch(principal, experience_id, deliver=Deliveries())
+
+    assert result["scored"] is True
+    assert result["attempt"]["correct_component_count"] == 1
+    assert result["attempt"]["graded_component_count"] == 1
+
+    results = launch_module.launch_results(
+        principal=principal, experience_id=experience_id, config=config()
+    )
+    assert results["scored"] is True
+    assert results["attempt"]["attempt_id"] == result["attempt"]["attempt_id"]
 
 
 def test_a_grant_is_created_and_bound_to_the_learner(runtime, spoken, principal, experience_id):
@@ -654,7 +681,7 @@ def test_results_never_invent_a_score_or_return_an_answer(
     )
 
     assert result["scored"] is False
-    assert result["attempts_stored"] is False
+    assert result["attempt"] is None
     assert result["responses_returned"] is False
     assert result["memory_candidates"] == []
 

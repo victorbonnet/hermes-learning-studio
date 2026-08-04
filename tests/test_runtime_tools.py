@@ -20,12 +20,16 @@ from learning_studio.schemas import TOOL_SCHEMAS
 RUNTIME_TOOL_NAMES = sorted(RUNTIME_TOOLS)
 
 ALL_TOOLS = [
+    "learning_studio_attempts",
+    "learning_studio_erase_learner",
     "learning_studio_get_context",
     "learning_studio_import_asset",
     "learning_studio_launch",
     "learning_studio_prepare",
     "learning_studio_results",
+    "learning_studio_review_plan",
     "learning_studio_save_context",
+    "learning_studio_set_review_reminders",
     "learning_studio_status",
     "learning_studio_stop",
 ]
@@ -42,7 +46,7 @@ def registered(ctx):
 # ── The registered surface ────────────────────────────────────────────────
 
 
-def test_exactly_these_eight_tools_are_registered(registered):
+def test_exactly_these_twelve_tools_are_registered(registered):
     assert sorted(tool.name for tool in registered.tools) == ALL_TOOLS
 
 

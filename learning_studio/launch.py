@@ -262,6 +262,8 @@ def _launch_within(
             decision=decision,
             delivered=False,
             reused=True,
+            principal=principal,
+            settings=settings,
         )
 
     launch_id = str(granted["launch_id"])
@@ -329,7 +331,13 @@ def _launch_within(
         raise _MayHaveBeenSent(exc) from None
 
     return _result(
-        experience=experience, granted=granted, decision=decision, delivered=True, reused=False
+        experience=experience,
+        granted=granted,
+        decision=decision,
+        delivered=True,
+        reused=False,
+        principal=principal,
+        settings=settings,
     )
 
 
@@ -362,6 +370,8 @@ def _result(
     decision: consent_policy.Decision,
     delivered: bool,
     reused: bool,
+    principal: Principal,
+    settings: LearningStudioConfig,
 ) -> dict[str, Any]:
     """The agent-facing answer. Built field by field; nothing passed through."""
     return {
@@ -381,18 +391,40 @@ def _result(
             if delivered
             else "The learner already has a button for this exercise; nothing new was sent."
         ),
-        **_honest_scoring(),
+        **_scoring_fields(principal=principal, experience=experience, settings=settings),
     }
 
 
-def _honest_scoring() -> dict[str, Any]:
+def _scoring_fields(
+    *, principal: Principal, experience: dict[str, Any], settings: LearningStudioConfig
+) -> dict[str, Any]:
+    """The scoring block for one experience: real, whenever an attempt exists.
+
+    A durable attempt and a live session are two different sources of truth,
+    checked separately — a learner mid-exercise has progress but no attempt
+    yet, because scoring only happens once the Mini App reports the exercise
+    complete. This never reads session state itself; it only reports what
+    :mod:`learning_studio.service` has durably stored.
+    """
+    attempt = service.latest_attempt_for_experience(
+        principal=principal, experience_id=str(experience["experience_id"]), config=settings
+    )
+    if attempt is None:
+        return {
+            "scored": False,
+            "attempt": None,
+            "notice": (
+                "Not scored yet: scoring happens once the learner finishes the exercise in "
+                "the Mini App. Call this again afterwards to see the outcome."
+            ),
+        }
     return {
-        "scored": False,
-        "attempts_stored": False,
+        "scored": True,
+        "attempt": attempt,
         "notice": (
-            "Nothing about how the learner does will be stored: no attempt, score, mastery, "
-            "or progress record exists in this release. Ask them how it went, and use "
-            "learning_studio_results only for whether they opened and finished it."
+            "Scored from the learner's own completed attempt. learning_studio_attempts "
+            "reports objective-level progress across everything they have done, and "
+            "learning_studio_review_plan reports what is due for review."
         ),
     }
 
@@ -437,16 +469,18 @@ def launch_results(
 ) -> dict[str, Any]:
     """What happened to a launch, with nothing invented.
 
-    The honest answer in this release is short, and the shape of the response
-    says so in three places rather than one, because "how did they do?" is the
-    question a reader most easily assumes has been answered.
+    Two independent sources feed this, and the shape of the response keeps
+    them apart rather than blending them into one guess:
 
-    What is actually known: whether an exercise was opened, which component the
-    learner reached, how many they answered, and whether they finished. Those
-    are facts the runtime holds while a session is alive. What is *not* known,
-    and is stated as not known: any mark, score, mastery estimate, durable
-    attempt, or review schedule. None of those exists in this release, and a
-    field reporting one would be a fabrication with a plausible name.
+    - **Session progress** comes from the runtime, if one is up and remembers
+      this launch: whether it was opened, which component the learner
+      reached, how many they answered, whether they finished. That is only
+      ever known while a runtime that served the session is still running.
+    - **Scoring** comes from durable storage via
+      :func:`learning_studio.service.latest_attempt_for_experience`, and
+      outlives any runtime: once the Mini App reports the exercise complete,
+      an attempt is scored and stored, and this reports it whether or not a
+      runtime is currently up.
 
     A learner's answers are never returned either. How far somebody got is
     progress; what they wrote is their work, and an agent that wants to discuss
@@ -472,9 +506,11 @@ def launch_results(
             state="not_running",
             message=(
                 "No Learning Studio runtime is open for this profile, so whether the learner "
-                "ever opened this exercise cannot be determined. Nothing was recorded while "
-                "it was running either way."
+                "ever opened this exercise cannot be determined from session progress. Scoring "
+                "is unaffected: it is read from durable storage below, not from the runtime."
             ),
+            principal=principal,
+            settings=settings,
         )
 
     try:
@@ -491,9 +527,11 @@ def launch_results(
             experience,
             state="unavailable",
             message=(
-                "The Learning Studio runtime did not answer, so what happened to this "
-                "exercise cannot be determined right now."
+                "The Learning Studio runtime did not answer, so session progress cannot be "
+                "determined right now. Scoring is unaffected: it is read from durable storage."
             ),
+            principal=principal,
+            settings=settings,
         )
 
     if not progress.get("found"):
@@ -503,8 +541,11 @@ def launch_results(
             message=(
                 "The current Learning Studio runtime has no record of this exercise being "
                 "opened for this learner. An earlier runtime may have; that is not something "
-                "this can see."
+                "session progress can see. Scoring is unaffected: it is read from durable "
+                "storage below."
             ),
+            principal=principal,
+            settings=settings,
         )
 
     return {
@@ -530,16 +571,24 @@ def launch_results(
         "memory_candidates": [],
         "memory_candidates_note": (
             "No durable memory candidate is proposed from running an exercise. Completing "
-            "one is an event rather than a fact that stays true, and no mark or attempt is "
-            "recorded to draw a conclusion from. Propose durable facts through "
+            "one is an event rather than a fact that stays true, and this is not where "
+            "objective-level progress is reported — see learning_studio_attempts and "
+            "learning_studio_review_plan. Propose durable facts through "
             "learning_studio_save_context, from what the learner actually told you."
         ),
-        **_honest_scoring(),
+        **_scoring_fields(principal=principal, experience=experience, settings=settings),
     }
 
 
-def _unknown(experience: dict[str, Any], *, state: str, message: str) -> dict[str, Any]:
-    """A result that says "I cannot tell", and says which kind of cannot.
+def _unknown(
+    experience: dict[str, Any],
+    *,
+    state: str,
+    message: str,
+    principal: Principal,
+    settings: LearningStudioConfig,
+) -> dict[str, Any]:
+    """A result that says "I cannot tell" about *session progress*, and why.
 
     ``opened`` is ``None`` rather than ``False`` throughout. The distinction is
     the whole point of this shape: ``False`` is a finding — the learner did not
@@ -547,6 +596,9 @@ def _unknown(experience: dict[str, Any], *, state: str, message: str) -> dict[st
     so. Everywhere else the honest answer is that the evidence is not available,
     and an agent that reads ``False`` as "they ignored it" would be repeating a
     conclusion nobody reached.
+
+    Scoring is reported regardless: it comes from durable storage, not from
+    the runtime session this function is otherwise unable to ask about.
     """
     return {
         "ok": True,
@@ -562,5 +614,5 @@ def _unknown(experience: dict[str, Any], *, state: str, message: str) -> dict[st
         "responses_returned": False,
         "memory_candidates": [],
         "message": message,
-        **_honest_scoring(),
+        **_scoring_fields(principal=principal, experience=experience, settings=settings),
     }

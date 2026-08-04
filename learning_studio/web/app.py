@@ -1,6 +1,6 @@
 """The protected Mini App API, and the static shell that calls it.
 
-Six API routes, one authentication rule, and no way round it.
+Eight API routes, one authentication rule, and no way round it.
 
 **Every route that can return learner data is protected.** Health included.
 There is no development bypass: each such request must carry a Telegram
@@ -28,16 +28,26 @@ serves a component serves the stored *learner payload*, which was constructed
 from an allowlist when the experience was prepared and never contained an answer
 key, rubric, hint, or branch in the first place.
 
-The single exception is ``POST /api/session/reveal``, which turns a flashcard
-over. It exists because retrieval practice is not retrieval practice unless the
-learner finds out whether they were right, and the component contract this plugin
-publishes requires an explicit reveal. It is not a general read of the hidden
-half: :func:`learning_studio.service.reveal_component_answer` returns *one string
-of one field of one component type*, chosen by a mapping in that module, and
+One exception to "learner payload only" predates this PR: ``POST
+/api/session/reveal``, which turns a flashcard over. It exists because
+retrieval practice is not retrieval practice unless the learner finds out
+whether they were right, and the component contract this plugin publishes
+requires an explicit reveal. It is not a general read of the hidden half:
+:func:`learning_studio.service.reveal_component_answer` returns *one string of
+one field of one component type*, chosen by a mapping in that module, and
 there is no query anywhere here that could return an evaluation record. The
 reveal is granted only after an attempt has been committed, and that attempt is
 frozen — so reading the answer and then improving the recall is refused rather
 than merely discouraged.
+
+The other, new with this PR, is ``GET /api/session/summary``: once a session
+is complete it scores every answered component and returns a summary — overall
+score, per-component correct/incorrect, and the stored ``feedback`` text for
+*that* outcome, never the answer key, rubric, or another component's feedback.
+Scoring is computed once per session and cached on it, so a refreshed or
+backgrounded webview sees the same result rather than a second scoring pass
+that could disagree with the first or write a second durable attempt. See
+:func:`learning_studio.service.record_attempt`.
 
 **Errors say little.** A missing experience, one belonging to another learner,
 and one belonging to another profile are the same 404. An invalid session, an
@@ -48,17 +58,19 @@ The interface this API serves lives in ``static/`` and is described in
 :mod:`learning_studio.web.static_files`; the shell is served from here, from a
 closed allowlist of files.
 
-What this still deliberately does not do: score anything, or store an attempt
-durably. Responses and reveals are held in the session for its lifetime and the
-summary reports progress, not marks. Grading and durable attempts arrive with the
-evaluation runtime, and inventing half of one here would mean storing learner
-performance data before the design that governs it exists.
+What this still deliberately does not do: return a learner's own submitted
+text back to them, or accept a rubric-graded criterion selection from a
+client. Scoring is summary-level only, and open-ended rubric responses are
+recorded as attempted but not machine-graded — see
+:mod:`learning_studio.evaluation` for why that is a design choice and not an
+omission.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -131,12 +143,21 @@ ATTEMPT_REQUIRED = "Write what you remember before turning the card over."
 REVEAL_REQUIRED = "Turn the card over before rating your recall."
 RECALL_FROZEN = "Your recall was recorded when you turned the card over."
 NOT_REVEALABLE = "There is nothing to turn over on this card."
+NOT_FINISHED = "This exercise is not finished yet."
 
-#: Said on every result summary, because the honest answer to "how did I do?"
-#: in this PR is "nothing has been marked".
+#: Said while the exercise is still in progress: nothing is marked *yet*.
 NOT_SCORED_NOTICE = (
-    "Responses are recorded for this session only. Nothing has been marked, and no "
-    "attempt or score has been stored."
+    "Responses are recorded for this session and are not scored until the exercise is "
+    "finished. Nothing has been marked yet."
+)
+
+#: Said on the final answer, so the client knows where to go next.
+FINISHED_NOTICE = "That was the last one. Call GET /api/session/summary for the score."
+
+#: Said on the completion screen itself.
+SCORED_NOTICE = (
+    "Scored from this attempt. Summary-level only: no stored answer key, rubric, or "
+    "another component's feedback is ever included here."
 )
 
 
@@ -585,7 +606,7 @@ def create_app(dependencies: Dependencies | None = None):
                 "scored": False,
                 "progress": _progress(session),
                 "next_component": _component_at(experience, session.position),
-                "notice": NOT_SCORED_NOTICE,
+                "notice": FINISHED_NOTICE if session.completed else NOT_SCORED_NOTICE,
             }
         )
 
@@ -676,17 +697,80 @@ def create_app(dependencies: Dependencies | None = None):
 
     @app.get("/api/session/result")
     async def result(request: Request):
-        """What happened in this session: progress, not marks."""
+        """What happened in this session: progress, and whether it is scored yet.
+
+        The mark itself is not here — see ``GET /api/session/summary`` — this
+        route only says whether one exists, so a client knows whether to ask.
+        """
         verified, session = authorise_session(request)
         experience = load_bundle(verified, session.scope.experience_id).experience
+        scored = session.attempt_result is not None
         return JSONResponse(
             {
                 "experience_id": session.scope.experience_id,
                 "title": experience["title"],
                 "progress": _progress(session),
-                "scored": False,
+                "scored": scored,
                 "answered_components": sorted(session.answers),
-                "notice": NOT_SCORED_NOTICE,
+                "notice": (
+                    SCORED_NOTICE
+                    if scored
+                    else (FINISHED_NOTICE if session.completed else NOT_SCORED_NOTICE)
+                ),
+            }
+        )
+
+    @app.get("/api/session/summary")
+    async def summary(request: Request):
+        """The completion screen: score this session, once, and report it.
+
+        Requires the session to be finished — every component answered or
+        skipped — because scoring a partial attempt would report a mark for
+        questions the learner has not reached yet. The result is computed the
+        first time this is called and cached on the session; a repeat request
+        (a refresh, a backgrounded webview resuming) returns the identical
+        cached summary rather than scoring the session a second time or
+        writing a second durable attempt.
+        """
+        verified, session = authorise_session(request)
+        if not session.completed:
+            raise ApiError(409, NOT_FINISHED, reason="not_completed")
+
+        def compute() -> dict[str, Any]:
+            return deps.record_attempt(
+                deps.principal(verified.user_id),
+                session.scope.experience_id,
+                dict(session.answers),
+                _iso(session.created_at),
+                _iso(session.completed_at),
+            )
+
+        try:
+            result = session.freeze_attempt_result(compute)
+        except NotFoundError as exc:
+            raise ApiError(404, NOT_FOUND, reason="experience_not_found") from exc
+        except ServiceError as exc:
+            raise ApiError(400, BAD_REQUEST, reason="attempt_unavailable") from exc
+
+        log_request(
+            event="session_scored",
+            route="/api/session/summary",
+            session_ref=session.ref,
+            status=200,
+        )
+        return JSONResponse(
+            {
+                "experience_id": session.scope.experience_id,
+                "attempt_id": result["attempt_id"],
+                "scored": True,
+                "overall_score": result["overall_score"],
+                "overall_max_score": result["overall_max_score"],
+                "graded_component_count": result["graded_component_count"],
+                "correct_component_count": result["correct_component_count"],
+                "component_count": result["component_count"],
+                "components": result["components"],
+                "review": result["review"],
+                "notice": SCORED_NOTICE,
             }
         )
 
@@ -843,3 +927,15 @@ def _progress(session) -> dict[str, Any]:
         "answered": len(session.answers),
         "completed": session.completed,
     }
+
+
+def _iso(epoch_seconds: float | None) -> str:
+    """A session timestamp (from ``deps.clock()``) as an ISO-8601 string.
+
+    Storage stores every other timestamp this way; a session's are the only
+    ones kept as epoch floats, because that is what the in-memory clock
+    speaks. Converted only at the boundary where they cross into a durable
+    row.
+    """
+    value = epoch_seconds if epoch_seconds is not None else 0.0
+    return datetime.fromtimestamp(value, tz=UTC).isoformat()

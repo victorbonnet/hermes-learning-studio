@@ -104,12 +104,16 @@ def test_the_tools_are_registered_without_optional_deps(without_optional_deps):
     module.register(ctx)
 
     assert sorted(tool.name for tool in ctx.tools) == [
+        "learning_studio_attempts",
+        "learning_studio_erase_learner",
         "learning_studio_get_context",
         "learning_studio_import_asset",
         "learning_studio_launch",
         "learning_studio_prepare",
         "learning_studio_results",
+        "learning_studio_review_plan",
         "learning_studio_save_context",
+        "learning_studio_set_review_reminders",
         "learning_studio_status",
         "learning_studio_stop",
     ]

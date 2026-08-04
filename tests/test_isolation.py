@@ -185,13 +185,31 @@ def test_a_track_id_from_another_profile_is_not_readable(tmp_path: Path, monkeyp
 def test_every_learner_owned_row_carries_its_profile_scope(hermes_home: Path):
     """The scope columns are the invariant the queries rely on."""
     from learning_studio import storage
+    from tests.component_examples import example, manifest
 
-    _make_track(ALICE, "Alice track")
+    track_id = _make_track(ALICE, "Alice track")
     service.save_context(
         principal=ALICE,
         temporary_context={"subject": "anything"},
         objectives=None,
     )
+    objective = {"behavior": "b", "condition": "c", "standard": "s"}
+    objective_id = service.save_context(
+        principal=ALICE, objectives=[{"track_id": track_id, **objective}]
+    )["outcome"]["objectives"][0]["objective_id"]
+    prepared = service.prepare_experience(
+        principal=ALICE,
+        manifest=manifest([example("multiple_choice", id="mc")], objective=objective),
+        track_id=track_id,
+        objective_id=objective_id,
+    )
+    service.record_attempt(
+        principal=ALICE,
+        experience_id=prepared["experience_id"],
+        responses={"mc": {"option_id": "cytosol"}},
+        started_at="2025-01-01T00:00:00+00:00",
+    )
+    service.set_review_reminders(principal=ALICE, enabled=True)
 
     scoped = (
         "tracks",
@@ -201,6 +219,13 @@ def test_every_learner_owned_row_carries_its_profile_scope(hermes_home: Path):
         "objectives",
         "memory_candidates",
         "learners",
+        "experiences",
+        "experience_components",
+        "attempts",
+        "attempt_components",
+        "review_state",
+        "misconceptions",
+        "learner_preferences",
     )
     with storage.connect() as conn:
         for table in scoped:

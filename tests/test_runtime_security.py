@@ -704,7 +704,7 @@ def test_registration_is_still_free_of_side_effects(ctx, tmp_path, monkeypatch):
     register(ctx)
 
     assert not (tmp_path / "fresh").exists(), "registration created state on disk"
-    assert len(ctx.tools) == 8
+    assert len(ctx.tools) == 12
 
 
 def test_the_group_is_never_signalled_when_the_leader_could_not_be(monkeypatch):

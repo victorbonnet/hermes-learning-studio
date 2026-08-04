@@ -99,6 +99,12 @@ class MiniAppSession:
     #: refresh returns the same card and keeps the first attempt.
     revealed: dict[str, str] = field(default_factory=dict)
     completed_at: float | None = None
+    #: The durable attempt this session produced, computed once and cached
+    #: here — never recomputed. A second request for the completion screen
+    #: (a refresh, a backgrounded webview resuming) must see the exact same
+    #: scored result rather than triggering ``record_attempt`` again, which
+    #: would otherwise write a second row for one finished session.
+    attempt_result: dict[str, Any] | None = None
 
     @property
     def completed(self) -> bool:
@@ -119,6 +125,17 @@ class MiniAppSession:
         re-posts a different recall does not get to replace it.
         """
         return self.revealed.setdefault(component_id, attempt)
+
+    def freeze_attempt_result(self, compute) -> dict[str, Any]:
+        """Compute and cache the durable attempt exactly once.
+
+        ``compute`` is only called the first time; every later call — a
+        refresh, a duplicate request — returns the cached result without
+        touching storage again.
+        """
+        if self.attempt_result is None:
+            self.attempt_result = compute()
+        return self.attempt_result
 
 
 class SessionStore:

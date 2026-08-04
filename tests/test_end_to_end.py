@@ -381,7 +381,7 @@ def test_a_learner_asks_to_practise_and_gets_a_working_exercise(
     assert results["answered"] == 1
     assert results["completed"] is False
     assert results["scored"] is False
-    assert results["attempts_stored"] is False
+    assert results["attempt"] is None
     assert results["responses_returned"] is False
     assert results["memory_candidates"] == []
 
