@@ -708,13 +708,48 @@
       var ungraded = Math.max(0, total - graded);
 
       var body = [el("p", { text: t("complete.body", { answered: total, count: total }) })];
+      var sentence = "";
       if (graded > 0) {
+        var correct = data.correct_component_count || 0;
         body.push(
           el("p", {
             className: "feedback",
-            text: t("complete.score", { correct: data.correct_component_count || 0, graded: graded }),
+            text: t("complete.score", { correct: correct, graded: graded }),
           })
         );
+        // A short, honest sentence under the mark: what the fraction means in
+        // plain words, and how many marked answers are worth another look.
+        // Composed from the marks the server already returned — never from an
+        // answer key, a rubric, or the learner's own response text.
+        //
+        // The tier reads the very fraction the sentences around it state —
+        // correct marked answers out of marked answers — and not the
+        // points-weighted overall score, which per-component weights and
+        // partial credit can pull far away from those counts. "You got 3 of 4
+        // marked answers right" above "a tricky exercise" is a contradiction
+        // the learner has no way to resolve.
+        var fraction = graded > 0 ? correct / graded : null;
+        var tier = null;
+        if (fraction !== null) {
+          if (fraction >= 0.9) {
+            tier = "complete.feedback.excellent";
+          } else if (fraction >= 0.6) {
+            tier = "complete.feedback.good";
+          } else if (fraction >= 0.4) {
+            tier = "complete.feedback.mixed";
+          } else {
+            tier = "complete.feedback.rough";
+          }
+        }
+        var incorrect = Math.max(0, graded - correct);
+        if (tier !== null || incorrect > 0) {
+          sentence = tier === null ? "" : t(tier);
+          if (incorrect > 0) {
+            sentence +=
+              (sentence ? " " : "") + t("complete.feedback.to_review", { count: incorrect });
+          }
+          body.push(el("p", { className: "feedback", text: sentence }));
+        }
       } else {
         body.push(el("p", { className: "hint", text: t("complete.no_score") }));
       }
@@ -750,7 +785,9 @@
           children: [el("h2", { text: t("complete.title") })].concat(body),
         })
       );
-      announce(t("complete.title"));
+      // Screen readers get the same two sentences a sighted learner sees: the
+      // title alone says the exercise ended, but not how it went.
+      announce(sentence ? t("complete.title") + " " + sentence : t("complete.title"));
       nodes["progress-text"].textContent = "";
       setAction(t("action.close"), function () {
         if (telegram && typeof telegram.close === "function") {

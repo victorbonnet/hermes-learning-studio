@@ -44,8 +44,11 @@ private Telegram conversation you are already in. They tap it and work through
 the cards — selection, cloze, ordering, matching, flashcards with an explicit
 reveal, images, hotspots, tables, scenarios, reflection — keyboard-operable, in
 three interface languages. When they finish, the Mini App scores the attempt
-and shows them a completion screen: overall score, a per-component
-correct/incorrect breakdown with feedback, and a review-plan preview.
+and shows them a completion screen: overall score, a short feedback sentence
+under it (encouraging or constructive, in the learner's interface language, and
+naming how many marked answers are worth another look when any were missed), a
+per-component correct/incorrect breakdown with feedback, and a review-plan
+preview.
 
 Three things about that are worth knowing before you use it.
 
