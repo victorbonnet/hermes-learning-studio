@@ -3542,6 +3542,12 @@ def erase_learner(
     components, review state, misconceptions, and the reminder preference —
     references it through a foreign key declared ``ON DELETE CASCADE``, so
     one deletion inside one transaction removes all of them or none of them.
+
+    The managed asset *files* are unlinked after the commit — a rolled-back
+    transaction must never leave files without their rows — and the pages
+    the deletion freed are physically reclaimed (WAL checkpoint plus
+    ``VACUUM``) so the erasure is not merely logical. Both steps are
+    best-effort: the committed deletion is the authoritative part.
     """
     config = config or load_config()
     profile = principal.profile
@@ -3551,9 +3557,38 @@ def erase_learner(
         learner_id = _find_learner(conn, principal)
         if learner_id is None:
             return {"ok": True, "erased": False, "message": "Nothing is stored for this learner."}
+        asset_rows = conn.execute(
+            "SELECT storage_name, byte_size FROM managed_assets"
+            " WHERE profile_id = ? AND learner_id = ?",
+            (profile, learner_id),
+        ).fetchall()
         conn.execute("DELETE FROM learners WHERE id = ? AND profile_id = ?", (learner_id, profile))
 
+    from . import assets
+
+    for asset in asset_rows:
+        with contextlib.suppress(assets.AssetError):
+            assets.remove_managed_asset_file(asset)
+    _reclaim_deleted_pages(config)
+
     return {"ok": True, "erased": True}
+
+
+def _reclaim_deleted_pages(config: LearningStudioConfig) -> None:
+    """Physically reclaim pages freed by an erasure, best-effort.
+
+    SQLite keeps deleted rows in the WAL until a checkpoint and in free pages
+    until a ``VACUUM``; an "erased" promise that left either on disk would be
+    a promise about a logical state. Both run here, outside any transaction,
+    on the already-committed deletion, and a failure changes nothing about
+    the erasure itself — so it is suppressed rather than reported.
+    """
+    try:
+        with storage.connect(config) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+    except sqlite3.Error:
+        return
 
 
 # ── Input validation helpers ──────────────────────────────────────────────

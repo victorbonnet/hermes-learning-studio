@@ -117,7 +117,7 @@ EXAMPLES: dict[str, dict[str, Any]] = {
             ]
         },
         "answer": {"option_ids": ["lifejackets", "flares"], "partial_credit": True},
-        "evaluation": _evaluation("multi_select", scoring={"mode": "set", "partial_credit": True}),
+        "evaluation": _evaluation("multi_select", scoring={"mode": "set"}),
     },
     "true_false": {
         "id": "law-03",
@@ -284,7 +284,7 @@ EXAMPLES: dict[str, dict[str, Any]] = {
             ],
             "partial_credit": True,
         },
-        "evaluation": _evaluation("matching", scoring={"mode": "set", "partial_credit": True}),
+        "evaluation": _evaluation("matching", scoring={"mode": "set"}),
     },
     "categorization": {
         "id": "eco-14",
@@ -487,8 +487,9 @@ EXAMPLES: dict[str, dict[str, Any]] = {
                 {"row_id": "meiosis", "column_id": "daughters", "accepted": ["4", "four"]},
             ],
             "case_sensitive": False,
+            "partial_credit": True,
         },
-        "evaluation": _evaluation("table_grid", scoring={"mode": "set", "partial_credit": True}),
+        "evaluation": _evaluation("table_grid", scoring={"mode": "normalised"}),
     },
     # ── Scenarios and decisions ───────────────────────────────────────────
     "scenario_choice": {

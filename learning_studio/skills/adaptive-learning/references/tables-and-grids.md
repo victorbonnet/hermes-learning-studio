@@ -32,7 +32,8 @@ rows and columns each carry meaning.
 - `payload.rows` and `payload.columns` — each with a clear, stated label.
 - `payload.cells` — which are pre-filled and which the learner must supply.
 - `answer` — per cell, with accepted variants where the cell is free text.
-- `evaluation` — usually `set` over cells, with per-cell partial credit.
+- `evaluation` — `exact` or `normalised`, scored per cell against that cell's
+  own accepted forms, with per-cell partial credit if declared.
 - `cell_type` — free text, selection, or numeric, per column if it varies.
 - Cells that are **legitimately empty or not applicable**, marked as such so a
   blank is not scored as a miss.

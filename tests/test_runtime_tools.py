@@ -338,6 +338,35 @@ def test_status_says_nothing_is_scored(registered, hermes_home):
 
     assert result["scored"] is False
     assert result["attempts_stored"] is False
+    assert "Merely opening an exercise" in result["notice"]
+
+
+def test_status_reports_attempts_stored_once_a_session_is_scored(registered, hermes_home):
+    """``attempts_stored`` is a profile-wide fact, not learner-scoped detail."""
+    from learning_studio import service
+    from learning_studio.identity import Principal
+    from tests.component_examples import example, manifest
+    from tests.served_responses import response_for
+
+    principal = Principal(
+        profile="default", platform="telegram", user_id="9001", source="gateway_session"
+    )
+    component = example("multiple_choice", id="mc")
+    prepared = service.prepare_experience(principal=principal, manifest=manifest([component]))
+    service.record_attempt(
+        principal=principal,
+        experience_id=prepared["experience_id"],
+        responses={"mc": response_for(component["type"], component["content"])},
+        started_at="2025-01-01T00:00:00+00:00",
+    )
+
+    handler = next(
+        tool.handler for tool in registered.tools if tool.name == "learning_studio_status"
+    )
+    result = json.loads(handler({}))
+
+    assert result["attempts_stored"] is True
+    assert str(hermes_home) not in json.dumps(result)
 
 
 def test_stopping_nothing_is_a_stated_no_op(registered, hermes_home):

@@ -1907,14 +1907,22 @@ component type directly:
   `case_sensitive`/`accent_sensitive` flags; `numeric` parses a leading number
   from the submission and compares it to the accepted values within
   `scoring.tolerance`.
-- **`set`** — multi-select, classification, matching, categorization,
-  labeling, and `table_grid`. Partial credit, where the type's own answer
-  block declares a `partial_credit` flag, is *matched-minus-false-positive,
-  divided by the number of expected entries, floored at zero* — not the only
-  reasonable formula, but a documented, deterministic, and tested one.
+- **`set`** — multi-select, classification, matching, categorization, and
+  labeling. Partial credit, where the type's own answer block declares a
+  `partial_credit` flag, is *matched-minus-false-positive, divided by the
+  number of expected entries, floored at zero* — not the only reasonable
+  formula, but a documented, deterministic, and tested one.
+- **`table_grid`** (`exact` or `normalised`, never `set`) — scored per cell
+  against that cell's own accepted forms: a grid is independent text answers
+  in a shape, not an unordered collection, so the set algorithm does not
+  apply. `partial_credit` is the fraction of cells matched, and is declared
+  in the answer block like the set-family types above.
 - **`ordered`** — sentence/sequence order, timeline, and process-flow score
   the fraction of positions where the submission agrees with the expected
-  order at that same index ("correctly placed", not edit distance).
+  order at that same index ("correctly placed", not edit distance). With
+  `partial_credit`, the denominator is the longer of the expected and
+  submitted lengths, so padding a submission with extra items cannot recover
+  credit lost to wrong positions.
   `decision_path`'s response contract is a *set* of `{step_id, option_id}`
   pairs rather than a sequence, so it is scored per-step instead.
 - **`rubric`** — `free_response`, `image_observation`, `case_study`,

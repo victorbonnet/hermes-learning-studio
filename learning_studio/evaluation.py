@@ -45,17 +45,28 @@ Where a mode admits more than one reasonable algorithm, the choice is written
 down beside the function that makes it, because the choice is the answer to
 "why did this get partial credit":
 
-- **set** (multi_select, classification, matching, categorization, labeling,
-  table_grid): matched-minus-false-positive, divided by the number of
-  expected entries, floored at zero. Exact when the type's own answer block
-  has no ``partial_credit`` flag or it is unset.
+- **set** (multi_select, classification, matching, categorization, labeling):
+  matched-minus-false-positive, divided by the number of expected entries,
+  floored at zero. Exact when the type's own answer block has no
+  ``partial_credit`` flag or it is unset.
+- **table_grid** (``exact`` or ``normalised``, never ``set``): scored per
+  cell against that cell's own accepted forms, not as a group — a table is a
+  grid of independent text answers, not an unordered collection, so the set
+  algorithm's "matched minus false positive" has nothing to subtract against.
+  ``partial_credit`` is the fraction of cells matched; it is read from the
+  answer block, the same as the other set-family types.
 - **ordered** (sentence_order, sequence_order, timeline, process_flow):
   fraction of positions where the submitted item equals the expected item at
-  that same index — "correctly placed", not edit distance.
+  that same index — "correctly placed", not edit distance. With
+  ``partial_credit``, the fraction is taken over
+  ``max(len(expected), len(submitted))``, not just ``len(expected)``, so
+  padding the submission with extra items cannot buy back credit lost to
+  wrong positions.
 - **ordered** (decision_path): the response contract for this type is a set
   of ``{step_id, option_id}`` pairs, not a sequence — see
   ``responses._decision_path`` — so grading here is per-step option
-  correctness, keyed by step, and averaged.
+  correctness, keyed by step, and averaged. Unaffected by the length penalty
+  above: a step either has a submitted decision or it does not.
 - **hotspot**: a submitted point counts inside a region when it falls within
   the region's own shape expanded by ``tolerance`` on every side. Polygon
   regions are checked *without* the tolerance expansion: growing an arbitrary
@@ -90,6 +101,12 @@ RUBRIC_ONLY_TYPES: frozenset[str] = frozenset(
     }
 )
 
+#: A comma used as a thousands separator: one to three leading digits, then
+#: one or more groups of exactly three digits, with no stray digit glued to
+#: either end of the run — see :func:`_parse_number`.
+_THOUSANDS_RE = re.compile(r"(?<!\d)-?\d{1,3}(?:,\d{3})+(?!\d)(?:\.\d+)?")
+#: A comma used as a decimal point (the French/European convention).
+_DECIMAL_COMMA_RE = re.compile(r"-?\d+,\d+")
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
@@ -179,7 +196,25 @@ def _text_matches(
 
 
 def _parse_number(text: str) -> float | None:
-    match = _NUMBER_RE.search(text.replace(",", ""))
+    """Find the first number in ``text``, disambiguating a comma by context.
+
+    A comma is a **thousands separator** only when it sits in a run that
+    reads as digit-grouping: one to three leading digits, then one or more
+    groups of exactly three digits, with nothing before or after that would
+    make a group not-exactly-three (``1,234`` and ``1,234,567`` qualify;
+    ``1,2345`` and ``12,3`` do not, because a group is the wrong size). Such a
+    comma is dropped. Anything else with a comma between two digit runs is a
+    **decimal comma** (the French/European convention) and is read as ``.``
+    instead — so ``1,5`` is one-and-a-half, not fifteen. A plain ``.`` decimal
+    point still works unchanged.
+    """
+    match = _THOUSANDS_RE.search(text)
+    if match is not None:
+        return float(match.group(0).replace(",", ""))
+    match = _DECIMAL_COMMA_RE.search(text)
+    if match is not None:
+        return float(match.group(0).replace(",", "."))
+    match = _NUMBER_RE.search(text)
     if match is None:
         return None
     try:
@@ -417,6 +452,7 @@ def _score_table_grid(
     response: dict[str, Any],
 ) -> ComponentResult:
     case_sensitive = bool(answer.get("case_sensitive"))
+    accent_sensitive = bool(answer.get("accent_sensitive", True))
     by_key = {
         (str(entry.get("row_id")), str(entry.get("column_id"))): [
             str(item) for item in entry.get("accepted") or ()
@@ -439,7 +475,7 @@ def _score_table_grid(
             accepted,
             mode=compare_mode,
             case_sensitive=case_sensitive,
-            accent_sensitive=True,
+            accent_sensitive=accent_sensitive,
         )
     )
     partial = bool(answer.get("partial_credit"))
@@ -686,12 +722,18 @@ def _score_ordering(
     scoring = evaluation.get("scoring") or {}
     partial = bool(scoring.get("partial_credit"))
     weight = _weight(scoring)
+    # A submission padded with extra items cannot match more positions than
+    # ``expected`` has, so dividing by ``total`` alone would let a learner buy
+    # back credit lost to wrong positions just by tacking junk onto the end.
+    # Dividing by the longer of the two lengths makes a padded submission
+    # strictly worse, never better, than the same submission unpadded.
+    denominator = max(len(expected), len(submitted)) or 1
     return ComponentResult(
         component_type=component_type,
         mode="ordered",
         graded=True,
         correct=correct,
-        score=(hits / total if partial else float(correct)) * weight,
+        score=(hits / denominator if partial else float(correct)) * weight,
         max_score=weight,
         feedback=_feedback_for(evaluation, correct=correct),
     )
@@ -790,7 +832,7 @@ def _score_hotspot(
     tolerance = float(answer.get("tolerance") or 0.0)
     submitted_points = response.get("points") or ()
     correct = False
-    if submitted_points:
+    if submitted_points and isinstance(submitted_points[0], dict):
         point = submitted_points[0]
         x, y = float(point.get("x", -1)), float(point.get("y", -1))
         correct = any(

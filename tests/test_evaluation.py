@@ -149,6 +149,23 @@ def test_numeric_mode_uses_tolerance() -> None:
     assert far.correct is False
 
 
+@pytest.mark.parametrize(
+    ("submitted", "accepted", "expected"),
+    [
+        ("1,5", ["1.5"], True),  # French decimal comma
+        ("1,5", ["15"], False),  # not a thousands separator here
+        ("1,234", ["1234"], True),  # thousands separator preserved
+        ("12,5", ["12.5"], True),
+        ("42", ["42"], True),
+        ("aucune", ["1"], False),  # no number in the submission at all
+    ],
+)
+def test_numeric_mode_disambiguates_the_comma(submitted, accepted, expected) -> None:
+    from learning_studio.evaluation import _text_matches
+
+    assert _text_matches(submitted, accepted, mode="numeric") is expected
+
+
 def test_set_mode_partial_credit_multi_select() -> None:
     result = _score("multi_select")  # served response picks only one of two
     assert result.correct is False
@@ -181,6 +198,31 @@ def test_ordered_mode_decision_path_is_keyed_by_step_not_position() -> None:
     assert result.correct is True
 
 
+def test_ordered_mode_partial_credit_penalizes_padded_submissions() -> None:
+    raw = example(
+        "sequence_order",
+        evaluation={"scoring": {"mode": "ordered", "partial_credit": True}},
+    )
+    component = build_component(raw, "component")
+    hidden = component.hidden()
+
+    exact = score_component(
+        component_type="sequence_order",
+        hidden=hidden,
+        response={"order": ["rinse", "fill", "titrate"]},
+    )
+    assert exact.correct is True
+    assert exact.score == 1.0
+
+    padded = score_component(
+        component_type="sequence_order",
+        hidden=hidden,
+        response={"order": ["rinse", "fill", "titrate", "extra"]},
+    )
+    assert padded.correct is False  # length mismatch against the expected order
+    assert padded.score == pytest.approx(0.75)  # 3 correctly placed, over 4 submitted
+
+
 def test_hotspot_inside_and_outside_tolerance() -> None:
     component, hidden = _hidden("hotspot")
     inside = score_component(
@@ -198,10 +240,82 @@ def test_hotspot_inside_and_outside_tolerance() -> None:
     assert edge.correct is True
 
 
+def test_hotspot_malformed_point_scores_not_correct_instead_of_crashing() -> None:
+    component, hidden = _hidden("hotspot")
+    result = score_component(
+        component_type="hotspot", hidden=hidden, response={"points": ["not-a-point"]}
+    )
+    assert result.graded is True
+    assert result.correct is False
+
+
 def test_table_grid_partial_credit() -> None:
     result = _score("table_grid")
     assert result.correct is False
     assert result.score == 0.0  # neither served cell text matches
+
+
+def test_table_grid_scores_per_cell_with_partial_credit() -> None:
+    component, hidden = _hidden("table_grid")
+    result = score_component(
+        component_type="table_grid",
+        hidden=hidden,
+        response={
+            "cells": [
+                {"row_id": "mitosis", "column_id": "daughters", "text": "two"},
+                {"row_id": "meiosis", "column_id": "daughters", "text": "x"},
+            ]
+        },
+    )
+    assert result.correct is False
+    assert result.score == pytest.approx(0.5)
+
+
+def test_table_grid_accent_sensitive_flag_defaults_true_but_is_honoured() -> None:
+    cells = [
+        {"row_id": "mitosis", "column_id": "daughters", "accepted": ["deux"]},
+        {"row_id": "meiosis", "column_id": "daughters", "accepted": ["quatre"]},
+    ]
+    raw = example(
+        "table_grid",
+        answer={"cells": cells, "case_sensitive": False},
+        evaluation={"scoring": {"mode": "normalised"}},
+    )
+    component = build_component(raw, "component")
+    hidden = component.hidden()
+
+    # Accent-sensitive by default: an accented submission does not match an
+    # unaccented accepted form.
+    strict = score_component(
+        component_type="table_grid",
+        hidden=hidden,
+        response={
+            "cells": [
+                {"row_id": "mitosis", "column_id": "daughters", "text": "déux"},
+                {"row_id": "meiosis", "column_id": "daughters", "text": "quatre"},
+            ]
+        },
+    )
+    assert strict.correct is False
+
+    raw_insensitive = example(
+        "table_grid",
+        answer={"cells": cells, "case_sensitive": False, "accent_sensitive": False},
+        evaluation={"scoring": {"mode": "normalised"}},
+    )
+    component_insensitive = build_component(raw_insensitive, "component")
+    hidden_insensitive = component_insensitive.hidden()
+    lenient = score_component(
+        component_type="table_grid",
+        hidden=hidden_insensitive,
+        response={
+            "cells": [
+                {"row_id": "mitosis", "column_id": "daughters", "text": "déux"},
+                {"row_id": "meiosis", "column_id": "daughters", "text": "quatre"},
+            ]
+        },
+    )
+    assert lenient.correct is True
 
 
 def test_error_correction_deterministic_phrase_check() -> None:

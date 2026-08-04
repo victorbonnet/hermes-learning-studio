@@ -351,6 +351,48 @@ def test_erase_learner_removes_every_evaluation_runtime_row(hermes_home: Path):
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_erase_learner_removes_managed_asset_files(hermes_home: Path):
+    """Erasure is not merely logical: the image files go with the rows."""
+    from learning_studio import assets
+    from tests.test_assets import _image, _import, _source_root
+
+    source = _source_root(hermes_home) / "cell.png"
+    _image(source)
+    _import(OWNER, source)
+
+    (storage_name,) = rows("SELECT storage_name FROM managed_assets")[0]
+    asset_file = assets.managed_assets_root() / str(storage_name)
+    assert asset_file.exists()
+
+    result = service.erase_learner(principal=OWNER)
+    assert result == {"ok": True, "erased": True}
+    assert not asset_file.exists()
+    assert rows("SELECT * FROM managed_assets") == []
+    with storage.connect() as conn:
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_erase_learner_leaves_another_learners_asset_files_alone(hermes_home: Path):
+    from learning_studio import assets
+    from tests.test_assets import _image, _import, _source_root
+
+    for principal, name in ((OWNER, "owner.png"), (OTHER, "other.png")):
+        source = _source_root(hermes_home) / name
+        _image(source)
+        _import(principal, source)
+
+    names = {str(row[0]) for row in rows("SELECT storage_name FROM managed_assets")}
+    assert len(names) == 2
+
+    service.erase_learner(principal=OWNER)
+
+    survivors = rows("SELECT storage_name FROM managed_assets")
+    assert len(survivors) == 1
+    surviving_name = str(survivors[0][0])
+    assert (assets.managed_assets_root() / surviving_name).exists()
+    assert surviving_name in names
+
+
 def test_erase_learner_is_idempotent_and_safe_with_nothing_stored(hermes_home: Path):
     result = service.erase_learner(principal=OWNER)
     assert result == {"ok": True, "erased": False, "message": "Nothing is stored for this learner."}

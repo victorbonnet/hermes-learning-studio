@@ -26,8 +26,10 @@ machine in the middle of a study session.
 from __future__ import annotations
 
 import logging
+import sqlite3
 from typing import Any
 
+from .. import storage
 from ..config import LearningStudioConfig, load_config
 from . import bootstrap, ownership, supervisor
 from .errors import (
@@ -84,7 +86,7 @@ def status(config: LearningStudioConfig | None = None) -> dict[str, Any]:
             "running": False,
             "prerequisites": ready,
             "stale_record": read_record() is not None,
-            **_never_scored(),
+            **_never_scored(settings),
         }
 
     reply = handle.reply
@@ -101,7 +103,7 @@ def status(config: LearningStudioConfig | None = None) -> dict[str, Any]:
         "max_lifetime_seconds": handle.record.max_lifetime_seconds,
         "expires_in_seconds": reply.payload.get("expires_in_seconds"),
         "open_sessions": reply.payload.get("sessions", 0),
-        **_never_scored(),
+        **_never_scored(settings),
     }
 
 
@@ -131,13 +133,42 @@ _STOP_MESSAGES = {
 }
 
 
-def _never_scored() -> dict[str, Any]:
-    """Said on every runtime response, because it is the thing most easily assumed."""
+def _never_scored(config: LearningStudioConfig) -> dict[str, Any]:
+    """Said on every runtime status response.
+
+    This call itself never scores anything — ``scored`` is always ``False``
+    here, whatever a learner has done in a Mini App session. ``attempts_stored``
+    is the one fact this notice needs to get right: whether *this profile* has
+    ever completed a scored session, checked as a bare existence query with no
+    learner-scoped detail, never which learner or what they answered.
+    """
     return {
         "scored": False,
-        "attempts_stored": False,
+        "attempts_stored": _profile_has_attempts(config),
         "notice": (
-            "Running an exercise records nothing durable: no attempt, score, or progress is "
-            "stored, and responses exist only for the life of the learner's session."
+            "Merely opening an exercise records nothing durable. A finished session is "
+            "scored and stored once its completion screen is shown."
         ),
     }
+
+
+def _profile_has_attempts(config: LearningStudioConfig) -> bool:
+    """Whether this profile has ever completed a scored session.
+
+    A bare existence check, scoped to the profile column already used
+    everywhere else — never which learner, never what they answered. Reads
+    only: a missing database (nothing has ever been stored) is answered
+    without creating one.
+    """
+    if not storage.database_path().exists():
+        return False
+    try:
+        from ..paths import profile_id
+
+        with storage.connect(config) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM attempts WHERE profile_id = ? LIMIT 1", (profile_id(),)
+            ).fetchone()
+            return row is not None
+    except sqlite3.Error:
+        return False
