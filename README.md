@@ -555,11 +555,6 @@ than blended:
   per-component correct/incorrect breakdown, and any spaced-repetition update
   it produced. It never carries a stored answer key, a rubric, or the
   learner's own submitted text.
-- **Completion feedback** — the completion screen adds a short, honest
-  sentence under the score (from the scored fraction: encouraging tiers, plus
-  a count of marked answers worth another look), composed in the learner's
-  interface language and never drawn from the answer key or the learner's own
-  responses.
 
 It does not return the learner's answers either way.
 
@@ -1837,6 +1832,17 @@ enforced.
 This is what `references/flashcards-and-recall.md` has always asked for — "the
 reveal must be explicit and keyboard-operable" — and what the first version of
 this Mini App did not have.
+
+**The completion screen.** Under the score line (*"You got 3 of 4 marked
+answers right"*) sits one short sentence: an encouraging or constructive
+reading of that same fraction — correct marked answers out of marked answers,
+not the points-weighted total, so the sentence cannot contradict the count
+printed above it — followed, only when something was missed, by how many
+answers are worth another look. It is composed from the counts the server
+already returned and from the interface translations, in the learner's own
+interface language; nothing in it is drawn from an answer key, a rubric, or the
+learner's submitted text. When nothing in the exercise is machine-graded there
+is no score and no such sentence, and the screen says so instead.
 
 ### What it looks like
 

@@ -94,6 +94,7 @@ function fakeApi({
   uiLocale = "en",
   contentLocale = "en",
   failWith = {},
+  summaryOverrides = {},
 } = {}) {
   const components = types.map((componentType, index) =>
     Object.assign({}, FIXTURES[componentType], {
@@ -228,19 +229,28 @@ function fakeApi({
         max_score: 1,
         feedback: null,
       }));
-      return jsonResponse(200, {
-        experience_id: EXPERIENCE_ID,
-        attempt_id: "attempt-fake",
-        scored: true,
-        overall_score: scoredComponents.length ? 1 : 0,
-        overall_max_score: scoredComponents.length,
-        graded_component_count: scoredComponents.length,
-        correct_component_count: scoredComponents.length ? 1 : 0,
-        component_count: components.length,
-        components: scoredComponents,
-        review: null,
-        notice: "Scored from this attempt.",
-      });
+      // `summaryOverrides` replaces individual marks so a test can reach a
+      // tier or a boundary the walk-through cannot produce on its own. An
+      // empty override — the default — leaves the shape above untouched.
+      return jsonResponse(
+        200,
+        Object.assign(
+          {
+            experience_id: EXPERIENCE_ID,
+            attempt_id: "attempt-fake",
+            scored: true,
+            overall_score: scoredComponents.length ? 1 : 0,
+            overall_max_score: scoredComponents.length,
+            graded_component_count: scoredComponents.length,
+            correct_component_count: scoredComponents.length ? 1 : 0,
+            component_count: components.length,
+            components: scoredComponents,
+            review: null,
+            notice: "Scored from this attempt.",
+          },
+          summaryOverrides
+        )
+      );
     }
     if (path.startsWith("/api/assets/")) {
       return {
@@ -385,7 +395,102 @@ test("a perfect score gets the encouraging tier and no review count", async () =
   const text = cardOf(only.win).textContent;
   assert.match(text, /You got 1 of 1 marked answers right/);
   assert.match(text, /Excellent work/i);
-  assert.ok(!/questions? to review/i.test(text));
+  assert.doesNotMatch(text, /question\(s\) to review/);
+});
+
+/** Run a one-card exercise to its completion screen with the marks rewritten. */
+async function finishWithMarks(summaryOverrides) {
+  const context = await boot({ types: ["multiple_choice"], summaryOverrides });
+  await answerCurrent(context);
+  return context;
+}
+
+test("the feedback tier follows the marked-answer count at every threshold", async () => {
+  const cases = [
+    { correct: 9, graded: 10, expect: /Excellent work/i }, // 0.9 exactly
+    { correct: 8, graded: 9, expect: /Well done/i }, // 0.888, just under 0.9
+    { correct: 2, graded: 3, expect: /Well done/i }, // 0.667
+    { correct: 3, graded: 5, expect: /Well done/i }, // 0.6 exactly
+    { correct: 5, graded: 9, expect: /foundations are there/i }, // 0.555, just under 0.6
+    { correct: 2, graded: 5, expect: /foundations are there/i }, // 0.4 exactly
+    { correct: 3, graded: 8, expect: /tricky exercise/i }, // 0.375, just under 0.4
+    { correct: 0, graded: 4, expect: /tricky exercise/i }, // nothing right
+  ];
+
+  for (const item of cases) {
+    const context = await finishWithMarks({
+      correct_component_count: item.correct,
+      graded_component_count: item.graded,
+      component_count: item.graded,
+    });
+    const text = cardOf(context.win).textContent;
+    assert.match(text, item.expect, `${item.correct} of ${item.graded}`);
+    assert.match(
+      text,
+      new RegExp(`${item.graded - item.correct} question\\(s\\) to review`),
+      `${item.correct} of ${item.graded}: review count`
+    );
+  }
+});
+
+test("the feedback tier ignores a points weighting the counts never show", async () => {
+  // Three of four marked answers right, but one heavily weighted item drags the
+  // points to 3 of 8. The sentence has to agree with the count above it.
+  const context = await finishWithMarks({
+    correct_component_count: 3,
+    graded_component_count: 4,
+    component_count: 4,
+    overall_score: 3,
+    overall_max_score: 8,
+  });
+
+  const text = cardOf(context.win).textContent;
+  assert.match(text, /You got 3 of 4 marked answers right/);
+  assert.match(text, /Well done/i);
+  assert.doesNotMatch(text, /tricky exercise/i);
+});
+
+test("nothing machine-graded gets no feedback paragraph at all", async () => {
+  const context = await finishWithMarks({
+    scored: false,
+    overall_score: 0,
+    overall_max_score: 0,
+    graded_component_count: 0,
+    correct_component_count: 0,
+    components: [],
+  });
+
+  const text = cardOf(context.win).textContent;
+  assert.match(text, /Nothing here is machine-graded/);
+  assert.doesNotMatch(text, /Excellent work|Well done|foundations are there|tricky exercise/i);
+  assert.doesNotMatch(text, /question\(s\) to review/);
+  assert.doesNotMatch(text, /marked answers right/);
+});
+
+test("the completion announcement carries the feedback sentence, not just the title", async () => {
+  const context = await finishWithMarks({
+    correct_component_count: 2,
+    graded_component_count: 3,
+    component_count: 3,
+  });
+
+  const announced = context.node("announcer").textContent;
+  assert.match(announced, /Exercise finished/);
+  assert.match(announced, /Well done/i);
+  assert.match(announced, /1 question\(s\) to review/);
+});
+
+test("the completion announcement is the title alone when nothing was graded", async () => {
+  const context = await finishWithMarks({
+    scored: false,
+    overall_score: 0,
+    overall_max_score: 0,
+    graded_component_count: 0,
+    correct_component_count: 0,
+    components: [],
+  });
+
+  assert.equal(context.node("announcer").textContent, "Exercise finished");
 });
 
 test("every renderer survives a real submit, for all thirty-one types", async () => {
