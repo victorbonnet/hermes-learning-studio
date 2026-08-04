@@ -715,6 +715,33 @@
             text: t("complete.score", { correct: data.correct_component_count || 0, graded: graded }),
           })
         );
+        // A short, honest sentence under the mark: what the fraction means in
+        // plain words, and how many marked answers are worth another look.
+        // Composed from the marks the server already returned — never from an
+        // answer key, a rubric, or the learner's own response text.
+        var fraction =
+          data.overall_max_score > 0 ? (data.overall_score || 0) / data.overall_max_score : null;
+        var tier = null;
+        if (fraction !== null) {
+          if (fraction >= 0.9) {
+            tier = "complete.feedback.excellent";
+          } else if (fraction >= 0.6) {
+            tier = "complete.feedback.good";
+          } else if (fraction >= 0.4) {
+            tier = "complete.feedback.mixed";
+          } else {
+            tier = "complete.feedback.rough";
+          }
+        }
+        var incorrect = Math.max(0, graded - (data.correct_component_count || 0));
+        if (tier !== null || incorrect > 0) {
+          var sentence = tier === null ? "" : t(tier);
+          if (incorrect > 0) {
+            sentence +=
+              (sentence ? " " : "") + t("complete.feedback.to_review", { count: incorrect });
+          }
+          body.push(el("p", { className: "feedback", text: sentence }));
+        }
       } else {
         body.push(el("p", { className: "hint", text: t("complete.no_score") }));
       }

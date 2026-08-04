@@ -361,6 +361,33 @@ test("the completion screen shows a per-component breakdown from the summary rou
   );
 });
 
+test("the completion screen adds a short feedback paragraph under the score", async () => {
+  const context = await boot({ types: ["multiple_choice", "true_false", "short_answer"] });
+
+  await answerCurrent(context);
+  await answerCurrent(context);
+  await answerCurrent(context);
+
+  const text = cardOf(context.win).textContent;
+  assert.match(text, /You got 1 of 3 marked answers right/);
+  // One of three correct is a third of the points: the "tricky" tier, plus a
+  // review count naming the two missed marks.
+  assert.match(text, /tricky exercise/i);
+  assert.match(text, /2 question\(s\) to review/);
+});
+
+test("a perfect score gets the encouraging tier and no review count", async () => {
+  // The fake summary marks the first component right and the rest wrong, so a
+  // single-component exercise is the way to reach a perfect mark.
+  const only = await boot({ types: ["multiple_choice"] });
+  await answerCurrent(only);
+
+  const text = cardOf(only.win).textContent;
+  assert.match(text, /You got 1 of 1 marked answers right/);
+  assert.match(text, /Excellent work/i);
+  assert.ok(!/questions? to review/i.test(text));
+});
+
 test("every renderer survives a real submit, for all thirty-one types", async () => {
   const context = await boot({ types: ALL_TYPES });
 

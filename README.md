@@ -555,6 +555,11 @@ than blended:
   per-component correct/incorrect breakdown, and any spaced-repetition update
   it produced. It never carries a stored answer key, a rubric, or the
   learner's own submitted text.
+- **Completion feedback** — the completion screen adds a short, honest
+  sentence under the score (from the scored fraction: encouraging tiers, plus
+  a count of marked answers worth another look), composed in the learner's
+  interface language and never drawn from the answer key or the learner's own
+  responses.
 
 It does not return the learner's answers either way.
 
