@@ -223,15 +223,24 @@ test("the ring's arc is the fraction it is given", () => {
   );
 });
 
-test("the ring says in its label what the sentence below it says in words", () => {
+test("the ring is decoration, because the sentence beside it is the real text", () => {
   const { icons } = fresh();
+  // A label is still offered, to prove the ring does not put one in the page
+  // merely because a caller passed one.
   const node = ringFor(icons, 3, 4, { label: "You got 3 of 4 marked answers right." });
 
-  assert.equal(node.getAttribute("role"), "img");
-  assert.equal(node.getAttribute("aria-label"), "You got 3 of 4 marked answers right.");
+  // `app.js` pushes the localized score paragraph immediately after this node,
+  // and that paragraph is the single accessible text equivalent for the mark.
+  // A ring that named itself as well would make linear screen-reader navigation
+  // announce the same score twice, once as an image and once as prose.
+  assert.equal(node.getAttribute("aria-hidden"), "true");
+  assert.equal(node.hasAttribute("role"), false, "the ring still claims to be an image");
+  assert.equal(node.hasAttribute("aria-label"), false, "the ring still names itself");
+  // The stylesheet still colours it, so the class it is found by does not move.
   assert.equal(node.getAttribute("class"), "score-ring");
-  // The digits in the middle are a picture of the same thing, so a screen
-  // reader hears the label rather than "3 slash 4".
+
+  // The digits stay visible — they are the picture — and stay hidden from
+  // assistive technology in their own right, not only by inheritance.
   const value = part(node, "ring-value");
   assert.equal(value.textContent, "3/4");
   assert.equal(value.getAttribute("aria-hidden"), "true");

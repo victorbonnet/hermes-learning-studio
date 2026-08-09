@@ -86,8 +86,9 @@ pip install "hermes-learning-studio[media] @ git+https://github.com/victorbonnet
 ```
 
 For a directory-plugin install, install Pillow into the same Python environment
-that runs Hermes. Without it, the plugin and its other three tools continue to
-work; `learning_studio_import_asset` returns a safe, actionable error.
+that runs Hermes. Without it, the plugin and every tool except
+`learning_studio_import_asset` continue to work; that tool returns a safe,
+actionable error.
 
 Managed publication also requires descriptor-relative filesystem operations
 (`dir_fd`, `O_DIRECTORY`, and `O_NOFOLLOW`) so validation cannot be bypassed by
@@ -152,7 +153,7 @@ installable **Python package**, which drives the layout:
 │   ├── evaluation.py           # Pure scoring engine + SM-2 review scheduling
 │   ├── service.py              # Reads, writes, ownership, consent gates,
 │   │                           # durable attempts, mastery, misconceptions
-│   ├── schemas.py              # JSON schemas for the four tools
+│   ├── schemas.py              # JSON schemas for the 12 tools
 │   ├── tools.py                # Tool handlers
 │   ├── telegram_auth.py        # Mini App initData verification (stdlib only)
 │   ├── authorization.py        # Allowlist intersection — narrows, never widens
@@ -220,26 +221,31 @@ needs. Tests assert that every reference is linked by a valid relative path,
 that none is orphaned, and that the registered surface stays at exactly one
 skill.
 
-**References are opened with `read_file`, not `skill_view`.** This is a
-correctness constraint, not a preference. Hermes' `skill_view` accepts a
-`file_path` argument, but qualified `plugin:skill` names are dispatched to
-`_serve_plugin_skill()`, which has no such parameter — the argument is dropped
-and SKILL.md is returned again *with `success: true`*. An agent following that
-idiom would silently re-read the same file instead of the reference it asked
-for. So SKILL.md addresses references as
-`read_file("${HERMES_SKILL_DIR}/references/<file>.md")`, the same token Hermes'
-own bundled skills use for sibling files, and warns explicitly against the
-`skill_view` route. `tests/test_hermes_integration.py` verifies both halves
-against a real Hermes checkout, and fails if Hermes ever fixes the plugin path
-so the workaround can be removed.
+**References are opened by qualified name, with `file_path`.** Hermes'
+`skill_view` dispatches qualified `plugin:skill` names to
+`_serve_plugin_skill()`, which takes a `file_path`, refuses a `..` traversal
+component, resolves the target and confirms it is still inside the skill
+directory, requires it to be an existing file, and returns that file's content.
+So SKILL.md addresses references as
+`skill_view(name="learning-studio:adaptive-learning", file_path="references/<file>.md")`,
+which is the supported route and needs no template substitution.
+
+An older Hermes whose `_serve_plugin_skill()` predated that parameter dropped
+the argument and returned SKILL.md again *with `success: true`* — a silent
+re-read rather than an error. SKILL.md therefore keeps
+`read_file("${HERMES_SKILL_DIR}/references/<file>.md")` as a documented
+fallback, which is also the idiom Hermes' own bundled skills use for sibling
+files. `tests/test_hermes_integration.py` verifies the current contract —
+including the traversal and containment checks — against a real Hermes
+checkout.
 
 **The skill tells the truth about its own scope.** A skill that overstates what
 exists sends the agent after tools that are not there; one that understates it
 sends the agent to chat when a better route is available. `SKILL.md` therefore
-names the four tools it has, says that a trusted renderer for all thirty-one
-component types exists, and says just as plainly that **nothing launches it yet**
-— so an exercise is prepared for that renderer and delivered in conversation until
-the launch tooling lands. Textual contract tests pin the load-bearing rules: what
+names all 12 tools, says that a trusted renderer for all thirty-one component
+types exists, and explains both the Mini App launch path and its honest
+conversation fallback when the runtime is unavailable. Textual contract tests
+pin the load-bearing rules: what
 may launch without asking, that a missing tool falls back to chat, that the agent
 writes validated manifests and never frontend code, that a learner never has to
 name an internal skill for the workflow to start, that image assets come from real
@@ -284,7 +290,7 @@ database written by a newer version of the plugin is refused with an
 explanation and left byte-for-byte untouched — deleting or "resetting" an
 unfamiliar database would destroy a learner's record to make the code happy.
 
-**`register()` opens no database.** It registers a skill and four tools and
+**`register()` opens no database.** It registers a skill and 12 tools and
 returns. Initialising storage at startup would let a corrupt or
 newer-versioned database take the whole plugin down, instead of failing one
 tool call with a message the agent can act on.
@@ -292,8 +298,8 @@ tool call with a message the agent can act on.
 **No mandatory runtime dependencies.** `dependencies` is empty, persistence
 uses the standard library's `sqlite3`, and Pillow is isolated in the optional
 `media` extra. Tests block FastAPI, Pillow, Telegram, HTTP clients, and PyYAML
-at import time and still require the plugin and all four tool schemas to
-register; only a real image import needs Pillow.
+at import time and still require the plugin and every tool schema to register;
+only a real image import needs Pillow.
 
 ## Configuration
 
@@ -1674,9 +1680,11 @@ generic card icon and no label rather than a dotted key printed at a learner.
 
 The icons live in `icons.js`, are built with `createElementNS` and presentation
 attributes only, are stroked in `currentColor`, and carry `aria-hidden="true"` —
-they are a second way of saying what the label beside them already says. No file
-in the frontend contains a colour: `app.css` owns the palette, so the Telegram
-theme and the contrast-tested fallbacks both reach the drawings.
+they are a second way of saying what the label beside them already says. No
+frontend script and no SVG presentation attribute hard-codes a palette colour —
+shapes are stroked in `currentColor` and the ring's arc is coloured by a class —
+so `app.css` is the one file that declares the palette, and the Telegram theme
+and the contrast-tested fallbacks both reach the drawings.
 
 Around them: one surface per screen, capped at a readable measure and centred,
 with the panels inside it — a statement to judge, an option, a pair, the back of
@@ -1687,9 +1695,14 @@ pixels of movement over `--motion`, which is `0ms` for anyone who asked for less
 of it and switched off outright there as well.
 
 The completion screen draws the mark as a **ring**: the same fraction the
-sentence under it states, coloured by the same tier, labelled with that same
-sentence so a screen reader hears prose rather than "chart", and not animated at
-all. It is a picture of what is already written, never a second source of truth.
+sentence under it states — correct marked answers out of marked answers, which
+per-component weighting and partial credit can pull well away from the
+points-based `overall_score` / `overall_max_score` — coloured by the same tier,
+and not animated at all. It is a picture of what is already written, never a
+second source of truth, so it is `aria-hidden` decoration carrying no role and
+no name of its own. The localized score paragraph beside it is the single
+accessible text equivalent; naming the ring as well made linear screen-reader
+navigation announce the same score twice, once as an image and once as prose.
 
 ### Localization
 
@@ -1724,9 +1737,13 @@ that do not steal focus, a labelled progress bar, an accessible name on every
 field, mandatory `alt` text on every image with a legible fallback when the bytes
 do not arrive, 44px touch targets, decorative drawings marked `aria-hidden` so
 nothing is read out twice, `prefers-reduced-motion` honoured in CSS so it holds
-even if the script never runs, a `data-reduced-motion` hook for the
-component-level flag, safe-area insets, Telegram's stable viewport height, and
-wide tables that scroll inside themselves rather than scrolling the page.
+even if the script never runs, and a `data-reduced-motion` hook written onto the
+card element — the one node every screen is painted into — so an experience-level
+`reduced_motion` accommodation or a component's own flag suppresses the entrance
+on the question, the confirmation, the completion screen and every error state
+alike, rather than only on the card that declared it. Plus safe-area insets,
+Telegram's stable viewport height, and wide tables that scroll inside themselves
+rather than scrolling the page.
 
 Component accessibility metadata is shown rather than stored and forgotten:
 `caption`, `transcript`, `long_description`, and `keyboard_alternative` are all
@@ -1872,10 +1889,11 @@ reveal must be explicit and keyboard-operable" — and what the first version of
 this Mini App did not have.
 
 **The completion screen.** The mark is drawn as a ring around the fraction it
-counts — correct marked answers out of marked answers — coloured by the tier of
-the sentence beneath it and named, for a screen reader, with that sentence
-verbatim. Under the score line (*"You got 3 of 4 marked answers right"*) sits
-one short sentence: an encouraging or constructive
+counts — correct marked answers out of marked answers — and coloured by the
+feedback tier. The ring is `aria-hidden` decoration; the localized score line
+immediately after it (*"You got 3 of 4 marked answers right"*) is its single
+accessible text equivalent. Under that score line sits one short sentence: an
+encouraging or constructive
 reading of that same fraction — correct marked answers out of marked answers,
 not the points-weighted total, so the sentence cannot contradict the count
 printed above it — followed, only when something was missed, by how many

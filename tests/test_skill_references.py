@@ -1,11 +1,13 @@
 """The skill must be one skill with a discoverable, well-formed reference set.
 
-The agent reaches a reference by joining the substituted ``${HERMES_SKILL_DIR}``
-to a path written in SKILL.md and calling ``read_file`` — *not* through
-``skill_view``, whose ``file_path`` is silently ignored for plugin-namespaced
-skills (see ``tests/test_hermes_integration.py``). Every advertised path
-therefore has to resolve relative to the skill directory, so the tests here
-treat the links as an API surface rather than as prose.
+The agent reaches a reference by naming this skill and the file:
+``skill_view(name="learning-studio:adaptive-learning", file_path="references/…")``.
+Hermes resolves that inside the skill's own directory and refuses anything that
+leaves it (see ``tests/test_hermes_integration.py``). A ``read_file`` on the
+substituted ``${HERMES_SKILL_DIR}`` is kept as the fallback for an older host
+that ignored ``file_path`` for plugin-namespaced skills. Either way every
+advertised path has to resolve relative to the skill directory, so the tests
+here treat the links as an API surface rather than as prose.
 """
 
 from __future__ import annotations
@@ -126,11 +128,14 @@ def test_skill_tells_the_agent_to_load_references_selectively(skill_md: str):
 
 
 def test_references_are_opened_with_read_file_and_the_skill_dir_token(skill_md: str):
-    """The only mechanism that actually works for a plugin-namespaced skill.
+    """The compatibility route still has to be spelled out concretely.
 
     Hermes substitutes ``${HERMES_SKILL_DIR}`` for the skill's real directory
     before serving SKILL.md, so a ``read_file`` on that path resolves. This is
-    the same idiom Hermes' own bundled skills use for sibling files.
+    the same idiom Hermes' own bundled skills use for sibling files, and it is
+    what an older host without ``file_path`` support needs — see
+    ``test_skill_frames_the_read_file_route_as_an_older_host_fallback`` for the
+    framing that keeps it secondary.
     """
     assert "${HERMES_SKILL_DIR}/references/" in skill_md, (
         "SKILL.md must address references through ${HERMES_SKILL_DIR}"
@@ -140,20 +145,46 @@ def test_references_are_opened_with_read_file_and_the_skill_dir_token(skill_md: 
     )
 
 
-def test_skill_warns_that_skill_view_cannot_open_a_reference(skill_md: str):
-    """``skill_view``'s file_path is silently ignored for plugin skills.
+def test_skill_prefers_the_qualified_skill_view_file_path_form(skill_md: str):
+    """The supported route, offered first.
 
-    Hermes' ``skill_view`` dispatches qualified ``plugin:skill`` names to
-    ``_serve_plugin_skill()``, which takes no ``file_path`` argument — the call
-    returns SKILL.md again and *reports success*. An agent that follows the
-    wrong idiom would silently re-read this file instead of the reference, so
-    the warning has to be in the text.
+    Hermes' ``skill_view`` dispatches a qualified ``plugin:skill`` name to
+    ``_serve_plugin_skill()``, which takes ``file_path``, refuses a ``..``
+    component, confirms the resolved target is still inside the skill
+    directory, and returns that file. So SKILL.md must name the skill and the
+    file rather than sending the agent somewhere else first —
+    ``tests/test_hermes_integration.py`` pins that host contract.
+    """
+    assert (
+        'skill_view(name="learning-studio:adaptive-learning", file_path="references/' in skill_md
+    ), "SKILL.md must show the qualified skill_view call for opening a reference"
+
+    normalized = " ".join(skill_md.lower().split())
+    # The old text said current Hermes ignores file_path. It does not, and an
+    # agent told otherwise would skip the route that actually works.
+    assert "do not try to load a reference with `skill_view`" not in normalized, (
+        "SKILL.md still warns against skill_view, which current Hermes supports"
+    )
+
+
+def test_skill_frames_the_read_file_route_as_an_older_host_fallback(skill_md: str):
+    """``read_file`` stays documented, but only as compatibility.
+
+    A host predating the ``file_path`` parameter returned SKILL.md again
+    reporting success, so the token route is still worth having. What it must
+    not be is the headline instruction: that would send every agent down the
+    substitution-dependent path on a host that does not need it.
     """
     normalized = " ".join(skill_md.lower().split())
-    assert "do not try to load a reference with `skill_view`" in normalized, (
-        "SKILL.md must warn against the skill_view idiom"
+
+    assert "fallback" in normalized, "the read_file route must be marked as a fallback"
+    assert "older hermes" in normalized, (
+        "the fallback must say which hosts need it, rather than describing current Hermes"
     )
-    assert "ignored for plugin" in normalized and "returns this same skill.md" in normalized
+    # Offered in that order, so the agent reads the supported route first.
+    assert skill_md.index("skill_view(name=") < skill_md.index(
+        'read_file("${HERMES_SKILL_DIR}/references/'
+    ), "SKILL.md offers the read_file fallback before the supported skill_view route"
 
 
 def test_skill_gives_a_fallback_when_substitution_is_disabled(skill_md: str):

@@ -47,8 +47,10 @@ three interface languages. Each card opens with a small icon and the name of the
 kind of card it is, in the learner's own interface language, and every answer is
 confirmed as recorded and **not** marked, because nothing is marked until the
 end. When they finish, the Mini App scores the attempt and shows them a
-completion screen: the overall score, drawn as a ring around the fraction of
-marked answers they got right, a short feedback sentence under it (encouraging
+completion screen: how many marked answers they got right, drawn as a ring
+around that same count — the fraction of marked answers, which is not the
+points-weighted `overall_score` and can differ from it when components carry
+different weights — a short feedback sentence under it (encouraging
 or constructive, in the learner's interface language, and naming how many marked
 answers are worth another look when any were missed), a per-component
 correct/incorrect breakdown with feedback, and a review-plan preview.
@@ -284,24 +286,30 @@ The UI catalogue is large on purpose and expensive to carry. It lives in
 separate files, and **you should open only the references the current decision
 needs** — typically one or two per exercise. Do not preload the catalogue.
 
-Open one with `read_file`, using the skill directory token:
+Open one with `skill_view`, naming this skill and the file:
+
+```
+skill_view(name="learning-studio:adaptive-learning", file_path="references/selection-cards.md")
+```
+
+That is the supported route: the path is resolved inside this skill's own
+directory, and anything that tries to leave it is refused.
+
+**Fallback, if `file_path` comes back with this SKILL.md instead of the
+reference.** An older Hermes ignored that argument for plugin-namespaced skills
+and returned this same file reporting success. If that is what you get, use
+`read_file` with the skill directory token instead:
 
 ```
 read_file("${HERMES_SKILL_DIR}/references/selection-cards.md")
 ```
 
 `${HERMES_SKILL_DIR}` is replaced with this skill's real absolute directory
-before you ever see this text, so the path above is already concrete.
-
-**Do not try to load a reference with `skill_view`.** Its `file_path` argument
-is ignored for plugin-namespaced skills like this one — the call silently
-returns this same SKILL.md instead of the reference you asked for, which looks
-like success and is not. Use `read_file`.
-
-If the token above still reads literally as `${HERMES_SKILL_DIR}`, template
-substitution is switched off in this profile. Locate the file yourself with
-`search_files` for `references/selection-cards.md`, or continue without the
-catalogue — the workflow below stands on its own.
+before you ever see this text, so the path above is already concrete. If it
+still reads literally as `${HERMES_SKILL_DIR}`, template substitution is
+switched off in this profile. Locate the file yourself with `search_files` for
+`references/selection-cards.md`, or continue without the catalogue — the
+workflow below stands on its own.
 
 | Reference | Open it when |
 | --- | --- |

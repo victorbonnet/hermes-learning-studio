@@ -81,9 +81,10 @@ Constraints this project holds itself to:
 Stated plainly, because a security policy that understates the surface is worse
 than none:
 
-- **Eight tools**, which read and write learner context, validate and store
-  exercises, import managed images, and open, inspect, report on and close an
-  exercise on the learner's screen.
+- **12 tools**, which read and write learner context, validate and store
+  exercises, import managed images, open, inspect, report on and close an
+  exercise on the learner's screen, and manage durable attempts, review state,
+  reminder consent and learner erasure.
 - **Profile-scoped SQLite storage** under the Hermes home. Learner identifiers
   are stored as salted HMAC digests rather than in the clear — a lookup key, not
   an authorisation check, and not a claim that identity is unrecoverable by
@@ -102,7 +103,7 @@ than none:
     runtime generation, named by a selector the button carried in its URL
     fragment — so knowing the public address is not enough to open anything, and
     a client cannot name an exercise of its own;
-  - the five static frontend files are public, because a webview cannot attach a
+  - the six static frontend files are public, because a webview cannot attach a
     header to the navigation that loads a page. They are byte-identical for every
     caller and contain no learner data;
   - one route, `POST /api/session/reveal`, discloses one field of one component
@@ -119,7 +120,7 @@ than none:
   It is assigned by Cloudflare, needs no account, and is withdrawn when the
   runtime stops — which it does after an idle period and again at an absolute
   maximum lifetime, both enforced inside the runtime itself. What an anonymous
-  visitor to that address can reach is the five public frontend files; every
+  visitor to that address can reach is the six public frontend files; every
   route that returns learner data still requires all four gates above.
 - **One outbound request, to one host.** A launch sends one Telegram Bot API
   `sendMessage` carrying a Web App button. It is the only remote host the plugin

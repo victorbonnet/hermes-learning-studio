@@ -305,8 +305,12 @@
    *
    * It shows the *same* fraction the sentence underneath it states -- correct
    * marked answers out of marked answers -- and it is a picture of that
-   * sentence rather than a second source of truth: `label` is the localized
-   * sentence itself, so a screen reader gets prose and not "chart".
+   * sentence rather than a second source of truth. So it is decoration:
+   * `aria-hidden`, with no role and no name. `app.js` pushes the localized
+   * score paragraph immediately after it, and that paragraph is the single
+   * accessible text equivalent for the mark. Naming the ring as well made a
+   * screen reader read the same score twice in linear navigation, once as an
+   * image and once as the prose beneath it.
    *
    * There is no animation. A ring that swept round would be a moving thing on
    * the one screen a learner reads carefully, and honouring reduced motion for
@@ -324,10 +328,9 @@
       {
         class: "score-ring",
         "data-tone": settings.tone || "accent",
-        // A picture with a name: the visible sentence below is the same claim
-        // in words, which is what makes this safe to label rather than hide.
-        role: "img",
-        "aria-label": String(settings.label || ""),
+        // Decoration. The visible sentence below is the same claim in words,
+        // and it is the one an assistive technology should read.
+        "aria-hidden": "true",
       }
     );
 
@@ -364,8 +367,9 @@
       y: RING_CENTRE,
       "text-anchor": "middle",
       "dominant-baseline": "central",
-      // Digits and a solidus: the words are in the sentence below and in the
-      // label above, both of which are translated.
+      // Digits and a solidus: the words are in the translated sentence below.
+      // Redundant under a decorative root, and kept anyway so the digits stay
+      // hidden in their own right rather than only by inheritance.
       "aria-hidden": "true",
     });
     value.textContent = String(correct) + "/" + String(graded);

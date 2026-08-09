@@ -111,6 +111,15 @@ def test_the_icons_are_drawings_rather_than_markup():
     assert "<path" not in icons
 
 
+def test_readme_describes_the_score_ring_as_decoration_not_a_second_announcement():
+    readme = (STATIC_DIR.parents[2] / "README.md").read_text(encoding="utf-8")
+    normalized = " ".join(readme.lower().split())
+
+    assert "named, for a screen reader" not in normalized
+    assert "the ring is `aria-hidden` decoration" in normalized
+    assert "single accessible text equivalent" in normalized
+
+
 @pytest.mark.parametrize("name", SCRIPTS)
 def test_no_script_persists_anything_between_launches(name: str):
     """A stored token is a token that can be stolen later.

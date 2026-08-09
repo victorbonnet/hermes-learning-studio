@@ -95,6 +95,7 @@ function fakeApi({
   contentLocale = "en",
   failWith = {},
   summaryOverrides = {},
+  accommodations = null,
 } = {}) {
   const components = types.map((componentType, index) =>
     Object.assign({}, FIXTURES[componentType], {
@@ -110,7 +111,13 @@ function fakeApi({
     content_locale: contentLocale,
     expected_duration_minutes: 12,
     difficulty: "intermediate",
-    accessibility: {},
+    // The experience-level envelope, exactly as `learning_studio/manifest.py`
+    // declares it: one approved source, and a closed vocabulary of tokens. An
+    // exercise with no declared needs sends the empty object, which is what the
+    // server stores when the manifest omits the block entirely.
+    accessibility: accommodations
+      ? { source: "profile_config", accommodations: accommodations }
+      : {},
     component_count: components.length,
   };
 
@@ -479,6 +486,8 @@ function ringOf(win) {
   return {
     node: ring,
     tone: ring.getAttribute("data-tone"),
+    hidden: ring.getAttribute("aria-hidden"),
+    role: ring.getAttribute("role"),
     label: ring.getAttribute("aria-label"),
     offset: Number(arc.getAttribute("stroke-dashoffset")),
     length: Number(arc.getAttribute("stroke-dasharray")),
@@ -521,11 +530,18 @@ test("the ring is coloured by the same tier as the sentence under it", async () 
     const ring = ringOf(context.win);
 
     assert.equal(ring.tone, item.tone, `${item.correct} of ${item.graded}`);
-    // The ring is a picture of the sentence, so it is named with it rather than
-    // with a description of a doughnut.
-    assert.equal(ring.label, `You got ${item.correct} of ${item.graded} marked answers right.`);
-    assert.equal(ring.node.getAttribute("role"), "img");
-    assert.match(cardOf(context.win).textContent, new RegExp(`${item.correct} of ${item.graded}`));
+    // The ring is a picture of the sentence, not a second telling of it: the
+    // paragraph pushed immediately after it is the one accessible text
+    // equivalent, so the drawing itself is decoration.
+    assert.equal(ring.hidden, "true", `${item.correct} of ${item.graded}: the ring is announced`);
+    assert.equal(ring.role, null, "the ring still claims to be an image");
+    assert.equal(ring.label, null, "the ring still names itself over the sentence");
+    // And that sentence is still on the screen, in the reader's own language.
+    assert.match(
+      cardOf(context.win).textContent,
+      new RegExp(`You got ${item.correct} of ${item.graded} marked answers right`),
+      `${item.correct} of ${item.graded}: the visible score paragraph went missing`
+    );
   }
 });
 
@@ -620,6 +636,140 @@ test("the confirmation is a tick and a reassurance, never a verdict", async () =
   for (const verdict of ["Correct", "Incorrect", "correct", "wrong"]) {
     assert.ok(!shown.includes(verdict), `the confirmation says "${verdict}"`);
   }
+});
+
+// ── Reduced motion outlives the card it was declared on ───────────────────
+
+/*
+ * The preference is declared in two places and has to survive in one.
+ *
+ * A component declares it in its own payload, and an experience declares it
+ * once for the whole session. Either way the *question* is not the only thing
+ * that animates: the confirmation and the completion screen are separate
+ * elements that replace it wholesale, so a marker written onto the question can
+ * only ever describe the question. What these tests pin is the boundary --
+ * `#card`, the one node every state is painted into and which no replacement
+ * touches -- and the consequence: the state that arrives under a reduced-motion
+ * boundary does not carry the entrance class at all.
+ */
+
+/** The preference, read from the boundary that outlives every repaint. */
+function motionMarkerOf(win) {
+  return cardOf(win).getAttribute("data-reduced-motion");
+}
+
+/** Whether the state currently painted into the card animated its way in. */
+function entersWithAnimation(win) {
+  return cardOf(win).children[0].classList.contains("card-enter");
+}
+
+/**
+ * An API whose every component asks for reduced motion in its own payload.
+ *
+ * The payload is replaced rather than mutated: `fakeApi` spreads the shared
+ * fixture, so writing into it would set the flag for every later test in the
+ * file.
+ */
+function componentReducedMotionApi(types) {
+  const api = fakeApi({ types });
+  api.components.forEach((component) => {
+    component.payload = Object.assign({}, component.payload, {
+      accessibility: Object.assign({}, component.payload.accessibility, {
+        reduced_motion: true,
+      }),
+    });
+  });
+  return api;
+}
+
+test("a reduced-motion component keeps the preference through recorded and completion", async () => {
+  const context = await bootWith(componentReducedMotionApi(["short_answer"]));
+
+  // The question still declares it itself, exactly as the renderer always did.
+  assert.equal(cardOf(context.win).children[0].getAttribute("data-reduced-motion"), "true");
+  // And the boundary carries it, which is the part that has to survive.
+  assert.equal(motionMarkerOf(context.win), "true", "the card boundary never got the preference");
+  assert.equal(entersWithAnimation(context.win), false, "the question animated in anyway");
+
+  completeCard(cardOf(context.win), FIXTURES.short_answer.payload);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(stateOf(context.win), "recorded");
+  assert.equal(motionMarkerOf(context.win), "true", "the confirmation lost the preference");
+  assert.equal(entersWithAnimation(context.win), false, "the confirmation animated in");
+
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(stateOf(context.win), "complete");
+  assert.equal(motionMarkerOf(context.win), "true", "the completion screen lost the preference");
+  assert.equal(entersWithAnimation(context.win), false, "the completion screen animated in");
+});
+
+test("an experience that declares reduced motion suppresses it for every card", async () => {
+  const context = await boot({
+    types: ["short_answer", "true_false"],
+    accommodations: ["reduced_motion"],
+  });
+
+  // No component asked for anything; the experience did, once, for all of them.
+  assert.equal(cardOf(context.win).children[0].getAttribute("data-reduced-motion"), null);
+  assert.equal(motionMarkerOf(context.win), "true", "the experience's own preference was dropped");
+  assert.equal(entersWithAnimation(context.win), false);
+
+  await answerCurrent(context);
+
+  assert.equal(motionMarkerOf(context.win), "true");
+  assert.equal(entersWithAnimation(context.win), false, "the second card animated in");
+});
+
+test("an experience-level preference is still there when a state replaces the card", async () => {
+  // The bootstrap succeeds, so the preference is known; the card request then
+  // fails, which paints a state that has nothing to do with any component.
+  const context = await boot({
+    types: ["short_answer"],
+    accommodations: ["reduced_motion"],
+    failWith: { "/api/session/component": 401 },
+  });
+
+  assert.equal(stateOf(context.win), "expired");
+  assert.equal(motionMarkerOf(context.win), "true", "an error state lost the preference");
+  assert.equal(entersWithAnimation(context.win), false);
+});
+
+test("an accommodation that is not reduced motion leaves the animation alone", async () => {
+  // The vocabulary in `learning_studio/manifest.py` has nine tokens in it, and
+  // eight of them say nothing about movement.
+  const context = await boot({
+    types: ["short_answer"],
+    accommodations: ["captions", "keyboard_only", "plain_language"],
+  });
+
+  assert.equal(motionMarkerOf(context.win), null, "an unrelated accommodation stopped the motion");
+  assert.equal(entersWithAnimation(context.win), true);
+});
+
+test("an ordinary exercise sets no marker and keeps its entrance throughout", async () => {
+  const context = await boot({ types: ["short_answer"] });
+
+  assert.equal(motionMarkerOf(context.win), null);
+  assert.equal(entersWithAnimation(context.win), true, "the question lost its entrance");
+
+  completeCard(cardOf(context.win), FIXTURES.short_answer.payload);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(stateOf(context.win), "recorded");
+  assert.equal(motionMarkerOf(context.win), null, "a marker appeared for nobody who asked");
+  assert.equal(entersWithAnimation(context.win), true, "the confirmation lost its entrance");
+
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(stateOf(context.win), "complete");
+  assert.equal(motionMarkerOf(context.win), null);
+  assert.equal(entersWithAnimation(context.win), true, "the completion screen lost its entrance");
 });
 
 test("no state leaves an uninterpolated placeholder on screen", async () => {
