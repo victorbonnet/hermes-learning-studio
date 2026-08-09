@@ -124,7 +124,7 @@ def test_the_shell_carries_no_learner_data(client):
 
 
 def test_the_frontend_ships_inside_the_package():
-    """A wheel without these files serves five 500s and no interface.
+    """A wheel without these files serves a 500 per asset and no interface.
 
     They are data files rather than modules, so nothing imports them and no test
     would otherwise notice their absence from a build. What makes them ship is
@@ -241,7 +241,8 @@ def test_the_document_loads_no_third_party_stylesheet_or_font():
 
 
 def test_the_scripts_load_in_dependency_order():
-    """`app.js` uses both of the others at load time, so it must be last."""
+    """`renderers.js` draws with the icon set and `app.js` uses all three at
+    load time, so the order is the dependency order."""
     import re
 
     sources = [
@@ -250,4 +251,9 @@ def test_the_scripts_load_in_dependency_order():
         if source.startswith("/static/")
     ]
 
-    assert sources == ["/static/i18n.js", "/static/renderers.js", "/static/app.js"]
+    assert sources == [
+        "/static/i18n.js",
+        "/static/icons.js",
+        "/static/renderers.js",
+        "/static/app.js",
+    ]

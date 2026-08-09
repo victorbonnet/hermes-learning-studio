@@ -4,8 +4,9 @@ A development tool. It is not part of the plugin, it is not packaged, and nothin
 at runtime imports it.
 
 What it produces is a self-contained directory holding one card for every
-component type in the registry, rendered by the *shipped* ``renderers.js`` and
-``i18n.js`` against payloads built by the *shipped* ``build_component`` — so it
+component type in the registry, rendered by the *shipped* ``renderers.js``,
+``icons.js``, and ``i18n.js`` against payloads built by the *shipped*
+``build_component`` — so it
 shows what a learner would actually see rather than a hand-written mock-up of it.
 There is no server, no session, and no network: the page loads no application
 code, makes no request, and gets its images from a generated placeholder.
@@ -45,7 +46,7 @@ from tests.component_examples import example  # noqa: E402
 #: Copied beside the generated page. Note the absence of ``app.js``: the gallery
 #: exercises the renderers, and the application is the part that needs a server,
 #: a session, and Telegram.
-COPIED = ("app.css", "i18n.js", "renderers.js")
+COPIED = ("app.css", "i18n.js", "icons.js", "renderers.js")
 
 #: A placeholder for every managed asset, so a visual card has something to show.
 #: An SVG data URL rather than a file: it needs no image library, it is the same
@@ -70,6 +71,7 @@ PAGE = """<!doctype html>
     <link rel="stylesheet" href="app.css" />
     <link rel="stylesheet" href="gallery.css" />
     <script src="i18n.js" defer></script>
+    <script src="icons.js" defer></script>
     <script src="renderers.js" defer></script>
     <script src="fixtures.js" defer></script>
     <script src="gallery.js" defer></script>

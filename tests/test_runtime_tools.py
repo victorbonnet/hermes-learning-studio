@@ -1,4 +1,4 @@
-"""The eight tools, as the model and the host actually see them.
+"""The registered tools, as the model and the host actually see them.
 
 The question throughout is not "does this work" — that is tested where the
 behaviour lives — but "what can a caller reach from here". A tool schema is the

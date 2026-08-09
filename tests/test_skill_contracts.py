@@ -593,3 +593,33 @@ def test_the_repository_states_the_renderer_consistently():
         body = normalize((root / document).read_text(encoding="utf-8"))
         assert "no mini app" not in body, f"{document} still says there is no Mini App"
         assert "no card renderer" not in body, f"{document} still says there is no renderer"
+
+
+def test_operator_docs_state_the_live_tool_count():
+    """Public surface counts must move with the registry rather than a past phase."""
+    from pathlib import Path
+
+    from learning_studio.schemas import TOOL_SCHEMAS
+
+    root = Path(__file__).resolve().parent.parent
+    count = len(TOOL_SCHEMAS)
+    readme = normalize((root / "README.md").read_text(encoding="utf-8"))
+    security = normalize((root / "SECURITY.md").read_text(encoding="utf-8"))
+
+    assert f"names all {count} tools" in readme
+    assert f"registers a skill and {count} tools" in readme
+    assert f"**{count} tools**" in security
+
+    operator_docs = {"README.md": readme, "SECURITY.md": security}
+    obsolete_claims = (
+        r"\bits other three tools\b",
+        r"\ball four tool schemas\b",
+        r"\bnames (?:the|all) four tools\b",
+        r"\bregisters a skill and (?:four|eight) tools\b",
+        r"\*\*(?:four|eight) tools\*\*",
+    )
+    for document, body in operator_docs.items():
+        for claim in obsolete_claims:
+            assert re.search(claim, body) is None, (
+                f"{document} still contains an obsolete tool-count claim: {claim}"
+            )

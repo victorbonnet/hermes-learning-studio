@@ -35,6 +35,7 @@
   "use strict";
 
   var I18n = global.LearningStudioI18n;
+  var Icons = global.LearningStudioIcons;
   var Renderers = global.LearningStudioRenderers;
 
   var INIT_DATA_HEADER = "X-Telegram-Init-Data";
@@ -85,6 +86,11 @@
     "secondary_bg_color",
   ];
 
+  //: The one accommodation token this file acts on, spelled as
+  //: `learning_studio/manifest.py` declares it. The other eight describe what an
+  //: exercise must *provide*, and are honoured by the renderers or by the server.
+  var REDUCED_MOTION = "reduced_motion";
+
   function createApp(settings) {
     var options = settings || {};
     var doc = options.document;
@@ -103,6 +109,12 @@
     var currentCard = null;
     var currentComponent = null;
     var objectUrls = [];
+    //: Reduced motion, kept as the two claims that produce it rather than as one
+    //: resolved boolean, because they have different lifetimes: the experience's
+    //: lasts the whole session, the component's lasts until another card becomes
+    //: current. Combined at the point of use by `reducedMotion()`.
+    var experienceReducedMotion = false;
+    var componentReducedMotion = false;
     //: Told to us by the bootstrap response. Defaults are the shipped
     //: configuration's, so a request made before the session opens is still
     //: bounded, but the server's answer is what governs.
@@ -262,11 +274,65 @@
       objectUrls = [];
     }
 
+    /**
+     * Whether an experience declares reduced motion for the whole session.
+     *
+     * The accommodation vocabulary is a closed list on the manifest, so this is
+     * an exact membership test rather than a search for a substring.
+     */
+    function experienceDeclaresReducedMotion(source) {
+      var access = (source && source.accessibility) || {};
+      var declared = access.accommodations;
+      return Boolean(declared && declared.indexOf && declared.indexOf(REDUCED_MOTION) !== -1);
+    }
+
+    /** Whether one component asks for reduced motion in its own payload. */
+    function componentDeclaresReducedMotion(component) {
+      var payload = (component && component.payload) || {};
+      return (payload.accessibility || {}).reduced_motion === true;
+    }
+
+    /** The preference actually in force: either source is enough. */
+    function reducedMotion() {
+      return experienceReducedMotion || componentReducedMotion;
+    }
+
+    /**
+     * Write the effective preference onto the card, which is the boundary.
+     *
+     * It goes here rather than on the question because the question is not the
+     * only thing that animates: the confirmation, the completion screen and
+     * every error state replace it wholesale, and a marker on a replaced element
+     * describes only the element that carried it. `#card` is the one node every
+     * state is painted into and that no replacement touches, so `app.css`'s
+     * `[data-reduced-motion="true"] .card-enter` hook reaches all of them from
+     * one place. The attribute is removed rather than set to "false": the
+     * stylesheet selects on the value, and a stale marker would silence the
+     * animation for an exercise that never asked.
+     */
+    function applyReducedMotion() {
+      if (reducedMotion()) {
+        nodes.card.setAttribute("data-reduced-motion", "true");
+      } else {
+        nodes.card.removeAttribute("data-reduced-motion");
+      }
+    }
+
     /** Replace the card, move focus to it, and clear anything stale. */
     function paint(element, options) {
       var config = options || {};
       releaseImages();
       showFieldError("");
+      if (element.classList && !reducedMotion()) {
+        // The entrance: a few pixels and a fade, over `--motion`, so a new card
+        // reads as having arrived rather than as the old one having changed
+        // words. Withheld entirely when reduced motion is in force, so the
+        // stylesheet's `animation: none` is a second line of defence rather than
+        // the only one — a transform that completes instantly is still a
+        // transform. `prefers-reduced-motion` remains the device's own say, and
+        // is handled in `app.css` so it holds even if this script never runs.
+        element.classList.add("card-enter");
+      }
       nodes.card.replaceChildren(element);
       if (config.focus) {
         config.focus();
@@ -553,6 +619,13 @@
           }
           sessionToken = result.data.session_token || "";
           experience = result.data.experience || null;
+          // Applied the moment the session is known, before the first card is
+          // asked for: a component request that fails paints a state of its own,
+          // and it must inherit the preference the exercise already declared.
+          // A reopen starts a fresh session, so the previous card's claim goes.
+          experienceReducedMotion = experienceDeclaresReducedMotion(experience);
+          componentReducedMotion = false;
+          applyReducedMotion();
           if (result.data.limits) {
             limits = result.data.limits;
           }
@@ -578,9 +651,15 @@
     function showComponent(component) {
       showProgress();
       if (!component) {
+        // Deliberately before the per-component preference is recomputed: the
+        // completion screen belongs to the exercise that just ended, so the last
+        // card's claim is still the one in force. Same reasoning as the
+        // confirmation screen, which `acknowledge` paints without touching it.
         return showResult();
       }
       currentComponent = component;
+      componentReducedMotion = componentDeclaresReducedMotion(component);
+      applyReducedMotion();
       currentCard = Renderers.render(component, renderContext());
       paint(currentCard.element, { focus: currentCard.focus });
       if (currentCard.unsupported) {
@@ -650,13 +729,25 @@
      * not here, per answer -- so a tick or a cross on this card would be
      * guessing ahead of the mark that ``GET /api/session/summary`` is what
      * actually produces. The next card is one deliberate tap away.
+     *
+     * The tick beside "Answer recorded" says *written down*, not *right*: it is
+     * the same confirmation this screen has always carried, drawn rather than
+     * only written. What keeps that from reading as a verdict is the sentence
+     * under it, which stays exactly as it was -- not marked yet -- and the fact
+     * that a wrong answer gets this identical screen.
      */
     function acknowledge(nextComponent) {
       var message = el("section", {
         className: "state",
         attrs: { "data-state": "recorded" },
         children: [
-          el("p", { className: "feedback", text: t("feedback.recorded") }),
+          el("p", {
+            className: "recorded-pill",
+            children: [
+              Icons ? Icons.icon("check") : null,
+              el("span", { text: t("feedback.recorded") }),
+            ],
+          }),
           el("p", { className: "hint", text: t("feedback.pending") }),
         ],
       });
@@ -701,6 +792,24 @@
       });
     }
 
+    //: Which of the palette's three states a tier is drawn in. Only tokens the
+    //: contrast tests already cover: there is no fourth colour for "nearly".
+    var RING_TONES = {
+      "complete.feedback.excellent": "ok",
+      "complete.feedback.good": "ok",
+      "complete.feedback.mixed": "accent",
+      "complete.feedback.rough": "danger",
+    };
+
+    /** The mark as a ring, in the tier's own colour. */
+    function ring(correct, graded, tier) {
+      return Icons.ring({
+        correct: correct,
+        graded: graded,
+        tone: RING_TONES[tier] || "accent",
+      });
+    }
+
     /** The completion screen: what was scored, what was not, what is next. */
     function renderCompletion(data) {
       var total = data.component_count || 0;
@@ -711,12 +820,6 @@
       var sentence = "";
       if (graded > 0) {
         var correct = data.correct_component_count || 0;
-        body.push(
-          el("p", {
-            className: "feedback",
-            text: t("complete.score", { correct: correct, graded: graded }),
-          })
-        );
         // A short, honest sentence under the mark: what the fraction means in
         // plain words, and how many marked answers are worth another look.
         // Composed from the marks the server already returned — never from an
@@ -741,6 +844,17 @@
             tier = "complete.feedback.rough";
           }
         }
+        var score = t("complete.score", { correct: correct, graded: graded });
+        // The same fraction, drawn: a ring, coloured by the same tier as the
+        // sentence under it. It is a picture of what the next paragraph says in
+        // words, so it is decoration and carries no accessible name of its own —
+        // naming it made linear screen-reader navigation announce the score
+        // twice, once as an image and once as the prose immediately after it.
+        // The paragraph below is the single accessible text equivalent.
+        if (Icons) {
+          body.push(ring(correct, graded, tier));
+        }
+        body.push(el("p", { className: "feedback", text: score }));
         var incorrect = Math.max(0, graded - correct);
         if (tier !== null || incorrect > 0) {
           sentence = tier === null ? "" : t(tier);

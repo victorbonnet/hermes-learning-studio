@@ -57,7 +57,7 @@ def relative(path: Path) -> str:
 
 
 def test_no_tool_schema_anywhere_names_a_machine_or_a_person():
-    """Across all eight tools, not just the new ones."""
+    """Across the complete registered tool surface, not just one tool group."""
     forbidden = {
         "host",
         "port",

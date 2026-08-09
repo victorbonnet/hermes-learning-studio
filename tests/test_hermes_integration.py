@@ -14,6 +14,7 @@ thing; these check that what it says is true of Hermes as it actually is.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import inspect
 import os
@@ -293,7 +294,7 @@ def test_every_reference_resolves_after_substitution(
 
 
 def test_template_substitution_is_on_by_default(skill_preprocessing):
-    """If ``template_vars`` defaulted off, the primary idiom would ship broken."""
+    """If ``template_vars`` defaulted off, the older-host fallback would ship broken."""
     source = inspect.getsource(skill_preprocessing.preprocess_skill_content)
 
     assert 'get("template_vars", True)' in source, (
@@ -302,41 +303,136 @@ def test_template_substitution_is_on_by_default(skill_preprocessing):
     )
 
 
-# ── The mechanism SKILL.md warns against is still broken ───────────────────
+# ── The mechanism SKILL.md points the agent at ─────────────────────────────
 
 
-def test_serve_plugin_skill_still_ignores_file_path():
-    """The reason we use read_file rather than skill_view(name, file_path).
+def _top_level_function(source: str, name: str) -> str:
+    """Return one top-level function from source using Python's own parser.
+
+    Whole-file offset comparisons were how this used to be checked, and they
+    broke on any reordering that changed nothing about behaviour. Isolating the
+    function means an assertion says "this happens inside _serve_plugin_skill"
+    rather than "this byte precedes that byte".
+    """
+    tree = ast.parse(source)
+    function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+        ),
+        None,
+    )
+    assert function is not None, f"could not find '{name}' in this Hermes checkout"
+    lines = source.splitlines()
+    return "\n".join(lines[function.lineno - 1 : function.end_lineno])
+
+
+def test_serve_plugin_skill_accepts_and_safely_serves_a_linked_file():
+    """The contract SKILL.md's primary idiom depends on.
 
     ``skill_view`` routes qualified ``plugin:skill`` names to
-    ``_serve_plugin_skill()``, which has no ``file_path`` parameter — so the
-    argument is silently dropped and SKILL.md is returned with
-    ``success: True``. If Hermes ever adds it, this test fails and SKILL.md's
-    warning can be simplified.
+    ``_serve_plugin_skill()``, which now takes ``file_path`` and serves the
+    requested linked file. Serving it is only safe because of the three checks
+    asserted below, so they are pinned individually: a future refactor that
+    kept the parameter and dropped the containment check would still let a
+    plugin skill read outside its own directory.
     """
     src = _hermes_src()
     skills_tool = (src / "tools" / "skills_tool.py").read_text(encoding="utf-8")
+    body = _top_level_function(skills_tool, "_serve_plugin_skill")
 
-    signature = re.search(r"def _serve_plugin_skill\((.*?)\) -> str:", skills_tool, re.S)
-    assert signature, "could not find _serve_plugin_skill in this Hermes checkout"
+    signature = re.search(r"def _serve_plugin_skill\((.*?)\) -> str:", body, re.S)
+    assert signature, "could not read _serve_plugin_skill's signature"
+    assert "file_path" in signature.group(1), (
+        "_serve_plugin_skill no longer accepts file_path — SKILL.md's primary "
+        "reference idiom would silently return SKILL.md instead"
+    )
 
-    assert "file_path" not in signature.group(1), (
-        "_serve_plugin_skill now accepts file_path — Hermes may have fixed "
-        "plugin reference loading; re-evaluate the read_file workaround"
+    assert "if file_path:" in body, "file_path is accepted but never acted on"
+
+    # Refused outright, before the path is built.
+    assert "has_traversal_component(file_path)" in body, (
+        "the '..' check is gone — a reference path could escape the skill directory"
+    )
+    # And again after resolution, which is what catches a symlink out.
+    assert "validate_within_dir(" in body, (
+        "the containment check is gone — a resolved target outside the skill "
+        "directory would be served"
+    )
+    assert "is_file()" in body, "a directory or a missing path is no longer rejected"
+
+    # The point of all of the above: the requested file comes back, not SKILL.md.
+    assert "read_text(" in body and '"file": file_path' in body, (
+        "the requested linked file's own content is no longer what is returned"
     )
 
 
-def test_plugin_dispatch_returns_before_file_path_is_handled():
-    """Confirms the drop is structural, not just a missing parameter name."""
+def test_current_hermes_serves_the_requested_plugin_reference(monkeypatch):
+    """Exercise the host implementation, not only its source shape."""
+    import json
+
+    src = _hermes_src()
+    skills_tool = _load_module("_hermes_skills_tool", src / "tools" / "skills_tool.py", src)
+    plugins = importlib.import_module("hermes_cli.plugins")
+
+    # Keep this a pure serving test: whether an operator disabled a plugin or
+    # skill in this profile is unrelated to the file_path contract under test.
+    monkeypatch.setattr(plugins, "_get_disabled_plugins", lambda: set())
+    monkeypatch.setattr(skills_tool, "_is_skill_disabled", lambda _name: False)
+
+    skill_md = (
+        Path(__file__).resolve().parent.parent
+        / "learning_studio"
+        / "skills"
+        / "adaptive-learning"
+        / "SKILL.md"
+    )
+    reference = "references/selection-cards.md"
+    expected = (skill_md.parent / reference).read_text(encoding="utf-8")
+
+    served = json.loads(
+        skills_tool._serve_plugin_skill(
+            skill_md,
+            "learning-studio",
+            "adaptive-learning",
+            file_path=reference,
+            preprocess=False,
+        )
+    )
+    assert served["success"] is True
+    assert served["file"] == reference
+    assert served["content"] == expected
+
+    refused = json.loads(
+        skills_tool._serve_plugin_skill(
+            skill_md,
+            "learning-studio",
+            "adaptive-learning",
+            file_path="../SKILL.md",
+            preprocess=False,
+        )
+    )
+    assert refused["success"] is False
+    assert "traversal" in refused["error"].lower()
+
+
+def test_qualified_plugin_dispatch_forwards_the_requested_file_path():
+    """The argument has to survive the hop, not merely exist on both sides."""
     src = _hermes_src()
     skills_tool = (src / "tools" / "skills_tool.py").read_text(encoding="utf-8")
+    view = _top_level_function(skills_tool, "skill_view")
 
-    dispatch = skills_tool.index("return _serve_plugin_skill(")
-    handling = skills_tool.index("if file_path and skill_dir:")
+    signature = re.search(r"def skill_view\((.*?)\)", view, re.S)
+    assert signature, "could not read skill_view's signature"
+    assert "file_path" in signature.group(1), "skill_view no longer takes a file_path to forward"
+    assert 'if ":" in name:' in view, "qualified names are no longer dispatched to plugins"
 
-    assert dispatch < handling, (
-        "file_path handling now precedes the plugin dispatch — re-evaluate "
-        "whether skill_view can open plugin references directly"
+    call = re.search(r"return _serve_plugin_skill\(([^)]*)\)", view, re.S)
+    assert call, "skill_view no longer dispatches to _serve_plugin_skill"
+    assert "file_path=file_path" in call.group(1), (
+        "the plugin dispatch drops file_path — a reference request would come "
+        "back as SKILL.md reporting success"
     )
 
 
@@ -443,6 +539,7 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
     ctx = plugins.PluginContext(manifest, manager)
 
     from learning_studio import TOOLSET_NAME, register
+    from learning_studio.schemas import TOOL_SCHEMAS
 
     register(ctx)
 
@@ -450,16 +547,14 @@ def test_the_plugin_registers_and_runs_through_the_real_plugin_context(monkeypat
     registered = {
         name: entry for name, entry in registry._tools.items() if entry.toolset == TOOLSET_NAME
     }
-    assert sorted(registered) == [
-        "learning_studio_get_context",
-        "learning_studio_import_asset",
-        "learning_studio_launch",
-        "learning_studio_prepare",
-        "learning_studio_results",
-        "learning_studio_save_context",
-        "learning_studio_status",
-        "learning_studio_stop",
-    ]
+    # Compared against what the plugin declares rather than against a copy of
+    # it. A hand-written roster goes stale the moment a tool is added, and the
+    # failure it produces then says nothing about the thing under test — which
+    # is whether the *host* registered exactly what it was handed, no more and
+    # no fewer, under this plugin's own toolset.
+    assert set(registered) == set(TOOL_SCHEMAS), (
+        "the real registry does not hold exactly the plugin's declared tools"
+    )
 
     # The real registry stores `check_fn`, and gates the tool on it. Checked
     # here rather than only against the fake context, because "Hermes accepts a

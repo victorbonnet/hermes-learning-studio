@@ -20,7 +20,12 @@ import pytest
 from learning_studio.components import COMPONENT_TYPES
 from learning_studio.web.static_files import STATIC_ASSETS, STATIC_DIR
 
-SCRIPTS = ("i18n.js", "renderers.js", "app.js")
+SCRIPTS = ("i18n.js", "icons.js", "renderers.js", "app.js")
+
+#: The XML namespace an ``<svg>`` has to be created in. It is an identifier
+#: rather than an address — nothing fetches it — and ``icons.js`` is the only
+#: file that names it.
+SVG_NAMESPACE = "http://www.w3.org/2000/svg"
 
 
 def source(name: str) -> str:
@@ -83,6 +88,38 @@ def test_the_only_html_the_frontend_produces_comes_from_createelement():
     assert "function el(tag, options)" in renderers
 
 
+def test_svg_is_built_through_one_call_site_of_its_own():
+    """The icons and the score ring, and nothing else, use the SVG namespace.
+
+    ``createElementNS`` lives in ``icons.js`` alone, which is why the count
+    above still holds: an ``<svg>`` cannot be created with ``createElement``,
+    and mixing the two in one file would have made that check unreadable.
+    """
+    icons = code("icons.js")
+
+    assert icons.count("createElementNS") == 1
+    assert "createElement(" not in icons
+    for name in ("renderers.js", "app.js", "i18n.js"):
+        assert "createElementNS" not in code(name), f"{name} builds SVG of its own"
+
+
+def test_the_icons_are_drawings_rather_than_markup():
+    """A drawing is a list of shapes and numbers here, not a string of tags."""
+    icons = code("icons.js")
+
+    assert "<svg" not in icons
+    assert "<path" not in icons
+
+
+def test_readme_describes_the_score_ring_as_decoration_not_a_second_announcement():
+    readme = (STATIC_DIR.parents[2] / "README.md").read_text(encoding="utf-8")
+    normalized = " ".join(readme.lower().split())
+
+    assert "named, for a screen reader" not in normalized
+    assert "the ring is `aria-hidden` decoration" in normalized
+    assert "single accessible text equivalent" in normalized
+
+
 @pytest.mark.parametrize("name", SCRIPTS)
 def test_no_script_persists_anything_between_launches(name: str):
     """A stored token is a token that can be stolen later.
@@ -96,8 +133,26 @@ def test_no_script_persists_anything_between_launches(name: str):
 
 @pytest.mark.parametrize("name", SCRIPTS)
 def test_no_script_names_an_external_origin(name: str):
-    """The SDK is loaded by the document. The scripts talk to this server only."""
-    assert re.search(r"https?://", code(name)) is None
+    """The SDK is loaded by the document. The scripts talk to this server only.
+
+    The SVG namespace is the single exception, and it is not an exception to the
+    rule the check exists for: it is an XML identifier that a document must name
+    in order to contain SVG at all, and nothing requests it. It is removed here
+    rather than allowed through, so anything *else* in that file that looked
+    like an address would still fail.
+    """
+    body = code(name).replace(f'"{SVG_NAMESPACE}"', '""')
+
+    assert re.search(r"https?://", body) is None
+
+
+def test_the_svg_namespace_is_named_once_and_never_fetched():
+    icons = code("icons.js")
+
+    assert icons.count(SVG_NAMESPACE) == 1
+    assert f'var SVG_NS = "{SVG_NAMESPACE}";' in icons
+    for reachable in ("fetch", "XMLHttpRequest", "src", "href"):
+        assert reachable not in icons, f"icons.js reaches for {reachable}"
 
 
 def test_the_stylesheet_requests_nothing_from_the_network():
@@ -205,6 +260,47 @@ def test_every_component_type_in_the_registry_has_a_renderer():
     }
 
 
+def icon_table() -> dict[str, str]:
+    """The ``TYPE_ICONS`` table in ``icons.js``, parsed rather than executed."""
+    body = code("icons.js")
+    block = re.search(r"var TYPE_ICONS = \{(.*?)\n  \};", body, flags=re.DOTALL)
+    assert block, "icons.js no longer declares its type table in one place"
+    return dict(re.findall(r"([a-z_]+): \"([a-z]+)\",", block.group(1)))
+
+
+def test_every_component_type_has_an_icon():
+    """A type nobody drew renders a card that looks like nothing in particular.
+
+    The registry is the contract here too: a component type added without an
+    icon would still render, which is exactly why it needs a test rather than a
+    reviewer noticing.
+    """
+    table = icon_table()
+
+    assert set(table) == set(COMPONENT_TYPES), {
+        "missing": sorted(set(COMPONENT_TYPES) - set(table)),
+        "unknown": sorted(set(table) - set(COMPONENT_TYPES)),
+    }
+
+
+def test_every_icon_a_type_names_is_drawn():
+    body = code("icons.js")
+    drawn = set(re.findall(r"^    ([a-z]+): \[", body, flags=re.MULTILINE))
+
+    assert set(icon_table().values()) <= drawn, sorted(set(icon_table().values()) - drawn)
+    # The two icons no component type names: the generic card for a type this
+    # build has never seen, and the tick on the recorded confirmation.
+    assert {"card", "check"} <= drawn
+
+
+def test_the_icons_state_their_colour_in_terms_of_the_theme():
+    """An icon that named a colour would ignore the Telegram palette."""
+    body = code("icons.js")
+
+    assert 'stroke: "currentColor"' in body
+    assert re.search(r"#[0-9a-fA-F]{3,8}", body) is None
+
+
 def test_the_renderers_are_not_hardcoded_to_one_subject():
     """The same neutrality rule the skill corpus is held to.
 
@@ -277,6 +373,20 @@ def test_every_key_the_interface_asks_for_exists():
     assert "loading.title" in asked
 
 
+def test_every_card_type_is_named_in_every_locale():
+    """The badge's label is composed from the type, so the parts have to exist.
+
+    A missing one is not a crash: the interface falls back to the key and the
+    badge deliberately shows nothing rather than printing ``card.type.timeline``
+    at somebody. That is the safety net, not the plan.
+    """
+    tables = locale_tables()
+
+    for locale, table in tables.items():
+        for component_type in COMPONENT_TYPES:
+            assert f"card.type.{component_type}" in table, f"{locale}: {component_type}"
+
+
 def test_composed_keys_resolve_for_every_difficulty_and_rating():
     """Two keys are built by concatenation, so the parts have to exist."""
     from learning_studio.manifest import DIFFICULTIES
@@ -329,10 +439,41 @@ def test_the_document_provides_a_skip_link_and_live_regions():
     assert 'tabindex="-1"' in document
 
 
+@pytest.mark.parametrize("name", SCRIPTS)
+def test_no_script_writes_a_style_attribute(name: str):
+    """`style-src 'self'` has no `'unsafe-inline'`, so a `style` attribute would
+    be dropped by the browser and the rule would only be visible as a bug.
+
+    Custom properties set through ``element.style`` are how the Telegram palette
+    and the two positioned markers work; those are DOM properties, not an
+    attribute this code writes.
+    """
+    assert re.search(r"setAttribute\(\s*[\"']style", code(name)) is None
+
+
+#: Classes the scripts attach and the stylesheet has to know about. A class that
+#: exists in only one of the two places is either dead CSS or an unstyled
+#: element, and both look fine in a diff.
+STYLED_CLASSES = ("type-badge", "type-label", "recorded-pill", "score-ring", "card-enter", "icon")
+
+
+@pytest.mark.parametrize("name", STYLED_CLASSES)
+def test_every_class_the_frontend_attaches_is_styled(name: str):
+    stylesheet = source("app.css")
+    scripts = "".join(code(script) for script in SCRIPTS)
+
+    assert f'"{name}"' in scripts, f"nothing attaches the {name} class"
+    assert f".{name}" in stylesheet, f"{name} is attached but never styled"
+
+
 def test_the_stylesheet_honours_reduced_motion_and_safe_areas():
     stylesheet = source("app.css")
 
     assert "prefers-reduced-motion" in stylesheet
+    # The card's entrance is switched off two ways: the duration token goes to
+    # zero, and the animation itself is dropped.
+    assert stylesheet.count(".card-enter {\n  animation: none;\n}") == 1
+    assert '[data-reduced-motion="true"] .card-enter' in stylesheet
     assert "env(safe-area-inset-bottom)" in stylesheet
     assert "env(safe-area-inset-top)" in stylesheet
     assert "--tg-viewport-stable-height" in stylesheet
@@ -444,7 +585,7 @@ def test_the_preview_gallery_renders_every_type_without_a_server(tmp_path):
     fixtures = (tmp_path / "preview" / "fixtures.js").read_text(encoding="utf-8")
     for component_type in COMPONENT_TYPES:
         assert f'"type": "{component_type}"' in fixtures
-    for name in ("app.css", "i18n.js", "renderers.js", "gallery.js", "dark.html"):
+    for name in ("app.css", "i18n.js", "icons.js", "renderers.js", "gallery.js", "dark.html"):
         assert (tmp_path / "preview" / name).is_file()
     # It renders cards; it does not run the application, which is what would need
     # a server and a session.
