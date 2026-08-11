@@ -1661,11 +1661,22 @@ The API's own error text is deliberately never displayed. It is written for an
 operator reading a log, and translating the interface only to fall back to English
 on the unhappy path would be a strange kind of half-localized.
 
-Answers are confirmed as **recorded and not marked**, because that is what
-happened. The confirmation carries a tick and the interface's calm green, and
-the sentence under it still says *not marked yet*: the tick means *written
-down*, and the identical screen appears whatever was answered. A verdict here
-would be a guess ahead of the mark `GET /api/session/summary` actually makes.
+**A successful submit opens the next card.** There is no confirmation screen
+between one answer and the next question, because there was nothing on it for a
+learner to decide: the next card arriving *is* the confirmation, and a screen
+whose only content was "now tap again" cost every answer of every exercise a
+second tap. The last answer opens the completion screen the same way. What a
+screen reader gets instead is one polite `Answer recorded.` announcement, made
+after the next card is painted and focused; at the end, the completion screen's
+own announcement is the one that stands.
+
+**No answer is given a verdict of its own.** Nothing is marked until the session
+is scored as a whole by `GET /api/session/summary`, so a tick or a cross on the
+way past would be a guess ahead of the only mark actually made.
+
+An **unsupported** component still gets a **Continue** button, because there it
+means something different: the card cannot be rendered by this build, and
+recording it as `{"skipped": true}` is the only honest way past it.
 
 ### What a card looks like
 
@@ -1740,8 +1751,8 @@ nothing is read out twice, `prefers-reduced-motion` honoured in CSS so it holds
 even if the script never runs, and a `data-reduced-motion` hook written onto the
 card element — the one node every screen is painted into — so an experience-level
 `reduced_motion` accommodation or a component's own flag suppresses the entrance
-on the question, the confirmation, the completion screen and every error state
-alike, rather than only on the card that declared it. Plus safe-area insets,
+on every question, the completion screen and every error state alike, rather
+than only on the card that declared it. Plus safe-area insets,
 Telegram's stable viewport height, and wide tables that scroll inside themselves
 rather than scrolling the page.
 

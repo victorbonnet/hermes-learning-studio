@@ -44,9 +44,11 @@ private Telegram conversation you are already in. They tap it and work through
 the cards — selection, cloze, ordering, matching, flashcards with an explicit
 reveal, images, hotspots, tables, scenarios, reflection — keyboard-operable, in
 three interface languages. Each card opens with a small icon and the name of the
-kind of card it is, in the learner's own interface language, and every answer is
-confirmed as recorded and **not** marked, because nothing is marked until the
-end. When they finish, the Mini App scores the attempt and shows them a
+kind of card it is, in the learner's own interface language, and submitting an
+answer opens the next card straight away — no confirmation screen and no second
+tap, with a polite `Answer recorded.` announcement for a screen reader. No
+answer is given a verdict of its own, because nothing is marked until the end.
+When they finish, the Mini App scores the attempt and shows them a
 completion screen: how many marked answers they got right, drawn as a ring
 around that same count — the fraction of marked answers, which is not the
 points-weighted `overall_score` and can differ from it when components carry

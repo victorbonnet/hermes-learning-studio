@@ -83,6 +83,14 @@ function jsonResponse(status, body) {
   };
 }
 
+function deferred() {
+  var release;
+  const promise = new Promise((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
 /**
  * An API that behaves like the real one for one experience.
  *
@@ -276,9 +284,10 @@ function fakeApi({
 async function boot(options = {}) {
   const api = fakeApi(options);
   const telegram = options.telegram === null ? null : telegramStub(options.telegram);
+  const fetchImpl = options.wrapFetch ? options.wrapFetch(api.fetchImpl, api) : api.fetchImpl;
   const { win, booted } = loadApp({
     telegram,
-    fetch: api.fetchImpl,
+    fetch: fetchImpl,
     location: options.location === undefined ? buttonLocation() : options.location,
   });
   await booted;
@@ -296,28 +305,160 @@ function stateOf(win) {
   return marked ? marked.getAttribute("data-state") : null;
 }
 
-/** Answer whatever card is showing and continue past the confirmation. */
-async function answerCurrent(context) {
-  const win = context.win;
-  const card = cardOf(win);
+function completeCurrent(context) {
+  const card = cardOf(context.win);
   const section = card.children[0];
   const componentType = section.getAttribute("data-component-type");
   const payload = componentType ? FIXTURES[componentType].payload : {};
-
   completeCard(card, payload);
+  return { section, componentType };
+}
+
+/** Answer whatever card is showing. One submit, and the exercise has moved on. */
+async function answerCurrent(context) {
+  const win = context.win;
+  const { section, componentType } = completeCurrent(context);
   // A flashcard's turn-over is a request; give it a chance to come back before
   // the answer is submitted.
   await settle(20);
   click(context.node("primary-action"));
   await settle(20);
 
-  assert.equal(stateOf(win), "recorded", `${componentType}: no confirmation after submitting`);
-  click(context.node("primary-action"));
-  await settle(20);
+  assert.notEqual(
+    cardOf(win).children[0],
+    section,
+    `${componentType}: submitting left the same card on the screen`
+  );
   return componentType;
 }
 
 // ── The happy path ────────────────────────────────────────────────────────
+
+test("one successful submit opens the next card, with nothing in between", async () => {
+  const context = await boot({ types: ["short_answer", "true_false"] });
+
+  completeCard(cardOf(context.win), FIXTURES.short_answer.payload);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  // No screen came between the two questions: the second card is what is
+  // showing, and it is showing already.
+  assert.equal(stateOf(context.win), null, "a state screen came between two questions");
+  const nextCard = cardOf(context.win).children[0];
+  assert.equal(nextCard.getAttribute("data-component-type"), "true_false");
+  assert.ok(
+    nextCard.all().includes(context.win.document.activeElement),
+    "focus stayed on a control from the card that was removed"
+  );
+  assert.match(context.node("primary-action").textContent, /Submit/);
+  assert.equal(
+    context.api.log.filter((entry) => entry.path === "/api/session/answer").length,
+    1,
+    "the answer was not sent exactly once"
+  );
+  assert.match(context.node("progress-text").textContent, /Card 2 of 2/);
+  // The one thing a sighted learner does not need: a screen reader is told the
+  // answer was written down, in the interface's own language.
+  assert.match(context.node("announcer").textContent, /Answer recorded/);
+});
+
+test("the last submit opens the completion screen, and the ending is what is announced", async () => {
+  const context = await boot({ types: ["short_answer"] });
+
+  completeCard(cardOf(context.win), FIXTURES.short_answer.payload);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(stateOf(context.win), "complete");
+  assert.equal(
+    context.win.document.activeElement,
+    cardOf(context.win),
+    "focus stayed on the removed final-card control"
+  );
+  // Nothing to finish: the exercise already did.
+  assert.match(context.node("primary-action").textContent, /Close/);
+  // The last thing said is how the exercise went, not that one more answer was
+  // written down — a recorded announcement landing after this one would leave a
+  // screen reader with the least useful of the two sentences.
+  assert.match(context.node("announcer").textContent, /Exercise finished/);
+  assert.doesNotMatch(context.node("announcer").textContent, /Answer recorded/);
+});
+
+test("a final answer cannot be submitted again while the completion summary is pending", async () => {
+  const summaryGate = deferred();
+  var summaryCalls = 0;
+  const context = await boot({
+    types: ["short_answer"],
+    wrapFetch: (fetchImpl) => async (path, init) => {
+      if (path === "/api/session/summary") {
+        summaryCalls += 1;
+        await summaryGate.promise;
+      }
+      return fetchImpl(path, init);
+    },
+  });
+
+  completeCurrent(context);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(summaryCalls, 1);
+  assert.equal(context.node("primary-action").disabled, true);
+  assert.equal(
+    context.api.log.filter((entry) => entry.path === "/api/session/answer").length,
+    1
+  );
+
+  // The DOM shim deliberately permits direct handler invocation on a disabled
+  // button. The app's own pending guard must still reject the re-entry.
+  click(context.node("primary-action"));
+  await settle(20);
+  assert.equal(summaryCalls, 1);
+  assert.equal(
+    context.api.log.filter((entry) => entry.path === "/api/session/answer").length,
+    1
+  );
+
+  summaryGate.release();
+  await settle(30);
+  assert.equal(stateOf(context.win), "complete");
+});
+
+test("identical answer-recorded announcements are separated by an empty live-region state", async () => {
+  const answerGate = deferred();
+  var holdNextAnswer = false;
+  const context = await boot({
+    types: ["short_answer", "true_false", "short_answer"],
+    wrapFetch: (fetchImpl) => async (path, init) => {
+      if (holdNextAnswer && path === "/api/session/answer") {
+        await answerGate.promise;
+      }
+      return fetchImpl(path, init);
+    },
+  });
+
+  await answerCurrent(context);
+  assert.equal(context.node("announcer").textContent, "Answer recorded.");
+
+  holdNextAnswer = true;
+  completeCurrent(context);
+  click(context.node("primary-action"));
+  await settle(20);
+  assert.equal(context.node("announcer").textContent, "");
+  assert.equal(
+    context.api.log.filter((entry) => entry.path === "/api/session/answer").length,
+    1
+  );
+
+  holdNextAnswer = false;
+  answerGate.release();
+  await settle(30);
+  assert.equal(
+    cardOf(context.win).children[0].getAttribute("data-component-type"),
+    "short_answer"
+  );
+  assert.equal(context.node("announcer").textContent, "Answer recorded.");
+});
 
 test("a launch from Telegram opens a session and shows the first card", async () => {
   const context = await boot({ types: ["multiple_choice", "short_answer"] });
@@ -341,7 +482,7 @@ test("a launch from Telegram opens a session and shows the first card", async ()
   );
 });
 
-test("the exercise runs to completion, one deliberate tap at a time", async () => {
+test("the exercise runs to completion, one submit per card", async () => {
   const context = await boot({ types: ["multiple_choice", "true_false", "short_answer"] });
 
   const walked = [];
@@ -601,41 +742,60 @@ test("every renderer survives a real submit, for all thirty-one types", async ()
   assert.equal(stateOf(context.win), "complete");
 });
 
-test("the confirmation says the answer was recorded and not marked", async () => {
-  const context = await boot({ types: ["short_answer", "true_false"] });
-  const card = cardOf(context.win);
-
-  completeCard(card, FIXTURES.short_answer.payload);
-  click(context.node("primary-action"));
-  await settle(20);
-
-  assert.match(cardOf(context.win).textContent, /Answer recorded/);
-  assert.match(cardOf(context.win).textContent, /Not marked yet/);
-  assert.match(context.node("announcer").textContent, /recorded/i);
-});
-
-test("the confirmation is a tick and a reassurance, never a verdict", async () => {
+test("a recorded answer is said to a screen reader and shown to nobody", async () => {
   const context = await boot({ types: ["short_answer", "true_false"] });
 
   completeCard(cardOf(context.win), FIXTURES.short_answer.payload);
   click(context.node("primary-action"));
   await settle(20);
 
-  const card = cardOf(context.win);
-  const pill = card.all().find((node) => node.className === "recorded-pill");
-  assert.ok(pill, "the confirmation lost its calm treatment");
+  // The sighted confirmation is the next question being on the screen. The
+  // polite region carries the same fact for a reader who cannot see that.
+  assert.equal(context.node("announcer").textContent, "Answer recorded.");
+  const shown = cardOf(context.win).textContent;
+  assert.doesNotMatch(shown, /Answer recorded/, "the confirmation is on the screen as well");
+  assert.doesNotMatch(shown, /Not marked yet/);
+  assert.equal(
+    cardOf(context.win)
+      .all()
+      .find((node) => node.className === "recorded-pill"),
+    undefined,
+    "a success pill was drawn between the two questions"
+  );
+});
 
-  const tick = pill.children.find((node) => node.tagName === "svg");
-  assert.ok(tick, "the confirmation carries no tick");
-  assert.equal(tick.getAttribute("data-icon"), "check");
-  assert.equal(tick.getAttribute("aria-hidden"), "true", "the tick is read out as well as shown");
+test("the recorded announcement is in the reader's own language", async () => {
+  const context = await boot({ types: ["short_answer", "true_false"], uiLocale: "fr" });
 
-  // A tick that meant "right" would be a mark, and nothing has been marked yet:
-  // the same screen appears whatever was answered.
-  const shown = card.textContent;
-  for (const verdict of ["Correct", "Incorrect", "correct", "wrong"]) {
-    assert.ok(!shown.includes(verdict), `the confirmation says "${verdict}"`);
+  completeCard(cardOf(context.win), FIXTURES.short_answer.payload);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(context.node("announcer").textContent, "Réponse enregistrée.");
+});
+
+test("an answered card gets no verdict of its own, right or wrong", async () => {
+  // Scoring happens once, for the whole session, on the completion screen. A
+  // tick or a cross on the way past would be guessing ahead of the mark that
+  // `GET /api/session/summary` is what actually produces.
+  const context = await boot({ types: ["short_answer", "true_false"] });
+
+  completeCard(cardOf(context.win), FIXTURES.short_answer.payload);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(stateOf(context.win), null, "an answer got a screen of its own");
+  const shown = cardOf(context.win).textContent;
+  for (const verdict of ["Correct", "Incorrect", "wrong"]) {
+    assert.ok(!shown.includes(verdict), `an answered card says "${verdict}"`);
   }
+  assert.equal(
+    cardOf(context.win)
+      .all()
+      .filter((node) => node.getAttribute && node.getAttribute("data-icon") === "check").length,
+    0,
+    "a tick was drawn over an answer nobody has marked"
+  );
 });
 
 // ── Reduced motion outlives the card it was declared on ───────────────────
@@ -644,10 +804,10 @@ test("the confirmation is a tick and a reassurance, never a verdict", async () =
  * The preference is declared in two places and has to survive in one.
  *
  * A component declares it in its own payload, and an experience declares it
- * once for the whole session. Either way the *question* is not the only thing
- * that animates: the confirmation and the completion screen are separate
- * elements that replace it wholesale, so a marker written onto the question can
- * only ever describe the question. What these tests pin is the boundary --
+ * once for the whole session. Either way one *question* is not the only thing
+ * that animates: the next question, the completion screen and every error state
+ * are separate elements that replace it wholesale, so a marker written onto one
+ * question can only ever describe that question. What these tests pin is the boundary --
  * `#card`, the one node every state is painted into and which no replacement
  * touches -- and the consequence: the state that arrives under a reduced-motion
  * boundary does not carry the entrance class at all.
@@ -682,8 +842,8 @@ function componentReducedMotionApi(types) {
   return api;
 }
 
-test("a reduced-motion component keeps the preference through recorded and completion", async () => {
-  const context = await bootWith(componentReducedMotionApi(["short_answer"]));
+test("a reduced-motion component keeps the preference from card to card and into completion", async () => {
+  const context = await bootWith(componentReducedMotionApi(["short_answer", "true_false"]));
 
   // The question still declares it itself, exactly as the renderer always did.
   assert.equal(cardOf(context.win).children[0].getAttribute("data-reduced-motion"), "true");
@@ -695,10 +855,12 @@ test("a reduced-motion component keeps the preference through recorded and compl
   click(context.node("primary-action"));
   await settle(20);
 
-  assert.equal(stateOf(context.win), "recorded");
-  assert.equal(motionMarkerOf(context.win), "true", "the confirmation lost the preference");
-  assert.equal(entersWithAnimation(context.win), false, "the confirmation animated in");
+  // Question straight to question: the transition a submit now makes.
+  assert.equal(cardOf(context.win).children[0].getAttribute("data-component-type"), "true_false");
+  assert.equal(motionMarkerOf(context.win), "true", "the next question lost the preference");
+  assert.equal(entersWithAnimation(context.win), false, "the next question animated in");
 
+  completeCard(cardOf(context.win), FIXTURES.true_false.payload);
   click(context.node("primary-action"));
   await settle(20);
 
@@ -751,7 +913,7 @@ test("an accommodation that is not reduced motion leaves the animation alone", a
 });
 
 test("an ordinary exercise sets no marker and keeps its entrance throughout", async () => {
-  const context = await boot({ types: ["short_answer"] });
+  const context = await boot({ types: ["short_answer", "true_false"] });
 
   assert.equal(motionMarkerOf(context.win), null);
   assert.equal(entersWithAnimation(context.win), true, "the question lost its entrance");
@@ -760,10 +922,11 @@ test("an ordinary exercise sets no marker and keeps its entrance throughout", as
   click(context.node("primary-action"));
   await settle(20);
 
-  assert.equal(stateOf(context.win), "recorded");
+  assert.equal(cardOf(context.win).children[0].getAttribute("data-component-type"), "true_false");
   assert.equal(motionMarkerOf(context.win), null, "a marker appeared for nobody who asked");
-  assert.equal(entersWithAnimation(context.win), true, "the confirmation lost its entrance");
+  assert.equal(entersWithAnimation(context.win), true, "the next question lost its entrance");
 
+  completeCard(cardOf(context.win), FIXTURES.true_false.payload);
   click(context.node("primary-action"));
   await settle(20);
 
@@ -885,6 +1048,37 @@ test("an incomplete answer is refused locally, without a request", async () => {
   assert.equal(context.node("field-error").hidden, false);
   assert.match(context.node("field-error").textContent, /Choose one option/);
   assert.match(context.node("announcer").textContent, /Choose one option/);
+});
+
+test("an answer the card refuses leaves that same card on the screen", async () => {
+  // A submit is the only way forward now, so the case where it must *not* be
+  // one is worth stating on its own.
+  const context = await boot({ types: ["multiple_choice", "true_false"] });
+  const before = cardOf(context.win).children[0];
+
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(cardOf(context.win).children[0], before, "an invalid answer advanced the exercise");
+  assert.match(context.node("primary-action").textContent, /Submit/);
+  assert.equal(context.api.answers.length, 0);
+  assert.match(context.node("progress-text").textContent, /Card 1 of 2/);
+});
+
+test("the submit button is disabled while the answer is in flight", async () => {
+  const context = await boot({ types: ["short_answer", "true_false"] });
+
+  completeCard(cardOf(context.win), FIXTURES.short_answer.payload);
+  click(context.node("primary-action"));
+  // Synchronously after the tap, before the request comes back: a second tap
+  // is what a browser refuses here, and it is the only thing between one
+  // answer and two.
+  assert.equal(context.node("primary-action").disabled, true, "a second tap could still land");
+
+  await settle(20);
+
+  assert.equal(context.api.answers.length, 1);
+  assert.equal(context.node("primary-action").disabled, false, "the next card cannot be answered");
 });
 
 test("the error clears once the card is answered", async () => {
@@ -1074,6 +1268,25 @@ test("reopening after an expiry starts a fresh session", async () => {
   );
 });
 
+test("a refused answer does not open the next card behind the error", async () => {
+  const context = await boot({ types: ["true_false", "short_answer"] });
+  context.api.failWith["/api/session/answer"] = 500;
+
+  completeCard(cardOf(context.win), FIXTURES.true_false.payload);
+  click(context.node("primary-action"));
+  await settle(20);
+
+  assert.equal(stateOf(context.win), "server");
+  assert.equal(context.api.answers.length, 0, "a refused request recorded an answer anyway");
+  assert.equal(
+    cardOf(context.win)
+      .all()
+      .find((node) => node.getAttribute && node.getAttribute("data-component-type")),
+    undefined,
+    "the next question opened underneath an error state"
+  );
+});
+
 test("a stale client answering the wrong card is told the card moved on", async () => {
   const context = await boot({ types: ["true_false", "short_answer"] });
   context.api.failWith["/api/session/answer"] = 409;
@@ -1221,6 +1434,9 @@ test("an unsupported card can be skipped so the exercise is not a dead end", asy
 
   assert.equal(api.answers.length, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(api.answers[0].response)), { skipped: true });
+  // Continue still means what it says here: the card could not be shown, and
+  // recording it as skipped is the only honest way past it.
+  assert.equal(win.document.getElementById("card").children[0].getAttribute("data-state"), "complete");
 });
 
 // ── Turning a flashcard over, through the real application ────────────────

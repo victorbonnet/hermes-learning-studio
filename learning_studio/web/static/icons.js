@@ -161,12 +161,6 @@
       ["line", { x1: "7", y1: "9.5", x2: "17", y2: "9.5" }],
       ["line", { x1: "7", y1: "14.5", x2: "13", y2: "14.5" }],
     ],
-    // The confirmation that an answer was written down. Not a mark: see
-    // `acknowledge` in `app.js`, and the API, which scores once at the end.
-    check: [
-      ["circle", { cx: "12", cy: "12", r: "9" }],
-      ["path", { d: "M8 12.4l2.6 2.6L16 9.6" }],
-    ],
   };
 
   /**
