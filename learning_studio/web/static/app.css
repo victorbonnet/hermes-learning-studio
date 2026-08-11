@@ -296,27 +296,6 @@ body {
   border-left: 4px solid var(--ok);
 }
 
-/* The confirmation that an answer was written down. Calm and positive, and
-   deliberately not a verdict: nothing has been marked at this point, and the
-   sentence under it says so. */
-.recorded-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0;
-  padding: 12px 16px;
-  border-radius: var(--radius);
-  background: var(--bg);
-  border-left: 4px solid var(--ok);
-  font-weight: 600;
-}
-
-.recorded-pill .icon {
-  width: 22px;
-  height: 22px;
-  color: var(--ok);
-}
-
 /* ── Completion screen ─────────────────────────────────────────────────── */
 
 /* The mark, drawn. The arc's colour is the tier's, applied here rather than in

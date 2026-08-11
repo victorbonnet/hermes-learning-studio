@@ -83,11 +83,9 @@
       "action.continue": "Continue",
       "action.retry": "Try again",
       "action.reopen": "Reopen",
-      "action.finish": "Finish",
       "action.close": "Close",
 
       "feedback.recorded": "Answer recorded.",
-      "feedback.pending": "Not marked yet — you'll see your score when you finish.",
 
       "invalid.required": "Answer this to continue.",
       "invalid.choose_one": "Choose one option.",
@@ -252,11 +250,9 @@
       "action.continue": "Continuer",
       "action.retry": "Réessayer",
       "action.reopen": "Rouvrir",
-      "action.finish": "Terminer",
       "action.close": "Fermer",
 
       "feedback.recorded": "Réponse enregistrée.",
-      "feedback.pending": "Pas encore corrigé — vous verrez votre score à la fin.",
 
       "invalid.required": "Répondez pour continuer.",
       "invalid.choose_one": "Choisissez une option.",
@@ -421,11 +417,9 @@
       "action.continue": "Continuar",
       "action.retry": "Reintentar",
       "action.reopen": "Volver a abrir",
-      "action.finish": "Terminar",
       "action.close": "Cerrar",
 
       "feedback.recorded": "Respuesta registrada.",
-      "feedback.pending": "Todavía sin corregir — verás tu puntuación al terminar.",
 
       "invalid.required": "Responde para continuar.",
       "invalid.choose_one": "Elige una opción.",

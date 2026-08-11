@@ -108,6 +108,11 @@
     var progress = null;
     var currentCard = null;
     var currentComponent = null;
+    // Covers the answer request and its server-authoritative destination. The
+    // native disabled button is useful feedback, but this guard is the actual
+    // invariant: even a direct handler call cannot submit the same card twice
+    // while the next card or completion summary is still arriving.
+    var submitting = false;
     var objectUrls = [];
     //: Reduced motion, kept as the two claims that produce it rather than as one
     //: resolved boolean, because they have different lifetimes: the experience's
@@ -300,8 +305,8 @@
     /**
      * Write the effective preference onto the card, which is the boundary.
      *
-     * It goes here rather than on the question because the question is not the
-     * only thing that animates: the confirmation, the completion screen and
+     * It goes here rather than on one question because the question is not the
+     * only thing that animates: the next question, the completion screen and
      * every error state replace it wholesale, and a marker on a replaced element
      * describes only the element that carried it. `#card` is the one node every
      * state is painted into and that no replacement touches, so `app.css`'s
@@ -653,8 +658,7 @@
       if (!component) {
         // Deliberately before the per-component preference is recomputed: the
         // completion screen belongs to the exercise that just ended, so the last
-        // card's claim is still the one in force. Same reasoning as the
-        // confirmation screen, which `acknowledge` paints without touching it.
+        // card's claim is still the one in force.
         return showResult();
       }
       currentComponent = component;
@@ -676,7 +680,28 @@
       return Promise.resolve();
     }
 
+    /**
+     * Send one answer, and open whatever comes after it.
+     *
+     * A successful submit *is* the transition: the next question is painted by
+     * the same turn that recorded the answer, and the last one opens the
+     * completion screen. There is no confirmation screen in between, because
+     * there was nothing for a learner to decide on it -- the next card arriving
+     * is the confirmation, and a screen whose only content was "now tap again"
+     * cost every answer of every exercise a second tap.
+     *
+     * Nothing here is a verdict. Scoring happens once, for the whole session,
+     * from ``GET /api/session/summary`` on the completion screen; a tick or a
+     * cross on the way past would be guessing ahead of the only mark that is
+     * actually made. What a screen reader gets instead is one polite sentence
+     * saying the answer was written down, which is the part of the transition
+     * that is not visible.
+     */
     function submit(override) {
+      if (submitting) {
+        return Promise.resolve();
+      }
+
       var payload = override;
       if (!payload) {
         var read = currentCard.read();
@@ -705,58 +730,48 @@
       }
 
       showFieldError("");
+      // Consecutive successes use the same localized sentence. Clearing it
+      // before the asynchronous request gives the live region a real empty ->
+      // message transition every time, without a timer or a visible state.
+      announce("");
+      submitting = true;
       nodes["primary-action"].disabled = true;
 
       return request("POST", API.answer, {
         component_id: currentComponent.component_id,
         response: payload,
       }).then(function (result) {
-        nodes["primary-action"].disabled = false;
         if (!result.ok) {
           return fail(result, "session");
         }
         progress = result.data.progress || progress;
         showProgress();
-        return acknowledge(result.data.next_component);
-      });
-    }
-
-    /**
-     * Confirm the answer was recorded, and say plainly that it is not marked
-     * yet.
-     *
-     * Scoring happens once for the whole session, on the completion screen --
-     * not here, per answer -- so a tick or a cross on this card would be
-     * guessing ahead of the mark that ``GET /api/session/summary`` is what
-     * actually produces. The next card is one deliberate tap away.
-     *
-     * The tick beside "Answer recorded" says *written down*, not *right*: it is
-     * the same confirmation this screen has always carried, drawn rather than
-     * only written. What keeps that from reading as a verdict is the sentence
-     * under it, which stays exactly as it was -- not marked yet -- and the fact
-     * that a wrong answer gets this identical screen.
-     */
-    function acknowledge(nextComponent) {
-      var message = el("section", {
-        className: "state",
-        attrs: { "data-state": "recorded" },
-        children: [
-          el("p", {
-            className: "recorded-pill",
-            children: [
-              Icons ? Icons.icon("check") : null,
-              el("span", { text: t("feedback.recorded") }),
-            ],
-          }),
-          el("p", { className: "hint", text: t("feedback.pending") }),
-        ],
-      });
-      paint(message);
-      announce(t("feedback.recorded") + " " + t("feedback.pending"));
-      setAction(nextComponent ? t("action.continue") : t("action.finish"), function () {
-        return showComponent(nextComponent);
-      });
-      return Promise.resolve();
+        var nextComponent = result.data.next_component;
+        if (!nextComponent) {
+          // The last answer of the exercise. The completion screen owns the
+          // announcement from here: "answer recorded" arriving after it would
+          // replace how the exercise went with the least useful of the two
+          // sentences, and arriving before it would be read out and then
+          // immediately discarded.
+          return showComponent(null);
+        }
+        return showComponent(nextComponent).then(function () {
+          // The next question is already on screen and already focused, so a
+          // sighted learner has their confirmation: the exercise moved on. A
+          // screen reader gets the same fact as one polite sentence, after the
+          // card it follows rather than before it.
+          announce(t("feedback.recorded"));
+        });
+      }).then(
+        function (value) {
+          submitting = false;
+          return value;
+        },
+        function (error) {
+          submitting = false;
+          throw error;
+        }
+      );
     }
 
     /**

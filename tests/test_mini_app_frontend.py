@@ -288,9 +288,13 @@ def test_every_icon_a_type_names_is_drawn():
     drawn = set(re.findall(r"^    ([a-z]+): \[", body, flags=re.MULTILINE))
 
     assert set(icon_table().values()) <= drawn, sorted(set(icon_table().values()) - drawn)
-    # The two icons no component type names: the generic card for a type this
-    # build has never seen, and the tick on the recorded confirmation.
-    assert {"card", "check"} <= drawn
+    # The one icon no component type names: the generic card, for a type this
+    # build has never seen.
+    assert "card" in drawn
+    # And nothing draws a tick. A successful submit opens the next card rather
+    # than a confirmation screen, and a tick beside an answer nobody has marked
+    # would read as a verdict the interface is in no position to give.
+    assert "check" not in drawn
 
 
 def test_the_icons_state_their_colour_in_terms_of_the_theme():
@@ -454,7 +458,7 @@ def test_no_script_writes_a_style_attribute(name: str):
 #: Classes the scripts attach and the stylesheet has to know about. A class that
 #: exists in only one of the two places is either dead CSS or an unstyled
 #: element, and both look fine in a diff.
-STYLED_CLASSES = ("type-badge", "type-label", "recorded-pill", "score-ring", "card-enter", "icon")
+STYLED_CLASSES = ("type-badge", "type-label", "score-ring", "card-enter", "icon")
 
 
 @pytest.mark.parametrize("name", STYLED_CLASSES)
