@@ -94,6 +94,7 @@ def test_record_attempt_scores_every_component_and_leaks_nothing_hidden(hermes_h
         CANARY + "-multiple_choice-per-option",
     }
     assert _leaked_canaries(result, allowed) == set()
+    assert all("answer_review" not in component for component in result["components"])
 
     assert len(rows("SELECT * FROM attempts")) == 1
     stored_components = rows("SELECT * FROM attempt_components")

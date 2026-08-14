@@ -1478,7 +1478,11 @@ cached result rather than scoring a second time or writing a second durable
 attempt — and is what actually calls
 [`service.record_attempt`](#scoring-and-the-evaluation-runtime). See
 [Scoring and the evaluation runtime](#scoring-and-the-evaluation-runtime) for
-what is and is not machine-graded.
+what is and is not machine-graded. For an incorrect `multiple_choice`, that
+authenticated completion response may also carry the prompt, the visible label
+the learner selected, and the visible accepted label. The projection exists
+only in the bounded Mini App session; it is not written to the attempt tables or
+returned by an agent tool.
 
 An asset is served only when the caller owns it *and* the session's own
 experience references it, and its bytes are re-hashed against the recorded
@@ -1486,12 +1490,16 @@ digest on every delivery — an image swapped on disk after import is not served
 
 ### What the API cannot leak
 
-Responses are built from the stored **learner payloads**, which were
-constructed from an allowlist when the experience was prepared and never
-contained an answer key, rubric, hint, feedback string, or branch. The
-evaluator-only tables are not queried anywhere in the web package. A test drives
-the whole flow and asserts that no canary from any hidden field appears in any
-response body.
+Ordinary exercise responses are built from stored **learner payloads**, which
+were constructed from an allowlist when the experience was prepared and never
+contained an answer key, rubric, hint, feedback string, or branch. There are two
+explicit post-commit exceptions, both re-authorised in the service layer:
+flashcard reveal returns one scalar back after that card is committed, and a
+completed summary may map one incorrect `multiple_choice` answer and its
+accepted answer back to visible option labels. Neither path returns the answer
+object or accepts a field name from the client. Tests drive all thirty-one types
+before completion, assert that hidden canaries remain absent, and exercise the
+two narrow disclosure paths separately.
 
 Errors say as little as possible: an experience that does not exist, one owned
 by another learner, and one in another profile are the same 404, and an
@@ -1606,6 +1614,9 @@ and there is no code path here that could.
 **A card cannot show what the server did not send.** Renderers read the stored
 learner payload, which has no `answer` and no `evaluation` key to leak, so "do
 not reveal the answer before submission" is an absence rather than a discipline.
+The completion screen is a different, server-authorised state: only after the
+whole session is complete may its summary include visible submitted and accepted
+labels for an incorrect `multiple_choice`.
 `flashcard` is the visible consequence: there is no *turn over* button, because
 the back of the card is in the evaluator-only half and this app has no way to ask
 for it. What a learner does instead is write down what they remember and rate the
@@ -1673,6 +1684,14 @@ own announcement is the one that stands.
 **No answer is given a verdict of its own.** Nothing is marked until the session
 is scored as a whole by `GET /api/session/summary`, so a tick or a cross on the
 way past would be a guess ahead of the only mark actually made.
+
+On that completion screen, an incorrect `multiple_choice` shows its prompt,
+**Your answer**, **Correct answer**, and any authored feedback. Correct items stay
+compact. Other graded types keep their existing feedback until they have an
+equally unambiguous, type-specific review projection; rubric and self-report
+items never invent a correct answer. Exercise text keeps its content language,
+while the two labels are interface strings translated in English, French and
+Spanish.
 
 An **unsupported** component still gets a **Continue** button, because there it
 means something different: the card cannot be rendered by this build, and

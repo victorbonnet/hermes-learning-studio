@@ -97,6 +97,15 @@ def deps(hermes_home, clock, config, allowlist) -> Dependencies:
                 config=config,
             )
         ),
+        completion_answer_review=lambda principal, experience_id, component_key, response: (
+            service.completion_answer_review(
+                principal=principal,
+                experience_id=experience_id,
+                component_key=component_key,
+                response=response,
+                config=config,
+            )
+        ),
     )
 
 
@@ -301,6 +310,39 @@ def complete_exercise(client, token: str) -> None:
         assert answered.status_code == 200, answered.text
 
 
+def complete_with_wrong_multiple_choice(client, token: str) -> dict:
+    """Choose the fixture's visible wrong option, then finish the other cards."""
+    first_response = client.get("/api/session/component", headers=session_headers(token))
+    assert first_response.status_code == 200, first_response.text
+    first = first_response.json()["component"]
+    options = first["payload"]["content"]["options"]
+    wrong = next(option for option in options if option["text"] == "The cytosol")
+
+    answered = client.post(
+        "/api/session/answer",
+        json={
+            "component_id": first["component_id"],
+            "response": {"option_id": wrong["id"]},
+        },
+        headers=session_headers(token),
+    )
+    assert answered.status_code == 200, answered.text
+    for _ in range(2):
+        current = client.get("/api/session/component", headers=session_headers(token)).json()[
+            "component"
+        ]
+        answered = client.post(
+            "/api/session/answer",
+            json={
+                "component_id": current["component_id"],
+                "response": response_for(current["type"], current["payload"].get("content", {})),
+            },
+            headers=session_headers(token),
+        )
+        assert answered.status_code == 200, answered.text
+    return wrong
+
+
 # ── Scoring: GET /api/session/summary ───────────────────────────────────────
 
 
@@ -333,6 +375,67 @@ def test_summary_scores_a_finished_session(client, experience_id):
     assert types["multiple_choice"]["correct"] is True
     assert types["short_answer"]["correct"] is False
     assert types["true_false"]["correct"] is True
+    assert "answer_review" not in types["multiple_choice"]
+    assert "answer_review" not in types["short_answer"]
+
+
+def test_summary_reviews_an_incorrect_multiple_choice_with_visible_text(client, experience_id):
+    token, _ = open_session(client, experience_id)
+    wrong = complete_with_wrong_multiple_choice(client, token)
+
+    summary = client.get("/api/session/summary", headers=session_headers(token))
+
+    assert summary.status_code == 200
+    item = next(
+        component
+        for component in summary.json()["components"]
+        if component["component_type"] == "multiple_choice"
+    )
+    assert item["correct"] is False
+    assert item["answer_review"] == {
+        "prompt": "In eukaryotes, where does the Krebs cycle take place?",
+        "submitted": "The cytosol",
+        "correct": "The mitochondrial matrix",
+    }
+    assert wrong["id"] not in json.dumps(item["answer_review"])
+
+    repeated = client.get("/api/session/summary", headers=session_headers(token)).json()
+    repeated_item = next(
+        component
+        for component in repeated["components"]
+        if component["component_type"] == "multiple_choice"
+    )
+    assert repeated_item["answer_review"] == item["answer_review"]
+    assert repeated["attempt_id"] == summary.json()["attempt_id"]
+
+    with service.storage.connect() as conn:
+        attempts = [dict(row) for row in conn.execute("SELECT * FROM attempts")]
+        components = [dict(row) for row in conn.execute("SELECT * FROM attempt_components")]
+    durable = json.dumps({"attempts": attempts, "components": components})
+    assert "The cytosol" not in durable
+    assert "The mitochondrial matrix" not in durable
+
+
+def test_summary_omits_review_when_alias_provenance_is_damaged(client, experience_id, config):
+    token, _ = open_session(client, experience_id)
+    complete_with_wrong_multiple_choice(client, token)
+    with service.storage.connect(config) as conn:
+        conn.execute(
+            "UPDATE experience_component_alias_bindings"
+            " SET binding_scheme = 3, binding_digest = ? WHERE experience_id = ?",
+            ("0" * 64, experience_id),
+        )
+
+    summary = client.get("/api/session/summary", headers=session_headers(token))
+
+    assert summary.status_code == 200
+    item = next(
+        component
+        for component in summary.json()["components"]
+        if component["component_type"] == "multiple_choice"
+    )
+    assert item["correct"] is False
+    assert "answer_review" not in item
 
 
 def test_summary_is_computed_once_and_cached(client, experience_id):

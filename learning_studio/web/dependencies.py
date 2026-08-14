@@ -101,6 +101,10 @@ class Dependencies:
     #: :func:`learning_studio.service.record_attempt`; nothing the learner
     #: wrote is stored, only the marks the evaluation engine produced.
     record_attempt: Callable[..., Any] = field(default=lambda *_: _unwired("record_attempt"))
+    #: A fail-closed completion-only projection of a supported wrong answer.
+    #: Safe omission is the default: a partially wired application keeps scoring
+    #: but never gains an accidental evaluator disclosure path.
+    completion_answer_review: Callable[..., Any] = field(default=lambda **_: None)
     #: ``alias -> canonical`` for one component. Returns the mapping and nothing
     #: else; an unknown component yields an empty map rather than an error.
     #:
@@ -209,6 +213,15 @@ def build_dependencies(
                 responses=responses,
                 started_at=started_at,
                 completed_at=completed_at,
+                config=resolved,
+            )
+        ),
+        completion_answer_review=lambda principal, experience_id, component_key, response: (
+            service.completion_answer_review(
+                principal=principal,
+                experience_id=experience_id,
+                component_key=component_key,
+                response=response,
                 config=resolved,
             )
         ),

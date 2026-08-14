@@ -78,6 +78,8 @@
       "complete.correct": "Correct",
       "complete.incorrect": "Incorrect",
       "complete.recorded_item": "Recorded",
+      "complete.your_answer": "Your answer",
+      "complete.correct_answer": "Correct answer",
 
       "action.submit": "Submit",
       "action.continue": "Continue",
@@ -245,6 +247,8 @@
       "complete.correct": "Correct",
       "complete.incorrect": "Incorrect",
       "complete.recorded_item": "Enregistré",
+      "complete.your_answer": "Votre réponse",
+      "complete.correct_answer": "Réponse correcte",
 
       "action.submit": "Valider",
       "action.continue": "Continuer",
@@ -412,6 +416,8 @@
       "complete.correct": "Correcto",
       "complete.incorrect": "Incorrecto",
       "complete.recorded_item": "Registrado",
+      "complete.your_answer": "Tu respuesta",
+      "complete.correct_answer": "Respuesta correcta",
 
       "action.submit": "Enviar",
       "action.continue": "Continuar",

@@ -377,6 +377,31 @@ body {
   font-size: 0.9rem;
 }
 
+.summary-item .review-prompt {
+  margin: 8px 0 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.answer-review {
+  margin: 8px 0 0;
+}
+
+.answer-review-row + .answer-review-row {
+  margin-top: 8px;
+}
+
+.answer-review dt {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.answer-review dd {
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+}
+
 /* ── Choices ─────────────────────────────────────────────────────────── */
 
 .choices {

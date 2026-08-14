@@ -108,6 +108,11 @@ than none:
     caller and contain no learner data;
   - one route, `POST /api/session/reveal`, discloses one field of one component
     type (a flashcard's back) after an attempt has been committed and frozen.
+  - after the entire session is complete, `GET /api/session/summary` may disclose
+    one other positive projection: the prompt and visible submitted/accepted
+    option labels for an incorrect `multiple_choice`. Alias provenance must
+    verify first; the projection is cached only with the bounded web session and
+    is absent from durable attempts and agent tools.
     Nothing else from the evaluator-only half is reachable through the API.
 - **Two child processes, on demand.** `learning_studio_launch` starts the Mini
   App service bound to a configured loopback address, and that service starts

@@ -774,14 +774,39 @@
       );
     }
 
+    var CONTENT_LOCALE = /^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?$/;
+
+    /** Exercise content on completion, pronounced in the authored language. */
+    function completionContent(tag, options) {
+      var node = el(tag, options);
+      var locale = experience && experience.content_locale;
+      if (typeof locale === "string" && CONTENT_LOCALE.test(locale) && locale !== t.locale) {
+        node.setAttribute("lang", locale);
+      }
+      return node;
+    }
+
+    /** Whether a completion review is the narrow text shape the UI understands. */
+    function readableAnswerReview(component) {
+      var review = component && component.answer_review;
+      if (!review || component.correct !== false) {
+        return null;
+      }
+      return ["prompt", "submitted", "correct"].every(function (key) {
+        return typeof review[key] === "string" && review[key].length > 0;
+      })
+        ? review
+        : null;
+    }
+
     /**
      * One row of the per-component breakdown.
      *
-     * ``feedback`` is the one piece of evaluator-only text the server ever
-     * discloses, and only for *this* learner's *own* completed attempt -- see
-     * ``learning_studio.evaluation``. Nothing here shows an answer key or a
-     * rubric; a component with no mark at all (a self-report, or a rubric
-     * response nobody has graded) says only that it was recorded.
+     * ``feedback`` and the narrow ``answer_review`` projection are disclosed
+     * only for *this* learner's own completed attempt. The review contains
+     * visible labels rather than identifiers or the answer object; a component
+     * with no mark at all (a self-report, or a rubric response nobody has graded)
+     * says only that it was recorded.
      */
     function summaryItem(component) {
       var outcome =
@@ -797,6 +822,31 @@
             ? t("complete.incorrect")
             : t("complete.recorded_item");
       var children = [el("p", { className: "outcome", text: label })];
+      var review = readableAnswerReview(component);
+      if (review) {
+        children.push(
+          completionContent("p", { className: "review-prompt", text: review.prompt }),
+          el("dl", {
+            className: "answer-review",
+            children: [
+              el("div", {
+                className: "answer-review-row",
+                children: [
+                  el("dt", { text: t("complete.your_answer") }),
+                  completionContent("dd", { text: review.submitted }),
+                ],
+              }),
+              el("div", {
+                className: "answer-review-row",
+                children: [
+                  el("dt", { text: t("complete.correct_answer") }),
+                  completionContent("dd", { text: review.correct }),
+                ],
+              }),
+            ],
+          })
+        );
+      }
       if (component.feedback) {
         children.push(el("p", { className: "detail", text: String(component.feedback) }));
       }
