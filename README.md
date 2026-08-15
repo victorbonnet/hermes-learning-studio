@@ -2059,9 +2059,15 @@ result carries `graded`, `correct`, `score`, `max_score`, and — copied
 verbatim from the manifest's own `evaluation.feedback`, and only the branch
 that matches the outcome — `feedback`. Nothing else from the hidden half of a
 component (answer key, rubric, hints, branching, evaluator notes) is ever
-reachable from a durable attempt, a tool response, or the completion screen; a
-test walks every string in these responses and asserts none of it is a
-canary planted in a hidden field.
+reachable from a durable attempt or a tool response — neither of which ever
+carries a submitted response, an answer object, or a canonical identifier; a
+test walks every string in these responses and asserts none of it is a canary
+planted in a hidden field. The completion screen is the one narrower exception,
+and only there: for an incorrect `multiple_choice`, the authenticated Mini App
+may show the prompt with the visible submitted and accepted labels, cached only
+in the bounded web session and never written down (see
+[Telegram Mini App API](#telegram-mini-app-api)). Every other hidden field
+stays unreachable from it too.
 
 ### Objective mastery and the misconception bank
 

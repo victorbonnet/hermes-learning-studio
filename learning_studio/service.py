@@ -2997,6 +2997,13 @@ def completion_answer_review(
     expected_text = labels.get(expected_id)
     if submitted_text is None or expected_text is None:
         return None
+    # Distinct options may still read alike: validation requires unique option
+    # IDs, never unique text. "You chose X, the answer is X" is a contradiction
+    # for a sighted reader and worse for a screen reader, and disambiguating it
+    # would mean showing the identifiers this projection exists to withhold. So
+    # the review is dropped; the item is still reported, still incorrect.
+    if submitted_text == expected_text:
+        return None
     return {"prompt": prompt, "submitted": submitted_text, "correct": expected_text}
 
 

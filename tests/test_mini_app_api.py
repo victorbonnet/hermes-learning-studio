@@ -131,6 +131,20 @@ def experience_id(hermes_home, principal, config) -> str:
     return result["experience_id"]
 
 
+@pytest.fixture
+def duplicate_label_experience_id(hermes_home, principal, config) -> str:
+    """One card whose accepted and wrong options carry the same visible text."""
+    component = example("multiple_choice", id="q-dup")
+    component["content"]["options"] = [
+        {"id": "matrix", "text": "The mitochondrial matrix"},
+        {"id": "cytosol", "text": "The mitochondrial matrix"},
+    ]
+    result = service.prepare_experience(
+        principal=principal, manifest=manifest([component]), config=config
+    )
+    return result["experience_id"]
+
+
 def auth(user_id: str = USER_ID, age: int = 5, **kwargs) -> dict[str, str]:
     return {INIT_DATA_HEADER: build_init_data(user_id=user_id, auth_date=NOW - age, **kwargs)}
 
@@ -414,6 +428,37 @@ def test_summary_reviews_an_incorrect_multiple_choice_with_visible_text(client, 
     durable = json.dumps({"attempts": attempts, "components": components})
     assert "The cytosol" not in durable
     assert "The mitochondrial matrix" not in durable
+
+
+def test_summary_omits_review_when_the_two_labels_read_alike(
+    client, duplicate_label_experience_id, principal, config
+):
+    """Two labels that read alike would make the review contradict itself."""
+    token, _ = open_session(client, duplicate_label_experience_id)
+    aliases = service.component_aliases(
+        principal=principal,
+        experience_id=duplicate_label_experience_id,
+        component_key="q-dup",
+        config=config,
+    )
+    wrong_id = next(alias for alias, canonical in aliases.mapping.items() if canonical == "cytosol")
+    answered = client.post(
+        "/api/session/answer",
+        json={"component_id": "q-dup", "response": {"option_id": wrong_id}},
+        headers=session_headers(token),
+    )
+    assert answered.status_code == 200, answered.text
+
+    summary = client.get("/api/session/summary", headers=session_headers(token))
+
+    assert summary.status_code == 200
+    item = next(
+        component
+        for component in summary.json()["components"]
+        if component["component_type"] == "multiple_choice"
+    )
+    assert item["correct"] is False
+    assert "answer_review" not in item
 
 
 def test_summary_omits_review_when_alias_provenance_is_damaged(client, experience_id, config):
