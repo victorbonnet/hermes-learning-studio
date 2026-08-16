@@ -519,6 +519,121 @@ test("the completion screen shows a per-component breakdown from the summary rou
   );
 });
 
+test("an incorrect reviewed answer shows the question, submitted option, and correct option", async () => {
+  const context = await boot({
+    types: ["multiple_choice", "true_false"],
+    uiLocale: "es",
+    summaryOverrides: {
+      correct_component_count: 1,
+      components: [
+        {
+          component_id: "component-0",
+          component_type: "multiple_choice",
+          graded: true,
+          correct: false,
+          score: 0,
+          max_score: 1,
+          feedback: "La explicación ya escrita.",
+          answer_review: {
+            prompt: "¿Qué frase suena natural?",
+            submitted: "¿Les parece hablar domingo?",
+            correct: "¿Les parece bien hablar el domingo?",
+          },
+        },
+        {
+          component_id: "component-1",
+          component_type: "true_false",
+          graded: true,
+          correct: true,
+          score: 1,
+          max_score: 1,
+          feedback: "Correcto.",
+          answer_review: {
+            prompt: "THIS CORRECT ITEM MUST STAY COMPACT",
+            submitted: "visible choice",
+            correct: "visible choice",
+          },
+        },
+      ],
+    },
+  });
+
+  await answerCurrent(context);
+  await answerCurrent(context);
+
+  const text = cardOf(context.win).textContent;
+  assert.match(text, /¿Qué frase suena natural\?/);
+  assert.match(text, /Tu respuesta/);
+  assert.match(text, /¿Les parece hablar domingo\?/);
+  assert.match(text, /Respuesta correcta/);
+  assert.match(text, /¿Les parece bien hablar el domingo\?/);
+  assert.equal((text.match(/Tu respuesta/g) || []).length, 1);
+  assert.equal((text.match(/Respuesta correcta/g) || []).length, 1);
+  assert.doesNotMatch(text, /THIS CORRECT ITEM MUST STAY COMPACT/);
+  const reviewPrompt = cardOf(context.win)
+    .all()
+    .find((node) => node.className === "review-prompt");
+  const reviewTerms = cardOf(context.win)
+    .all()
+    .filter((node) => node.tagName === "dt");
+  const reviewValues = cardOf(context.win)
+    .all()
+    .filter((node) => node.tagName === "dd");
+  assert.equal(reviewTerms.length, 2);
+  assert.equal(reviewValues.length, 2);
+  assert.equal(reviewPrompt.getAttribute("lang"), "en");
+  assert.deepEqual(
+    reviewValues.map((node) => node.getAttribute("lang")),
+    ["en", "en"]
+  );
+  assert.deepEqual(
+    reviewTerms.map((node) => node.getAttribute("lang")),
+    [null, null]
+  );
+});
+
+test("completion review content that looks like markup stays inert text", async () => {
+  const markup = '<img src="x" onerror="window.reviewInjected=true">';
+  const context = await boot({
+    types: ["multiple_choice", "true_false"],
+    summaryOverrides: {
+      components: [
+        {
+          component_id: "component-0",
+          component_type: "multiple_choice",
+          graded: true,
+          correct: false,
+          score: 0,
+          max_score: 1,
+          feedback: null,
+          answer_review: { prompt: markup, submitted: markup, correct: markup },
+        },
+        {
+          component_id: "component-1",
+          component_type: "true_false",
+          graded: true,
+          correct: true,
+          score: 1,
+          max_score: 1,
+          feedback: null,
+        },
+      ],
+    },
+  });
+
+  await answerCurrent(context);
+  await answerCurrent(context);
+
+  assert.match(cardOf(context.win).textContent, /<img src=/);
+  assert.equal(context.win.reviewInjected, undefined);
+  assert.equal(
+    cardOf(context.win)
+      .all()
+      .filter((node) => node.tagName === "img").length,
+    0
+  );
+});
+
 test("the completion screen adds a short feedback paragraph under the score", async () => {
   const context = await boot({ types: ["multiple_choice", "true_false", "short_answer"] });
 

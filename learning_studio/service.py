@@ -2429,6 +2429,12 @@ def _experience_payload(row: sqlite3.Row, components: list[sqlite3.Row]) -> dict
 #: other type's answer key are not here and cannot be requested.
 REVEALABLE_ANSWER_FIELDS: dict[str, str] = {"flashcard": "back"}
 
+#: Component types whose answer key may be projected into a completed Mini App
+#: session. This is deliberately a positive allowlist rather than "everything
+#: graded": each entry promises that both sides can be reduced to learner-visible
+#: text without exposing an evaluator structure or inventing one canonical answer.
+COMPLETION_REVIEW_TYPES = frozenset({"multiple_choice"})
+
 #: Version of the identifier-aliasing scheme a stored component was prepared
 #: under. Recorded per component rather than per database so mapping-only legacy
 #: experiences remain explicitly compatible, while inventory-only scheme 2 is
@@ -2690,67 +2696,13 @@ def _proved(
     return ComponentAliases(AliasState.ALIASED, mapping)
 
 
-def component_aliases(
+def _component_aliases_from_row(
+    row: sqlite3.Row,
     *,
-    principal: Principal,
-    experience_id: str,
-    component_key: str,
-    config: LearningStudioConfig | None = None,
+    learner_id: str,
+    profile: str,
 ) -> ComponentAliases:
-    """How to read one component's learner-facing identifiers.
-
-    Scoped in SQL by profile, learner, experience, and component key, exactly like
-    every other learner-owned read — so a session for one experience cannot obtain
-    the mapping for another, and a component belonging to somebody else is
-    indistinguishable from one that does not exist.
-
-    Returns only the state and the mapping. The row it comes from also holds the
-    answer, the rubric, the hints and the branching; none of that leaves here.
-    """
-    config = config or load_config()
-    profile = principal.profile
-
-    storage.initialize(config)
-    with storage.connect(config) as conn:
-        learner_id = _find_learner(conn, principal)
-        if learner_id is None:
-            return ComponentAliases(AliasState.UNRESOLVED)
-
-        row = conn.execute(
-            # The learner payload comes back too: the aliases a response may name
-            # are the ones *served*, and reading them from the payload rather than
-            # from the mapping is what makes coverage a real check instead of the
-            # mapping agreeing with itself.
-            "SELECT e.evaluation, c.id AS stored_component_id, c.experience_id,"
-            " c.component_key, c.component_type, c.learner_payload,"
-            " b.binding_scheme, b.binding_digest"
-            "  FROM experience_components AS c"
-            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
-            "  LEFT JOIN experience_component_alias_bindings AS b"
-            "    ON b.component_id = c.id"
-            "   AND b.experience_id = c.experience_id"
-            "   AND b.profile_id = c.profile_id"
-            "   AND b.learner_id = c.learner_id"
-            " WHERE c.experience_id = ? AND c.component_key = ?"
-            "   AND c.profile_id = ? AND c.learner_id = ?"
-            "   AND e.profile_id = ? AND e.learner_id = ?",
-            (
-                str(experience_id),
-                str(component_key),
-                profile,
-                learner_id,
-                profile,
-                learner_id,
-            ),
-        ).fetchone()
-
-    if row is None:
-        # No evaluator row for this component. That may mean a component with
-        # nothing to hide, a row that was never written, or a component that is
-        # not this learner's. None of those is evidence that the payload names
-        # canonical identifiers, so none of them earns identity translation.
-        return ComponentAliases(AliasState.UNRESOLVED)
-
+    """Prove alias provenance from one owner-scoped component snapshot."""
     try:
         stored = json.loads(str(row["evaluation"]))
     except ValueError:
@@ -2811,6 +2763,69 @@ def component_aliases(
     return ComponentAliases(AliasState.UNRESOLVED)
 
 
+def component_aliases(
+    *,
+    principal: Principal,
+    experience_id: str,
+    component_key: str,
+    config: LearningStudioConfig | None = None,
+) -> ComponentAliases:
+    """How to read one component's learner-facing identifiers.
+
+    Scoped in SQL by profile, learner, experience, and component key, exactly like
+    every other learner-owned read — so a session for one experience cannot obtain
+    the mapping for another, and a component belonging to somebody else is
+    indistinguishable from one that does not exist.
+
+    Returns only the state and the mapping. The row it comes from also holds the
+    answer, the rubric, the hints and the branching; none of that leaves here.
+    """
+    config = config or load_config()
+    profile = principal.profile
+
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            return ComponentAliases(AliasState.UNRESOLVED)
+
+        row = conn.execute(
+            # The learner payload comes back too: the aliases a response may name
+            # are the ones *served*, and reading them from the payload rather than
+            # from the mapping is what makes coverage a real check instead of the
+            # mapping agreeing with itself.
+            "SELECT e.evaluation, c.id AS stored_component_id, c.experience_id,"
+            " c.component_key, c.component_type, c.learner_payload,"
+            " b.binding_scheme, b.binding_digest"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            "  LEFT JOIN experience_component_alias_bindings AS b"
+            "    ON b.component_id = c.id"
+            "   AND b.experience_id = c.experience_id"
+            "   AND b.profile_id = c.profile_id"
+            "   AND b.learner_id = c.learner_id"
+            " WHERE c.experience_id = ? AND c.component_key = ?"
+            "   AND c.profile_id = ? AND c.learner_id = ?"
+            "   AND e.profile_id = ? AND e.learner_id = ?",
+            (
+                str(experience_id),
+                str(component_key),
+                profile,
+                learner_id,
+                profile,
+                learner_id,
+            ),
+        ).fetchone()
+
+    if row is None:
+        # No evaluator row for this component. That may mean a component with
+        # nothing to hide, a row that was never written, or a component that is
+        # not this learner's. None of those is evidence that the payload names
+        # canonical identifiers, so none of them earns identity translation.
+        return ComponentAliases(AliasState.UNRESOLVED)
+    return _component_aliases_from_row(row, learner_id=learner_id, profile=profile)
+
+
 def reveal_component_answer(
     *,
     principal: Principal,
@@ -2869,6 +2884,127 @@ def reveal_component_answer(
     if not isinstance(value, str) or not value:
         raise NotFoundError(NOT_REVEALABLE_MESSAGE)
     return value
+
+
+def completion_answer_review(
+    *,
+    principal: Principal,
+    experience_id: str,
+    component_key: str,
+    response: Any,
+    config: LearningStudioConfig | None = None,
+) -> dict[str, str] | None:
+    """Project one completed wrong answer into learner-visible text, or omit it.
+
+    This is a completion-only building block for the authenticated Mini App. It
+    returns three strings and has no path that returns the stored evaluator,
+    aliases, identifiers, hints, rubric, branching, or feedback. Callers still
+    decide whether the scored result is incorrect before including the projection.
+
+    Identifier-bearing components require the current, independently proved alias
+    binding (or a positively identified canonical legacy row). The weaker
+    mapping-only compatibility state is sufficient to *grade* old attempts, but
+    not to disclose an answer label: a mapping whose canonical targets were never
+    recorded cannot prove which learner-visible label names the expected answer.
+    """
+    if not isinstance(response, dict):
+        return None
+    submitted = response.get("option_id")
+    if not isinstance(submitted, str) or not submitted:
+        return None
+
+    config = config or load_config()
+    profile = principal.profile
+    storage.initialize(config)
+    with storage.connect(config) as conn:
+        learner_id = _find_learner(conn, principal)
+        if learner_id is None:
+            return None
+        row = conn.execute(
+            "SELECT e.evaluation, c.id AS stored_component_id, c.experience_id,"
+            " c.component_key, c.component_type, c.learner_payload,"
+            " b.binding_scheme, b.binding_digest"
+            "  FROM experience_components AS c"
+            "  JOIN experience_component_evaluations AS e ON e.component_id = c.id"
+            "  LEFT JOIN experience_component_alias_bindings AS b"
+            "    ON b.component_id = c.id"
+            "   AND b.experience_id = c.experience_id"
+            "   AND b.profile_id = c.profile_id"
+            "   AND b.learner_id = c.learner_id"
+            " WHERE c.experience_id = ? AND c.component_key = ?"
+            "   AND c.profile_id = ? AND c.learner_id = ?"
+            "   AND e.profile_id = ? AND e.learner_id = ?",
+            (
+                str(experience_id),
+                str(component_key),
+                profile,
+                learner_id,
+                profile,
+                learner_id,
+            ),
+        ).fetchone()
+    if row is None or str(row["component_type"]) not in COMPLETION_REVIEW_TYPES:
+        return None
+
+    aliases = _component_aliases_from_row(row, learner_id=learner_id, profile=profile)
+    if aliases.state not in {AliasState.ALIASED, AliasState.CANONICAL}:
+        return None
+
+    try:
+        payload = json.loads(str(row["learner_payload"]))
+        hidden = json.loads(str(row["evaluation"]))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(hidden, dict):
+        return None
+
+    answer = hidden.get("answer")
+    expected = answer.get("option_id") if isinstance(answer, dict) else None
+    if not isinstance(expected, str) or not expected or submitted == expected:
+        return None
+
+    if aliases.state is AliasState.CANONICAL:
+        submitted_id = submitted
+        expected_id = expected
+    else:
+        inverse = {canonical: alias for alias, canonical in aliases.mapping.items()}
+        if len(inverse) != len(aliases.mapping):
+            return None
+        submitted_id = inverse.get(submitted)
+        expected_id = inverse.get(expected)
+        if submitted_id is None or expected_id is None:
+            return None
+
+    content = payload.get("content")
+    options = content.get("options") if isinstance(content, dict) else None
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt or not isinstance(options, list):
+        return None
+
+    labels: dict[str, str] = {}
+    for option in options:
+        if not isinstance(option, dict):
+            return None
+        option_id = option.get("id")
+        text = option.get("text")
+        if not isinstance(option_id, str) or not isinstance(text, str) or not text:
+            return None
+        if option_id in labels:
+            return None
+        labels[option_id] = text
+
+    submitted_text = labels.get(submitted_id)
+    expected_text = labels.get(expected_id)
+    if submitted_text is None or expected_text is None:
+        return None
+    # Distinct options may still read alike: validation requires unique option
+    # IDs, never unique text. "You chose X, the answer is X" is a contradiction
+    # for a sighted reader and worse for a screen reader, and disambiguating it
+    # would mean showing the identifiers this projection exists to withhold. So
+    # the review is dropped; the item is still reported, still incorrect.
+    if submitted_text == expected_text:
+        return None
+    return {"prompt": prompt, "submitted": submitted_text, "correct": expected_text}
 
 
 # ── Managed asset delivery ────────────────────────────────────────────────

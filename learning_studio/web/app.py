@@ -23,7 +23,7 @@ allowlist, optionally narrowed by this plugin's configuration. No allowlist
 means nobody, an unreadable configuration means nobody, and a group launch
 means nobody.
 
-**Nothing hidden leaves except one string, deliberately.** Every route that
+**Nothing hidden leaves except narrow, deliberate projections.** Every route that
 serves a component serves the stored *learner payload*, which was constructed
 from an allowlist when the experience was prepared and never contained an answer
 key, rubric, hint, or branch in the first place.
@@ -40,14 +40,16 @@ reveal is granted only after an attempt has been committed, and that attempt is
 frozen — so reading the answer and then improving the recall is refused rather
 than merely discouraged.
 
-The other, new with this PR, is ``GET /api/session/summary``: once a session
-is complete it scores every answered component and returns a summary — overall
-score, per-component correct/incorrect, and the stored ``feedback`` text for
-*that* outcome, never the answer key, rubric, or another component's feedback.
-Scoring is computed once per session and cached on it, so a refreshed or
-backgrounded webview sees the same result rather than a second scoring pass
-that could disagree with the first or write a second durable attempt. See
-:func:`learning_studio.service.record_attempt`.
+The second exception is ``GET /api/session/summary``: once the whole session is
+complete it scores every answered component and returns overall score,
+per-component correct/incorrect, and the stored ``feedback`` for *that* outcome.
+For an incorrect ``multiple_choice`` only, it may also project the prompt and the
+visible labels for the selected and accepted options. The service re-authorises
+ownership and verifies alias provenance; the web layer cannot request an
+evaluator field. Scoring and that projection are computed once per session and
+cached on it, so a refreshed or backgrounded webview sees the same result rather
+than a second scoring pass that could disagree or write a second durable attempt.
+See :func:`learning_studio.service.record_attempt`.
 
 **Errors say little.** A missing experience, one belonging to another learner,
 and one belonging to another profile are the same 404. An invalid session, an
@@ -58,10 +60,12 @@ The interface this API serves lives in ``static/`` and is described in
 :mod:`learning_studio.web.static_files`; the shell is served from here, from a
 closed allowlist of files.
 
-What this still deliberately does not do: return a learner's own submitted
-text back to them, or accept a rubric-graded criterion selection from a
-client. Scoring is summary-level only, and open-ended rubric responses are
-recorded as attempted but not machine-graded — see
+What this still deliberately does not do: return a learner's free-text response,
+the answer object, a rubric, a hint, a branch, or another component's feedback;
+nor does it accept a rubric-graded criterion selection from a client. The one
+submitted response it projects is an already-visible option label in the bounded
+completed web session. Durable attempts and agent tools remain answer-free.
+Open-ended rubric responses are recorded as attempted but not machine-graded — see
 :mod:`learning_studio.evaluation` for why that is a design choice and not an
 omission.
 """
@@ -737,13 +741,33 @@ def create_app(dependencies: Dependencies | None = None):
             raise ApiError(409, NOT_FINISHED, reason="not_completed")
 
         def compute() -> dict[str, Any]:
-            return deps.record_attempt(
-                deps.principal(verified.user_id),
+            principal = deps.principal(verified.user_id)
+            reviews = {
+                component_id: review
+                for component_id, response in session.answers.items()
+                if (
+                    review := deps.completion_answer_review(
+                        principal=principal,
+                        experience_id=session.scope.experience_id,
+                        component_key=component_id,
+                        response=response,
+                    )
+                )
+                is not None
+            }
+            attempt = deps.record_attempt(
+                principal,
                 session.scope.experience_id,
                 dict(session.answers),
                 _iso(session.created_at),
                 _iso(session.completed_at),
             )
+            for component in attempt["components"]:
+                if component.get("correct") is False:
+                    review = reviews.get(component.get("component_id"))
+                    if review is not None:
+                        component["answer_review"] = review
+            return attempt
 
         try:
             result = session.freeze_attempt_result(compute)
