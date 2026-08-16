@@ -34,10 +34,11 @@ One launch, one session
 -----------------------
 
 A grant has at most one *live* session at a time, and re-admission is how a
-reload works: the new session inherits the position, answers, and reveals of
-the one it replaces, and the replaced one is expired on the spot. So there is
-never a second token that still works, progress never restarts, and the
-question "which session is this launch?" always has one answer.
+reload works: the new session inherits the position, answers, reveals,
+completion, and cached scored result of the one it replaces, and the replaced
+one is expired on the spot. So there is never a second token that still works,
+progress never restarts, and the question "which session is this launch?"
+always has one answer.
 
 That matters more than it sounds. Without it, two ``POST /api/session`` calls
 minted two live tokens, the grant's pointer named only the newer, and revoking
@@ -46,10 +47,10 @@ the launch left the older one working.
 What a grant is not
 -------------------
 
-It is not a record of performance. It holds the session so a launch can be
-*reported on* honestly — opened or not, how far through, finished or not — and
-that is the whole of it. Nothing here is written to disk, nothing survives the
-process, and nothing is scored.
+It is not the durable record of performance. It holds the session so a launch
+can be *reported on* honestly — opened or not, how far through, finished or
+not — and can retain an already-scored result across a reload. Nothing here is
+written to disk, nothing survives the process, and scoring happens elsewhere.
 """
 
 from __future__ import annotations
