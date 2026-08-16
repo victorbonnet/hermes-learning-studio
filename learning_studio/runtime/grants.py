@@ -34,10 +34,11 @@ One launch, one session
 -----------------------
 
 A grant has at most one *live* session at a time, and re-admission is how a
-reload works: the new session inherits the position, answers, and reveals of
-the one it replaces, and the replaced one is expired on the spot. So there is
-never a second token that still works, progress never restarts, and the
-question "which session is this launch?" always has one answer.
+reload works: the new session inherits the position, answers, reveals,
+completion, and cached scored result of the one it replaces, and the replaced
+one is expired on the spot. So there is never a second token that still works,
+progress never restarts, and the question "which session is this launch?"
+always has one answer.
 
 That matters more than it sounds. Without it, two ``POST /api/session`` calls
 minted two live tokens, the grant's pointer named only the newer, and revoking
@@ -46,10 +47,10 @@ the launch left the older one working.
 What a grant is not
 -------------------
 
-It is not a record of performance. It holds the session so a launch can be
-*reported on* honestly — opened or not, how far through, finished or not — and
-that is the whole of it. Nothing here is written to disk, nothing survives the
-process, and nothing is scored.
+It is not the durable record of performance. It holds the session so a launch
+can be *reported on* honestly — opened or not, how far through, finished or
+not — and can retain an already-scored result across a reload. Nothing here is
+written to disk, nothing survives the process, and scoring happens elsewhere.
 """
 
 from __future__ import annotations
@@ -523,11 +524,17 @@ def _carry_forward(previous: Any, session: Any) -> None:
     Without this, a reload would hand back a token that works and an exercise
     that has forgotten them — which is a worse failure than the parallel
     sessions it replaces, because it silently discards work.
+
+    The scored result comes with the completion that produced it. Carrying one
+    without the other left the replacement *finished but unscored*: finished
+    enough for the completion screen to accept it, unscored enough to compute
+    the attempt again — and a second durable record for one learner session.
     """
     session.position = getattr(previous, "position", 0)
     session.answers = dict(getattr(previous, "answers", {}) or {})
     session.revealed = dict(getattr(previous, "revealed", {}) or {})
     session.completed_at = getattr(previous, "completed_at", None)
+    session.attempt_result = getattr(previous, "attempt_result", None)
 
 
 def _identifier(raw: Any, label: str) -> str:

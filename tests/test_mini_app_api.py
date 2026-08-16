@@ -2253,6 +2253,37 @@ def test_a_reload_resumes_where_the_learner_was(launched):
     assert reopened.json()["progress"]["answered"] == 1
 
 
+def test_a_reload_after_scoring_reuses_the_attempt_already_recorded(launched):
+    """A finished, scored launch reopened once more must not score twice.
+
+    The replacement session inherits completion, so its first summary request
+    passes the "are you finished?" gate — and without the scored result coming
+    with it, that request recomputes and writes a second durable attempt for
+    one learner session.
+    """
+    dependencies, launch_id, _grants = launched
+
+    with _client(dependencies) as client:
+        token = client.post("/api/session", headers=auth(), json={"launch_id": launch_id}).json()[
+            "session_token"
+        ]
+        complete_exercise(client, token)
+        first = client.get("/api/session/summary", headers=session_headers(token))
+        assert first.status_code == 200, first.text
+
+        resumed = client.post("/api/session", headers=auth(), json={"launch_id": launch_id})
+        assert resumed.status_code == 201, resumed.text
+        resumed_token = resumed.json()["session_token"]
+
+        again = client.get("/api/session/summary", headers=session_headers(resumed_token))
+
+    assert again.status_code == 200, again.text
+    assert again.json()["attempt_id"] == first.json()["attempt_id"]
+    with service.storage.connect() as conn:
+        count = conn.execute("SELECT COUNT(*) AS n FROM attempts").fetchone()["n"]
+    assert count == 1
+
+
 def test_revoking_the_launch_kills_the_open_session(launched):
     dependencies, launch_id, grants = launched
 

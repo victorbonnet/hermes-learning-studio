@@ -126,6 +126,34 @@ def test_progress_never_regresses_across_a_reload(store, sessions):
     assert second.completed is True
 
 
+def test_a_scored_session_carries_its_result_across_a_reload(store, sessions):
+    """Completion without the result it produced is a session scored twice.
+
+    The replacement inherits ``completed_at``, so it is finished as far as the
+    summary route is concerned; leaving ``attempt_result`` behind makes that
+    route recompute and record a second durable attempt for one session.
+    """
+    grant = granted(store)
+    _, first = open_session(store, sessions, grant)
+    first.position = 3
+    first.completed_at = 1234.0
+    first.attempt_result = {"attempt_id": "attempt-1"}
+
+    _, second = open_session(store, sessions, grant)
+
+    assert second.attempt_result == {"attempt_id": "attempt-1"}
+
+
+def test_an_unscored_session_resumes_without_inventing_a_result(store, sessions):
+    grant = granted(store)
+    _, first = open_session(store, sessions, grant)
+    first.position = 1
+
+    _, second = open_session(store, sessions, grant)
+
+    assert second.attempt_result is None
+
+
 def test_concurrent_opens_leave_exactly_one_live_session(store, sessions, clock):
     """A double tap, or a webview that retries. Only one may end up live."""
     grant = granted(store)
