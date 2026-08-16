@@ -523,11 +523,17 @@ def _carry_forward(previous: Any, session: Any) -> None:
     Without this, a reload would hand back a token that works and an exercise
     that has forgotten them — which is a worse failure than the parallel
     sessions it replaces, because it silently discards work.
+
+    The scored result comes with the completion that produced it. Carrying one
+    without the other left the replacement *finished but unscored*: finished
+    enough for the completion screen to accept it, unscored enough to compute
+    the attempt again — and a second durable record for one learner session.
     """
     session.position = getattr(previous, "position", 0)
     session.answers = dict(getattr(previous, "answers", {}) or {})
     session.revealed = dict(getattr(previous, "revealed", {}) or {})
     session.completed_at = getattr(previous, "completed_at", None)
+    session.attempt_result = getattr(previous, "attempt_result", None)
 
 
 def _identifier(raw: Any, label: str) -> str:
