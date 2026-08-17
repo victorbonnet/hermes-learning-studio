@@ -12,7 +12,13 @@ import threading
 import pytest
 
 from learning_studio.runtime import grants as grants_module
-from learning_studio.sessions import SessionScope, SessionStore
+from learning_studio.sessions import (
+    SessionError,
+    SessionScope,
+    SessionStep,
+    SessionStore,
+    SessionTransitionError,
+)
 
 
 class Clock:
@@ -65,10 +71,39 @@ def granted(store, *, user: str = "1001", experience: str = "exp-1"):
     return store.admit(launch_id=created["launch_id"], telegram_user_id=user)
 
 
-def open_session(store, sessions, grant, *, user: str = "1001", experience: str = "exp-1"):
-    return store.admit_session(
-        grant, lambda: sessions.create(scope(user, experience), component_count=3)
+def plan(count: int = 3, *, reveal: tuple[str, ...] = ()) -> tuple[SessionStep, ...]:
+    """The ordered steps of a ``count``-component exercise: ``c-1`` … ``c-n``."""
+    return tuple(
+        SessionStep(component_id=f"c-{index}", reveal_required=f"c-{index}" in reveal)
+        for index in range(1, count + 1)
     )
+
+
+def open_session(
+    store,
+    sessions,
+    grant,
+    *,
+    user: str = "1001",
+    experience: str = "exp-1",
+    steps: tuple[SessionStep, ...] | None = None,
+):
+    ordered = plan() if steps is None else steps
+    return store.admit_session(
+        grant, lambda: sessions.create(scope(user, experience), steps=ordered)
+    )
+
+
+def answer(session, count: int = 1, *, now: float = 1000.0) -> None:
+    """Walk a session forward by ``count`` components, through its own interface.
+
+    Assigning ``position`` and ``answers`` — which is what these tests used to
+    do — asserts against a state no learner could actually have reached, and
+    would keep passing if the session stopped enforcing how one is reached.
+    """
+    for _ in range(count):
+        step = session.steps[session.position]
+        session.record_answer(step.component_id, {"value": True}, now=now)
 
 
 # ── Exactly one live session ──────────────────────────────────────────────
@@ -102,56 +137,139 @@ def test_the_replaced_token_stops_working_immediately(store, sessions, clock):
 def test_reopening_resumes_rather_than_restarts(store, sessions):
     """A webview reload must not discard what the learner has already done."""
     grant = granted(store)
-    _, first = open_session(store, sessions, grant)
-    first.position = 2
-    first.answers = {"q-one": {"a": 1}, "q-two": {"a": 2}}
-    first.revealed = {"q-one": "my recall"}
+    steps = plan(3, reveal=("c-1",))
+    _, first = open_session(store, sessions, grant, steps=steps)
+    first.reveal("c-1", "my recall", lambda: "the back")
+    first.record_answer("c-1", {"text": "my recall", "self_rating": "good"}, now=1000.0)
+    first.record_answer("c-2", {"a": 2}, now=1000.0)
 
-    _, second = open_session(store, sessions, grant)
+    _, second = open_session(store, sessions, grant, steps=steps)
 
     assert second.position == 2
-    assert set(second.answers) == {"q-one", "q-two"}
-    assert second.revealed == {"q-one": "my recall"}
+    assert set(second.responses) == {"c-1", "c-2"}
+    assert second.revealed_attempts == {"c-1": "my recall"}
 
 
 def test_progress_never_regresses_across_a_reload(store, sessions):
     grant = granted(store)
     _, first = open_session(store, sessions, grant)
-    first.position = 3
-    first.completed_at = 1234.0
+    answer(first, 3, now=1234.0)
 
     _, second = open_session(store, sessions, grant)
 
     assert second.position == 3
     assert second.completed is True
+    assert second.completed_at == 1234.0
 
 
 def test_a_scored_session_carries_its_result_across_a_reload(store, sessions):
     """Completion without the result it produced is a session scored twice.
 
-    The replacement inherits ``completed_at``, so it is finished as far as the
-    summary route is concerned; leaving ``attempt_result`` behind makes that
-    route recompute and record a second durable attempt for one session.
+    The replacement inherits the completion timestamp, so it is finished as far
+    as the summary route is concerned; leaving the cached result behind makes
+    that route recompute and record a second durable attempt for one session.
     """
     grant = granted(store)
     _, first = open_session(store, sessions, grant)
-    first.position = 3
-    first.completed_at = 1234.0
-    first.attempt_result = {"attempt_id": "attempt-1"}
+    answer(first, 3, now=1234.0)
+    first.score_once(lambda completion: {"attempt_id": "attempt-1"})
 
     _, second = open_session(store, sessions, grant)
 
-    assert second.attempt_result == {"attempt_id": "attempt-1"}
+    assert second.scored is True
+    assert second.score_once(lambda completion: pytest.fail("scored twice")) == {
+        "attempt_id": "attempt-1"
+    }
+
+
+def test_capacity_eviction_resumes_scored_state_instead_of_starting_a_second_attempt(store, clock):
+    sessions = SessionStore(ttl_seconds=1800, max_sessions=1, clock=clock)
+    first_grant = granted(store, user="1001", experience="exp-1")
+    first_token, first = open_session(store, sessions, first_grant)
+    answer(first, 3, now=clock.now)
+    first.score_once(lambda completion: {"attempt_id": "attempt-1"})
+
+    second_grant = granted(store, user="2002", experience="exp-2")
+    open_session(store, sessions, second_grant, user="2002", experience="exp-2")
+    assert first.expired(clock.now), "capacity did not retire the old bearer token"
+
+    replacement_token, replacement = open_session(store, sessions, first_grant)
+
+    assert replacement_token != first_token
+    assert replacement.progress == first.progress
+    assert replacement.score_once(lambda completion: pytest.fail("scored twice")) == {
+        "attempt_id": "attempt-1"
+    }
+
+
+def test_capacity_eviction_never_extends_the_original_session_deadline(store, clock):
+    sessions = SessionStore(ttl_seconds=60, max_sessions=1, clock=clock)
+    first_grant = granted(store, user="1001", experience="exp-1")
+    first_token, first = open_session(store, sessions, first_grant)
+    first.record_answer("c-1", {"value": True}, now=clock.now)
+
+    other_grant = granted(store, user="1002", experience="exp-2")
+    open_session(store, sessions, other_grant)
+    clock.advance(61)
+
+    replacement_token, replacement = open_session(store, sessions, first_grant)
+
+    with pytest.raises(SessionError):
+        sessions.resolve(first_token, profile="default", telegram_user_id="1001")
+    assert replacement_token != first_token
+    assert replacement.progress["position"] == 0
+    assert replacement.responses == {}
+
+
+def test_capacity_retained_state_survives_the_shorter_launch_invitation(clock):
+    store = grants_module.GrantStore(profile="default", generation=1, clock=clock, ttl_seconds=60)
+    sessions = SessionStore(ttl_seconds=120, max_sessions=1, clock=clock)
+    first_grant = granted(store, user="1001", experience="exp-1")
+    assert first_grant is not None
+    _, first = open_session(store, sessions, first_grant)
+    first.record_answer("c-1", {"value": True}, now=clock.now)
+
+    other_grant = granted(store, user="1002", experience="exp-2")
+    assert other_grant is not None
+    open_session(store, sessions, other_grant)
+    clock.advance(61)
+
+    admitted = store.admit(launch_id=first_grant.launch_id, telegram_user_id="1001")
+    assert admitted is first_grant
+    _, replacement = open_session(store, sessions, admitted)
+    assert replacement.progress["position"] == 1
+    assert replacement.responses == {"c-1": {"value": True}}
+
+
+def test_an_evicted_predecessor_cannot_score_after_its_state_was_transferred(store, clock):
+    sessions = SessionStore(ttl_seconds=1800, max_sessions=1, clock=clock)
+    first_grant = granted(store, user="1001", experience="exp-1")
+    _, first = open_session(store, sessions, first_grant)
+    answer(first, 3, now=clock.now)
+
+    second_grant = granted(store, user="2002", experience="exp-2")
+    open_session(store, sessions, second_grant, user="2002", experience="exp-2")
+    _, replacement = open_session(store, sessions, first_grant)
+    callbacks = []
+
+    with pytest.raises(SessionTransitionError) as caught:
+        first.score_once(lambda completion: callbacks.append("retired") or {"attempt_id": "old"})
+
+    assert caught.value.reason == "session_retired"
+    assert replacement.score_once(
+        lambda completion: callbacks.append("replacement") or {"attempt_id": "attempt-1"}
+    ) == {"attempt_id": "attempt-1"}
+    assert callbacks == ["replacement"]
 
 
 def test_an_unscored_session_resumes_without_inventing_a_result(store, sessions):
     grant = granted(store)
     _, first = open_session(store, sessions, grant)
-    first.position = 1
+    answer(first, 1)
 
     _, second = open_session(store, sessions, grant)
 
-    assert second.attempt_result is None
+    assert second.scored is False
 
 
 def test_concurrent_opens_leave_exactly_one_live_session(store, sessions, clock):
@@ -247,7 +365,7 @@ def test_progress_selects_the_open_launch_not_the_first_inserted(store, sessions
     clock.advance(grants_module.DEFAULT_GRANT_TTL_SECONDS + 1)
     current = granted(store)
     _, session = open_session(store, sessions, current)
-    session.position = 2
+    answer(session, 2)
 
     reported = store.progress({"telegram_user_id": "1001", "experience_id": "exp-1"})
 
@@ -264,7 +382,7 @@ def test_capacity_refuses_rather_than_orphaning_an_active_session(clock, session
     store = grants_module.GrantStore(profile="default", generation=1, clock=clock, max_grants=1)
     busy = granted(store, user="1001")
     _, session = open_session(store, sessions, busy, user="1001")
-    session.position = 2
+    answer(session, 2)
 
     with pytest.raises(grants_module.GrantCapacityError):
         store.create(
@@ -435,8 +553,10 @@ def test_an_expired_session_does_not_keep_a_grant_alive_for_ever(store, sessions
 def test_progress_stops_being_reported_when_the_session_runs_out(store, sessions, clock):
     """A learner's position must not outlive the thing that bounds it."""
     grant = granted(store)
-    open_session(store, sessions, grant)
-    grant.session.position = 3
+    # Five steps, three answered: far enough in to have a position worth
+    # reporting, and not so far that the launch reads as completed instead.
+    open_session(store, sessions, grant, steps=plan(5))
+    answer(grant.session, 3)
 
     live = store.progress({"telegram_user_id": "1001", "experience_id": "exp-1"})
     assert live["position"] == 3
@@ -455,8 +575,7 @@ def test_expired_session_state_is_not_carried_into_a_fresh_session(clock):
     sessions = SessionStore(clock=clock, ttl_seconds=60, max_sessions=50)
     grant = granted(store)
     _, old = open_session(store, sessions, grant)
-    old.position = 2
-    old.answers = {"component": {"option_id": "x"}}
+    answer(old, 2)
 
     clock.advance(61)
     assert store.admit(launch_id=grant.launch_id, telegram_user_id="1001") is grant
@@ -464,4 +583,4 @@ def test_expired_session_state_is_not_carried_into_a_fresh_session(clock):
     assert opened is not None
     _, fresh = opened
     assert fresh.position == 0
-    assert fresh.answers == {}
+    assert fresh.responses == {}

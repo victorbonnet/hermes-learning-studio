@@ -1385,7 +1385,7 @@ def test_a_served_alias_is_accepted_and_stored_canonically(client, experience_id
     )
 
     assert accepted.status_code == 200
-    stored = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+    stored = next(iter(deps.sessions._sessions.values())).responses["q-one"]
     assert stored["option_id"] in canonical_ids
 
 
@@ -1426,11 +1426,11 @@ def session_state(deps):
     session = next(iter(deps.sessions._sessions.values()))
     return {
         "position": session.position,
-        "answered": len(session.answers),
-        "answers": dict(session.answers),
+        "answered": session.progress["answered"],
+        "answers": session.responses,
         "completed": session.completed,
         "completed_at": session.completed_at,
-        "revealed": dict(session.revealed),
+        "revealed": session.revealed_attempts,
     }
 
 
@@ -1487,7 +1487,7 @@ def test_a_current_scheme_with_a_complete_mapping_resolves(client, deps, experie
     )
 
     assert accepted.status_code == 200
-    stored = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+    stored = next(iter(deps.sessions._sessions.values())).responses["q-one"]
     assert stored["option_id"] in canonical
 
 
@@ -1577,7 +1577,7 @@ def test_a_previous_head_record_still_resolves_through_the_route(
     )
 
     assert accepted.status_code == 200
-    stored_answer = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+    stored_answer = next(iter(deps.sessions._sessions.values())).responses["q-one"]
     assert stored_answer["option_id"] in canonical
     assert stored_answer["option_id"] != served
 
@@ -1831,7 +1831,7 @@ def test_absent_legacy_scheme_resolves_but_explicit_null_is_refused(
         )
         canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
         assert accepted.status_code == 200
-        answer = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+        answer = next(iter(deps.sessions._sessions.values())).responses["q-one"]
         assert answer["option_id"] in canonical
     else:
         before = session_state(deps)
@@ -1994,7 +1994,7 @@ def test_a_valid_current_mapping_still_resolves_through_the_real_route(
     )
 
     assert accepted.status_code == 200
-    assert next(iter(deps.sessions._sessions.values())).answers["q-one"]["option_id"] in canonical
+    assert next(iter(deps.sessions._sessions.values())).responses["q-one"]["option_id"] in canonical
 
 
 @pytest.mark.parametrize("legacy_scheme", [1, 2])
@@ -2022,7 +2022,7 @@ def test_legacy_mapping_only_resolves_but_inventory_only_fails_closed(
         )
         canonical = {entry["id"] for entry in example("multiple_choice")["content"]["options"]}
         assert accepted.status_code == 200
-        answer = next(iter(deps.sessions._sessions.values())).answers["q-one"]
+        answer = next(iter(deps.sessions._sessions.values())).responses["q-one"]
         assert answer["option_id"] in canonical
     else:
         before = session_state(deps)

@@ -92,7 +92,7 @@ from ..service import (
     NotFoundError,
     ServiceError,
 )
-from ..sessions import SessionError, SessionScope
+from ..sessions import SessionError, SessionScope, SessionStep, SessionTransitionError
 from ..telegram_auth import InitDataError, verify_init_data
 from .dependencies import Dependencies, build_dependencies, user_log_reference
 from .security import (
@@ -174,6 +174,36 @@ class ApiError(Exception):
         self.message = message
         self.reason = reason
         self.headers = headers or {}
+
+
+#: Every move a session can refuse, and the answer this API has always given for
+#: it. The session decides *whether* a transition may happen; what a caller is
+#: told about it is decided here, once, so no route invents its own wording.
+_TRANSITION_ERRORS: dict[str, tuple[int, str]] = {
+    "already_complete": (409, "This exercise is already finished."),
+    "no_component": (409, "This exercise is already finished."),
+    "component_mismatch": (409, "That is not the current question."),
+    "type_not_revealable": (409, NOT_REVEALABLE),
+    "reveal_required": (409, REVEAL_REQUIRED),
+    "recall_changed_after_reveal": (409, RECALL_FROZEN),
+    "not_completed": (409, NOT_FINISHED),
+    "session_retired": (401, SESSION_REQUIRED),
+}
+
+#: A finished exercise has no card to turn over, and the reveal route has always
+#: logged that as "no component" rather than as a completed submission. The
+#: session states the fact; this renames it for the one route where it reads
+#: differently.
+_REVEAL_REASONS = {"already_complete": "no_component"}
+
+
+def _transition_error(
+    exc: SessionTransitionError, *, rename: dict[str, str] | None = None
+) -> ApiError:
+    """The HTTP answer to a refused session transition."""
+    reason = (rename or {}).get(exc.reason, exc.reason)
+    status, message = _TRANSITION_ERRORS[reason]
+    return ApiError(status, message, reason=reason)
 
 
 def create_app(dependencies: Dependencies | None = None):
@@ -484,7 +514,7 @@ def create_app(dependencies: Dependencies | None = None):
                     experience_id=str(experience["experience_id"]),
                     track_id=experience.get("track_id"),
                 ),
-                component_count=len(experience["components"]),
+                steps=_session_steps(experience),
                 auth_date=verified.auth_date,
             )
 
@@ -515,7 +545,7 @@ def create_app(dependencies: Dependencies | None = None):
                 "session_token": token,
                 "expires_in_seconds": int(session.expires_at - session.created_at),
                 "experience": _experience_summary(experience),
-                "progress": _progress(session),
+                "progress": session.progress,
                 # Told to the client rather than duplicated in it. These are the
                 # bounds a submission is actually judged against, and they are
                 # operator-tunable, so a frontend constant would eventually be a
@@ -535,7 +565,7 @@ def create_app(dependencies: Dependencies | None = None):
         experience = load_bundle(verified, session.scope.experience_id).experience
         return JSONResponse(
             {
-                "progress": _progress(session),
+                "progress": session.progress,
                 "component": _component_at(experience, session.position),
             }
         )
@@ -548,20 +578,31 @@ def create_app(dependencies: Dependencies | None = None):
         freely: accepting an arbitrary ID would let a caller walk the whole
         experience out of order, and the ID is checked rather than trusted so
         that a stale client cannot silently answer the wrong question.
+
+        That check belongs to the session, and this route asks for it *first* —
+        before it inspects the response at all — because refusing a stale
+        component before its payload is the order in which a caller has always
+        learned about the two kinds of mistake. The recording below asks again:
+        the session is the authority, not this sequence.
         """
         verified, session = authorise_session(request)
         payload = await json_body(request)
         experience = load_bundle(verified, session.scope.experience_id).experience
 
-        if session.completed:
-            raise ApiError(409, "This exercise is already finished.", reason="already_complete")
+        try:
+            step = session.require_current_step(payload.get("component_id"))
+        except SessionTransitionError as exc:
+            raise _transition_error(exc) from exc
 
+        # The response is checked against the component *as served*, so the
+        # served component and the session's step have to be the same one. They
+        # were built from this list, so they can only disagree if the stored
+        # exercise changed underneath a live session — in which case neither is
+        # trusted over the other.
         current = _component_at(experience, session.position)
         if current is None:
             raise ApiError(409, "This exercise is already finished.", reason="no_component")
-
-        claimed = payload.get("component_id")
-        if not isinstance(claimed, str) or claimed != current["component_id"]:
+        if current["component_id"] != step.component_id:
             raise ApiError(409, "That is not the current question.", reason="component_mismatch")
 
         try:
@@ -578,7 +619,7 @@ def create_app(dependencies: Dependencies | None = None):
         aliases = deps.component_aliases(
             deps.principal(verified.user_id),
             session.scope.experience_id,
-            current["component_id"],
+            step.component_id,
         )
         try:
             response = validate_component_response(
@@ -590,13 +631,14 @@ def create_app(dependencies: Dependencies | None = None):
         except ResponseContractError as exc:
             raise ApiError(400, INVALID_RESPONSE_MESSAGE, reason=exc.reason) from exc
 
-        if current["type"] in REVEALABLE_ANSWER_FIELDS:
-            _enforce_reveal_contract(session, current["component_id"], submitted)
-
-        session.answers[current["component_id"]] = response
-        session.position += 1
-        if session.position >= session.component_count:
-            session.completed_at = deps.now()
+        # Recording, advancing, the reveal contract, and the completion stamp are
+        # one transition, and it is the session's. A response this route accepted
+        # can still be refused here — an unturned card, a rewritten recall — and
+        # nothing moves when it is.
+        try:
+            progress = session.record_answer(step.component_id, response, now=deps.now())
+        except SessionTransitionError as exc:
+            raise _transition_error(exc) from exc
 
         log_request(
             event="answer_recorded",
@@ -608,9 +650,9 @@ def create_app(dependencies: Dependencies | None = None):
             {
                 "recorded": True,
                 "scored": False,
-                "progress": _progress(session),
+                "progress": progress,
                 "next_component": _component_at(experience, session.position),
-                "notice": FINISHED_NOTICE if session.completed else NOT_SCORED_NOTICE,
+                "notice": FINISHED_NOTICE if progress["completed"] else NOT_SCORED_NOTICE,
             }
         )
 
@@ -639,15 +681,17 @@ def create_app(dependencies: Dependencies | None = None):
         """
         verified, session = authorise_session(request)
         payload = await json_body(request)
-        experience = load_bundle(verified, session.scope.experience_id).experience
+        # Ownership is re-checked before anything can be disclosed, and keeps its
+        # own 404: an exercise that has gone away is not "a card with no back".
+        load_bundle(verified, session.scope.experience_id)
 
-        current = _component_at(experience, session.position)
-        if current is None or session.completed:
-            raise ApiError(409, "This exercise is already finished.", reason="no_component")
-
-        claimed = payload.get("component_id")
-        if not isinstance(claimed, str) or claimed != current["component_id"]:
-            raise ApiError(409, "That is not the current question.", reason="component_mismatch")
+        # Which card may be turned over is the session's answer, and it is asked
+        # before the attempt is read so that a finished or out-of-order request
+        # is refused as such rather than as a malformed one.
+        try:
+            step = session.require_current_step(payload.get("component_id"))
+        except SessionTransitionError as exc:
+            raise _transition_error(exc, rename=_REVEAL_REASONS) from exc
 
         attempt = payload.get("attempt")
         if not isinstance(attempt, str) or not attempt.strip():
@@ -659,26 +703,29 @@ def create_app(dependencies: Dependencies | None = None):
         except InvalidResponseValue as exc:
             raise ApiError(400, BAD_REQUEST, reason="attempt_invalid") from exc
 
-        # Retrieve *before* committing anything. Freezing first meant a card that
-        # could not be turned over — the wrong type, a transient failure reading
-        # the store — still recorded the attempt that bought the reveal, and the
-        # learner was then held to a recall they never got an answer for. Now a
-        # failed reveal changes nothing and the next attempt is the one that
-        # counts.
-        try:
-            back = deps.reveal_answer(
+        def disclose() -> str:
+            """The one authorised read of the evaluator-only half."""
+            return deps.reveal_answer(
                 deps.principal(verified.user_id),
                 session.scope.experience_id,
-                current["component_id"],
+                step.component_id,
             )
+
+        # The session orders these: it retrieves *before* it commits anything, and
+        # it refuses a card that has no back without asking the service at all.
+        # Freezing first meant a card that could not be turned over — the wrong
+        # type, a transient failure reading the store — still recorded the attempt
+        # that bought the reveal, and the learner was then held to a recall they
+        # never got an answer for. Now a failed reveal changes nothing and the next
+        # attempt is the one that counts.
+        try:
+            outcome = session.reveal(step.component_id, attempt, disclose)
         except NotFoundError as exc:
             raise ApiError(404, NOT_REVEALABLE, reason="nothing_to_reveal") from exc
         except ServiceError as exc:
             raise ApiError(409, NOT_REVEALABLE, reason="type_not_revealable") from exc
-
-        # Committed only now, and only once: a repeat keeps the first attempt, so
-        # a refresh is safe and a second try with a better recall is not.
-        frozen = session.freeze_attempt(current["component_id"], attempt)
+        except SessionTransitionError as exc:
+            raise _transition_error(exc, rename=_REVEAL_REASONS) from exc
 
         log_request(
             event="answer_revealed",
@@ -688,13 +735,13 @@ def create_app(dependencies: Dependencies | None = None):
         )
         return JSONResponse(
             {
-                "component_id": current["component_id"],
+                "component_id": step.component_id,
                 "revealed": True,
-                "back": back,
+                "back": outcome.back,
                 # Echoed so a client that lost its own copy — a refresh, a
                 # backgrounded webview — shows the attempt that actually counts
                 # rather than an empty box it would then try to submit.
-                "attempt": frozen,
+                "attempt": outcome.attempt,
                 "notice": NOT_SCORED_NOTICE,
             }
         )
@@ -708,14 +755,14 @@ def create_app(dependencies: Dependencies | None = None):
         """
         verified, session = authorise_session(request)
         experience = load_bundle(verified, session.scope.experience_id).experience
-        scored = session.attempt_result is not None
+        scored = session.scored
         return JSONResponse(
             {
                 "experience_id": session.scope.experience_id,
                 "title": experience["title"],
-                "progress": _progress(session),
+                "progress": session.progress,
                 "scored": scored,
-                "answered_components": sorted(session.answers),
+                "answered_components": list(session.answered_component_ids),
                 "notice": (
                     SCORED_NOTICE
                     if scored
@@ -735,16 +782,25 @@ def create_app(dependencies: Dependencies | None = None):
         (a refresh, a backgrounded webview resuming) returns the identical
         cached summary rather than scoring the session a second time or
         writing a second durable attempt.
+
+        Both rules — finished first, scored once — belong to the session, so
+        this route asks it rather than checking the completion itself and then
+        hoping the cache agrees.
         """
         verified, session = authorise_session(request)
-        if not session.completed:
-            raise ApiError(409, NOT_FINISHED, reason="not_completed")
 
-        def compute() -> dict[str, Any]:
+        def compute(completion) -> dict[str, Any]:
+            """Score the finished session from its snapshot, and persist it.
+
+            Everything read here comes from ``completion`` rather than from the
+            session: the responses are already a copy, so nothing below can write
+            back into the state it is scoring.
+            """
             principal = deps.principal(verified.user_id)
+            responses = completion.responses
             reviews = {
                 component_id: review
-                for component_id, response in session.answers.items()
+                for component_id, response in responses.items()
                 if (
                     review := deps.completion_answer_review(
                         principal=principal,
@@ -758,9 +814,9 @@ def create_app(dependencies: Dependencies | None = None):
             attempt = deps.record_attempt(
                 principal,
                 session.scope.experience_id,
-                dict(session.answers),
-                _iso(session.created_at),
-                _iso(session.completed_at),
+                dict(responses),
+                _iso(completion.created_at),
+                _iso(completion.completed_at),
             )
             for component in attempt["components"]:
                 if component.get("correct") is False:
@@ -770,7 +826,9 @@ def create_app(dependencies: Dependencies | None = None):
             return attempt
 
         try:
-            result = session.freeze_attempt_result(compute)
+            result = session.score_once(compute)
+        except SessionTransitionError as exc:
+            raise _transition_error(exc) from exc
         except NotFoundError as exc:
             raise ApiError(404, NOT_FOUND, reason="experience_not_found") from exc
         except ServiceError as exc:
@@ -885,31 +943,6 @@ def _identifier_resolver(aliases: ComponentAliases):
     return resolve
 
 
-def _enforce_reveal_contract(session, component_id: str, response: Any) -> None:
-    """A card whose answer can be shown may only be submitted after it was.
-
-    Two rules, and the second is the one that matters:
-
-    1. The card must have been turned over. Self-rating a recall you never
-       committed is not retrieval practice, and the component contract says the
-       reveal is part of the interaction rather than an optional extra.
-    2. The submitted recall must be the recall that bought the reveal. Without
-       this, the sequence "commit anything, read the answer, replace the recall
-       with the answer, rate yourself Easy" is available to any client — and it
-       would be invisible in the stored attempt.
-
-    Enforced here rather than in the frontend because the frontend is a
-    convenience; anybody can post to this route directly.
-    """
-    frozen = session.attempt_before_reveal(component_id)
-    if frozen is None:
-        raise ApiError(409, REVEAL_REQUIRED, reason="reveal_required")
-
-    submitted = response.get("text") if isinstance(response, dict) else None
-    if submitted != frozen:
-        raise ApiError(409, RECALL_FROZEN, reason="recall_changed_after_reveal")
-
-
 # ── Projections ──────────────────────────────────────────────────────────
 #
 # Every response body below is *constructed*, field by field, from the stored
@@ -944,13 +977,23 @@ def _component_at(experience: dict[str, Any], position: int) -> dict[str, Any] |
     }
 
 
-def _progress(session) -> dict[str, Any]:
-    return {
-        "position": session.position,
-        "component_count": session.component_count,
-        "answered": len(session.answers),
-        "completed": session.completed,
-    }
+def _session_steps(experience: dict[str, Any]) -> tuple[SessionStep, ...]:
+    """The ordered walk a session is minted over.
+
+    Built from the *learner-facing* component list, and from exactly two of its
+    fields: the identifier the learner was served, and whether the type is one
+    whose answer may ever be shown. No payload, no stored evaluator record, and
+    no lookup — so a session's plan cannot become a second place where hidden
+    content lives, and the reveal contract is decided from what was published
+    rather than from what a route remembered to check.
+    """
+    return tuple(
+        SessionStep(
+            component_id=component["component_id"],
+            reveal_required=component["type"] in REVEALABLE_ANSWER_FIELDS,
+        )
+        for component in experience["components"]
+    )
 
 
 def _iso(epoch_seconds: float | None) -> str:

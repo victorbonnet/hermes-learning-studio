@@ -86,6 +86,15 @@ _ID_BYTES = 18
 #: refuses anything else, and the frontend refuses to send anything else.
 LAUNCH_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{16,64}\Z")
 
+#: What a launch nobody is inside reports. Shaped like a session's own progress
+#: snapshot so that :meth:`GrantStore._describe` has one field list, not two.
+_NO_PROGRESS: dict[str, Any] = {
+    "position": 0,
+    "component_count": 0,
+    "answered": 0,
+    "completed": False,
+}
+
 
 class GrantError(ValueError):
     """The control payload was not a grant this runtime can create."""
@@ -161,6 +170,8 @@ class LaunchGrant:
         if self.revoked or not self.activated:
             return False
         if self.live_session(now) is not None:
+            return True
+        if _capacity_resumable(self.session):
             return True
         return not self.expired(now)
 
@@ -377,14 +388,25 @@ class GrantStore:
                 return None
             if not grant.admissible(now):
                 return None
-            # Never resurrect state after the hard session expiry.  The raw
-            # pointer intentionally outlives the token for truthful history,
-            # but only a live session may be resumed.
+            # Never resurrect state after the hard session expiry. Capacity
+            # eviction is different: it invalidates the bearer token to bound
+            # the token store, while this scoped grant still owns the resumable
+            # state and may copy it into one replacement.
             previous = grant.live_session(now)
+            if previous is None:
+                held = grant.session
+                if held is not None and bool(
+                    getattr(held, "resumable_after_capacity_eviction", False)
+                ):
+                    previous = held
             token, session = create()
             if previous is not None:
-                _carry_forward(previous, session)
-                _retire(previous)
+                # The replacement takes its predecessor's place over; *what* moves
+                # is the session's own answer, not a field list kept here. A store
+                # that copied the fields itself was a second definition of "what a
+                # learner's progress is", and it would go quietly out of date the
+                # moment the session grew one.
+                session.resume_from(previous)
             grant.session = session
             grant.sessions.append(session)
             return token, session
@@ -479,16 +501,21 @@ class GrantStore:
         # "position 3 of 10" indefinitely, which is a learner's activity
         # outliving the thing that was supposed to bound it.
         session = grant.live_session(now)
+        # Read as the session's own snapshot rather than assembled from its
+        # fields here. Counting the answers meant reaching into the mapping that
+        # holds them, and a store that reports on learners has no business
+        # holding what they wrote — even for a `len`.
+        progress = _NO_PROGRESS if session is None else session.progress
         return {
             "launch_id": grant.launch_id,
             "generation": grant.generation,
             "state": grant.state(now),
             "opened": grant.session is not None,
             "expires_in_seconds": max(0.0, grant.expires_at - now),
-            "position": int(getattr(session, "position", 0) or 0),
-            "component_count": int(getattr(session, "component_count", 0) or 0),
-            "answered": len(getattr(session, "answers", ()) or ()),
-            "completed": bool(getattr(session, "completed", False)),
+            "position": int(progress["position"]),
+            "component_count": int(progress["component_count"]),
+            "answered": int(progress["answered"]),
+            "completed": bool(progress["completed"]),
             # Stated in the payload rather than left to a reader's assumption.
             "scored": False,
         }
@@ -504,7 +531,14 @@ def _finished(grant: LaunchGrant, now: float) -> bool:
     session = grant.session
     if session is None:
         return False
-    return bool(session.expired(now)) and grant.expired(now)
+    return bool(session.expired(now)) and grant.expired(now) and not _capacity_resumable(session)
+
+
+def _capacity_resumable(session: Any | None) -> bool:
+    """Whether capacity retired this session before its own hard deadline."""
+    if session is None:
+        return False
+    return bool(getattr(session, "resumable_after_capacity_eviction", False))
 
 
 def _retire(session: Any) -> None:
@@ -514,27 +548,11 @@ def _retire(session: Any) -> None:
     checks it on every resolution, so the token stops working immediately
     wherever it is held.
     """
-    if getattr(session, "expires_at", None) is not None:
+    retire = getattr(session, "retire", None)
+    if callable(retire):
+        retire()
+    elif getattr(session, "expires_at", None) is not None:
         session.expires_at = 0.0
-
-
-def _carry_forward(previous: Any, session: Any) -> None:
-    """Move a learner's place in the exercise onto their new session.
-
-    Without this, a reload would hand back a token that works and an exercise
-    that has forgotten them — which is a worse failure than the parallel
-    sessions it replaces, because it silently discards work.
-
-    The scored result comes with the completion that produced it. Carrying one
-    without the other left the replacement *finished but unscored*: finished
-    enough for the completion screen to accept it, unscored enough to compute
-    the attempt again — and a second durable record for one learner session.
-    """
-    session.position = getattr(previous, "position", 0)
-    session.answers = dict(getattr(previous, "answers", {}) or {})
-    session.revealed = dict(getattr(previous, "revealed", {}) or {})
-    session.completed_at = getattr(previous, "completed_at", None)
-    session.attempt_result = getattr(previous, "attempt_result", None)
 
 
 def _identifier(raw: Any, label: str) -> str:
