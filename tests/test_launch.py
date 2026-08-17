@@ -721,12 +721,14 @@ def test_results_reflect_a_session_that_was_actually_opened(
     granted = runtime.store.admit(launch_id=result["launch_id"], telegram_user_id="1001")
 
     class Session:
-        position = 1
-        component_count = 3
-        answers = {"q-one": {}}
-        revealed: dict = {}
-        completed = False
-        completed_at = None
+        # The grant reports the session-owned projection; it never reaches into
+        # the learner's response mapping to reconstruct progress itself.
+        progress = {
+            "position": 1,
+            "component_count": 3,
+            "answered": 1,
+            "completed": False,
+        }
         expires_at = 1e12
 
     runtime.store.admit_session(granted, lambda: ("token", Session()))
