@@ -63,6 +63,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..sessions import SessionProgress, SessionView
+
 logger = logging.getLogger(__name__)
 
 #: How long a learner has to tap the button before the grant expires. Short:
@@ -86,14 +88,11 @@ _ID_BYTES = 18
 #: refuses anything else, and the frontend refuses to send anything else.
 LAUNCH_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{16,64}\Z")
 
-#: What a launch nobody is inside reports. Shaped like a session's own progress
-#: snapshot so that :meth:`GrantStore._describe` has one field list, not two.
-_NO_PROGRESS: dict[str, Any] = {
-    "position": 0,
-    "component_count": 0,
-    "answered": 0,
-    "completed": False,
-}
+#: What a launch nobody is inside reports. The session's own progress value, so
+#: that :meth:`GrantStore._describe` has one field list rather than two — and so
+#: that "nobody opened it" and "somebody is on component 3" are serialised by
+#: exactly the same code.
+_NO_PROGRESS = SessionProgress(position=0, component_count=0, answered=0, completed=False)
 
 
 class GrantError(ValueError):
@@ -175,14 +174,21 @@ class LaunchGrant:
             return True
         return not self.expired(now)
 
-    def state(self, now: float) -> str:
+    def state(self, now: float, view: SessionView | None) -> str:
+        """What became of this launch, given its live session's own snapshot.
+
+        ``view`` is that snapshot — ``None`` when there is no live session —
+        and it is passed in rather than fetched here so that the state and the
+        position reported beside it come from the same read. Asking the session
+        a second question of its own could answer "opened" next to a position
+        that had already reached the end.
+        """
         if self.revoked:
             return "revoked"
         if not self.activated:
             return "pending"
-        session = self.live_session(now)
-        if session is not None:
-            return "completed" if getattr(session, "completed", False) else "opened"
+        if view is not None:
+            return "completed" if view.progress.completed else "opened"
         if self.session is not None:
             # Opened, and the session has since run out. Distinct from
             # ``expired``, which is a button nobody ever tapped: this learner
@@ -501,21 +507,25 @@ class GrantStore:
         # "position 3 of 10" indefinitely, which is a learner's activity
         # outliving the thing that was supposed to bound it.
         session = grant.live_session(now)
-        # Read as the session's own snapshot rather than assembled from its
-        # fields here. Counting the answers meant reaching into the mapping that
+        # One read of the session, and everything below is derived from it.
+        # Taken as the session's own projection rather than assembled from its
+        # fields here: counting the answers meant reaching into the mapping that
         # holds them, and a store that reports on learners has no business
         # holding what they wrote — even for a `len`.
-        progress = _NO_PROGRESS if session is None else session.progress
+        view = None if session is None else session.snapshot()
+        progress = _NO_PROGRESS if view is None else view.progress
         return {
             "launch_id": grant.launch_id,
             "generation": grant.generation,
-            "state": grant.state(now),
+            "state": grant.state(now, view),
             "opened": grant.session is not None,
             "expires_in_seconds": max(0.0, grant.expires_at - now),
-            "position": int(progress["position"]),
-            "component_count": int(progress["component_count"]),
-            "answered": int(progress["answered"]),
-            "completed": bool(progress["completed"]),
+            # Serialised field by field into primitives: this crosses the
+            # control plane as JSON, and the typed value does not travel.
+            "position": int(progress.position),
+            "component_count": int(progress.component_count),
+            "answered": int(progress.answered),
+            "completed": bool(progress.completed),
             # Stated in the payload rather than left to a reader's assumption.
             "scored": False,
         }

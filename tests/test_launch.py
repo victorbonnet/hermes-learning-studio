@@ -25,6 +25,7 @@ from learning_studio.identity import Principal
 from learning_studio.runtime import bootstrap, ownership, state, supervisor
 from learning_studio.runtime import grants as grants_module
 from learning_studio.runtime.errors import RuntimeUnavailable
+from learning_studio.sessions import SessionProgress, SessionView
 from tests.component_examples import example, manifest
 
 pytestmark = pytest.mark.skipif(
@@ -723,13 +724,18 @@ def test_results_reflect_a_session_that_was_actually_opened(
     class Session:
         # The grant reports the session-owned projection; it never reaches into
         # the learner's response mapping to reconstruct progress itself.
-        progress = {
-            "position": 1,
-            "component_count": 3,
-            "answered": 1,
-            "completed": False,
-        }
         expires_at = 1e12
+
+        def snapshot(self):
+            return SessionView(
+                progress=SessionProgress(
+                    position=1, component_count=3, answered=1, completed=False
+                ),
+                current_component_id="c-2",
+                answered_component_ids=("c-1",),
+                completed_at=None,
+                scored=False,
+            )
 
     runtime.store.admit_session(granted, lambda: ("token", Session()))
 
