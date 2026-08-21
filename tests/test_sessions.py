@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import FrozenInstanceError
 
 import pytest
 
 from learning_studio.sessions import (
     SessionError,
+    SessionProgress,
     SessionScope,
     SessionStep,
     SessionStore,
     SessionTransitionError,
+    SessionView,
 )
 
 
@@ -214,41 +217,142 @@ def test_dropping_a_session_ends_it(store: SessionStore):
 
 
 def lifecycle(session) -> dict:
-    """Everything a refused transition must leave exactly as it was."""
+    """Everything a refused transition must leave exactly as it was.
+
+    The session's own projection — which is one frozen value, so comparing two
+    of them compares every lifecycle field at once — beside the two copies that
+    are deliberately *not* in it: what the learner wrote, and the recall they
+    were held to when a card was turned over.
+    """
     return {
-        "progress": session.progress,
+        "view": session.snapshot(),
         "responses": session.responses,
         "revealed": session.revealed_attempts,
-        "completed_at": session.completed_at,
-        "scored": session.scored,
     }
+
+
+# ── One coherent read of the whole lifecycle ──────────────────────────────
+
+
+def test_a_snapshot_reports_every_lifecycle_field_from_one_state(store: SessionStore, clock: Clock):
+    """One projection, taken once, whose fields cannot disagree with each other.
+
+    Position, the component that position names, and the answers behind it are
+    read together: a consumer that asked for them separately could be handed a
+    position from before another request's transition and a component from
+    after it.
+    """
+    _, session = store.create(scope(), steps=plan(3))
+    session.record_answer("c-1", {"value": True}, now=clock.now)
+
+    view = session.snapshot()
+
+    assert (view.progress.position, view.progress.component_count) == (1, 3)
+    assert (view.progress.answered, view.progress.completed) == (1, False)
+    assert view.current_component_id == "c-2"
+    assert view.answered_component_ids == ("c-1",)
+    assert (view.completed_at, view.scored) == (None, False)
+    # A value, not a handle on the session.
+    with pytest.raises(FrozenInstanceError):
+        view.progress.position = 99
+    with pytest.raises(FrozenInstanceError):
+        view.scored = True
+
+
+def test_a_snapshot_does_not_move_when_the_session_does(store: SessionStore, clock: Clock):
+    """What a reader was told stays what they were told.
+
+    A projection that tracked the session would be the original defect wearing
+    a different name: the answer a request already decided on would change
+    under it while the response was still being built.
+    """
+    _, session = store.create(scope(), steps=plan(2))
+    before = session.snapshot()
+
+    session.record_answer("c-1", {"value": True}, now=clock.now)
+    session.record_answer("c-2", {"value": False}, now=clock.now)
+
+    assert before.progress == SessionProgress(
+        position=0, component_count=2, answered=0, completed=False
+    )
+    assert (before.current_component_id, before.answered_component_ids) == ("c-1", ())
+    assert (before.completed_at, before.scored) == (None, False)
+    assert session.snapshot() != before
+
+
+def test_a_receipt_is_frozen_and_describes_only_its_own_move(store: SessionStore, clock: Clock):
+    _, session = store.create(scope(), steps=plan(3))
+
+    receipt = session.record_answer("c-1", {"value": True}, now=clock.now)
+    session.record_answer("c-2", {"value": True}, now=clock.now)
+
+    # The second answer moved the session on; the first answer's receipt still
+    # says what the first answer did.
+    assert receipt.next_component_id == "c-2"
+    assert receipt.progress.position == 1
+    with pytest.raises(FrozenInstanceError):
+        receipt.next_component_id = "c-3"
+    with pytest.raises(FrozenInstanceError):
+        receipt.progress.answered = 99
+
+
+def test_no_projection_carries_a_learner_value_into_a_repr(store: SessionStore, clock: Clock):
+    """These values travel to adapters, grants, and logs. Nothing private rides.
+
+    A repr is where a private value escapes without anybody deciding to send
+    it: a debugger, an exception formatter, a log line that interpolates the
+    object it was handed.
+    """
+    _, session = store.create(scope(), steps=plan(2, reveal=("c-1",)))
+    session.reveal("c-1", "RAW-RECALL-CANARY", lambda: "HIDDEN-BACK-CANARY")
+    receipt = session.record_answer(
+        "c-1", {"text": "RAW-RECALL-CANARY", "self_rating": "good"}, now=clock.now
+    )
+    answered = session.record_answer("c-2", {"text": "RAW-RESPONSE-CANARY"}, now=clock.now)
+    session.score_once(lambda completion: {"attempt_id": "ATTEMPT-CANARY", "overall_score": 1})
+
+    rendered = " ".join(
+        repr(value)
+        for value in (
+            session.snapshot(),
+            session.snapshot().progress,
+            receipt,
+            answered,
+        )
+    )
+
+    for canary in (
+        "RAW-RECALL-CANARY",
+        "HIDDEN-BACK-CANARY",
+        "RAW-RESPONSE-CANARY",
+        "ATTEMPT-CANARY",
+    ):
+        assert canary not in rendered
 
 
 def test_a_new_session_starts_at_the_first_component(store: SessionStore):
     _, session = store.create(scope(), steps=plan(4))
+    view = session.snapshot()
 
-    assert (session.position, session.completed, session.responses) == (0, False, {})
-    assert session.progress == {
-        "position": 0,
-        "component_count": 4,
-        "answered": 0,
-        "completed": False,
-    }
+    assert view.progress == SessionProgress(
+        position=0, component_count=4, answered=0, completed=False
+    )
+    assert view.current_component_id == "c-1"
+    assert (view.answered_component_ids, session.responses) == ((), {})
+    assert (view.completed_at, view.scored) == (None, False)
 
 
 def test_recording_the_current_answer_advances_exactly_one_step(store: SessionStore, clock: Clock):
     _, session = store.create(scope(), steps=plan(3))
 
-    progress = session.record_answer("c-1", {"value": True}, now=clock.now)
+    receipt = session.record_answer("c-1", {"value": True}, now=clock.now)
 
-    assert progress == {
-        "position": 1,
-        "component_count": 3,
-        "answered": 1,
-        "completed": False,
-    }
+    assert receipt.progress == SessionProgress(
+        position=1, component_count=3, answered=1, completed=False
+    )
+    assert receipt.next_component_id == "c-2"
     assert session.responses == {"c-1": {"value": True}}
-    assert session.completed_at is None
+    assert session.snapshot().completed_at is None
 
 
 def test_a_caller_cannot_mutate_a_recorded_response(store: SessionStore, clock: Clock):
@@ -264,14 +368,19 @@ def test_a_caller_cannot_mutate_a_recorded_response(store: SessionStore, clock: 
 def test_completion_is_recorded_only_on_the_final_component(store: SessionStore, clock: Clock):
     _, session = store.create(scope(), steps=plan(2))
     session.record_answer("c-1", {"value": True}, now=clock.now)
-    assert session.completed is False
+    assert session.snapshot().progress.completed is False
 
     clock.advance(30)
-    progress = session.record_answer("c-2", {"value": False}, now=clock.now)
+    receipt = session.record_answer("c-2", {"value": False}, now=clock.now)
 
-    assert progress["completed"] is True
-    assert (session.completed, session.completed_at) == (True, clock.now)
-    assert session.answered_component_ids == ("c-1", "c-2")
+    assert receipt.progress.completed is True
+    # There is no card after the last one, and the receipt says so rather than
+    # leaving the caller to work it out from a position it would have to read.
+    assert receipt.next_component_id is None
+    finished = session.snapshot()
+    assert (finished.progress.completed, finished.completed_at) == (True, clock.now)
+    assert finished.answered_component_ids == ("c-1", "c-2")
+    assert finished.current_component_id is None
 
 
 # ── A refused transition changes nothing ──────────────────────────────────
@@ -332,11 +441,15 @@ def test_a_session_over_no_components_has_nothing_to_record(store: SessionStore,
 
     assert caught.value.reason == "no_component"
     assert lifecycle(session) == {
-        "progress": {"position": 0, "component_count": 0, "answered": 0, "completed": False},
+        "view": SessionView(
+            progress=SessionProgress(position=0, component_count=0, answered=0, completed=False),
+            current_component_id=None,
+            answered_component_ids=(),
+            completed_at=None,
+            scored=False,
+        ),
         "responses": {},
         "revealed": {},
-        "completed_at": None,
-        "scored": False,
     }
 
 
@@ -372,7 +485,7 @@ def test_the_reveal_discloses_before_it_freezes_the_attempt(store: SessionStore)
     assert (outcome.back, outcome.attempt) == ("the back", "my recall")
     assert session.revealed_attempts == {"c-1": "my recall"}
     # Turning a card over is not answering it.
-    assert session.progress["position"] == 0
+    assert session.snapshot().progress.position == 0
 
 
 def test_a_reveal_outcome_repr_contains_neither_hidden_answer_nor_raw_recall(store: SessionStore):
@@ -483,25 +596,22 @@ def test_the_frozen_recall_is_what_may_be_recorded(store: SessionStore, clock: C
     _, session = store.create(scope(), steps=plan(2, reveal=("c-1",)))
     session.reveal("c-1", "no idea", lambda: "the back")
 
-    progress = session.record_answer(
+    receipt = session.record_answer(
         "c-1", {"text": "no idea", "self_rating": "again"}, now=clock.now
     )
 
-    assert progress == {
-        "position": 1,
-        "component_count": 2,
-        "answered": 1,
-        "completed": False,
-    }
+    assert receipt.progress == SessionProgress(
+        position=1, component_count=2, answered=1, completed=False
+    )
 
 
 def test_a_card_with_nothing_to_turn_over_needs_no_reveal(store: SessionStore, clock: Clock):
     """The contract applies to revealable steps and to no others."""
     _, session = store.create(scope(), steps=plan(1))
 
-    progress = session.record_answer("c-1", {"value": True}, now=clock.now)
+    receipt = session.record_answer("c-1", {"value": True}, now=clock.now)
 
-    assert progress["answered"] == 1
+    assert receipt.progress.answered == 1
 
 
 # ── Scoring: after the end, and exactly once ──────────────────────────────
@@ -516,7 +626,7 @@ def test_an_unfinished_session_cannot_be_scored(store: SessionStore, clock: Cloc
         session.score_once(lambda completion: pytest.fail("the scorer was called"))
 
     assert caught.value.reason == "not_completed"
-    assert session.scored is False
+    assert session.snapshot().scored is False
 
 
 def test_the_scorer_is_given_a_snapshot_it_cannot_write_back_through(
@@ -576,7 +686,7 @@ def test_a_successful_score_is_cached_and_the_scorer_never_runs_twice(
     assert len(calls) == 1, "the durable scorer ran twice for one session"
     assert second == first
     assert second is not first, "a caller received the mutable cached object"
-    assert session.scored is True
+    assert session.snapshot().scored is True
 
 
 def test_a_caller_cannot_mutate_the_cached_score(store: SessionStore, clock: Clock):
@@ -640,7 +750,7 @@ def test_a_failed_score_is_not_cached(store: SessionStore, clock: Clock):
     with pytest.raises(RuntimeError):
         session.score_once(unavailable)
 
-    assert session.scored is False
+    assert session.snapshot().scored is False
     assert session.score_once(lambda completion: {"attempt_id": "attempt-2"}) == {
         "attempt_id": "attempt-2"
     }
@@ -823,7 +933,7 @@ def test_resume_waits_for_an_in_flight_answer_and_carries_it(store: SessionStore
     answer_thread.join(timeout=5)
     resume_thread.join(timeout=5)
 
-    assert second.progress["position"] == 1
+    assert second.snapshot().progress.position == 1
     assert second.responses == {"c-1": {"value": True}}
 
 
@@ -836,7 +946,7 @@ def test_resuming_does_not_copy_identity_freshness_or_lifetime(store: SessionSto
     _, second = store.create(scope(), steps=plan(2), auth_date=1060)
     second.resume_from(first)
 
-    assert second.position == 1
+    assert second.snapshot().progress.position == 1
     assert second.ref != first.ref
     assert second.auth_date == 1060
     assert second.created_at == clock.now
@@ -857,11 +967,15 @@ def test_a_resumed_session_and_the_one_it_replaced_share_no_state(
     second.score_once(lambda completion: {"attempt_id": "attempt-1"})
 
     assert lifecycle(first) == {
-        "progress": {"position": 1, "component_count": 2, "answered": 1, "completed": False},
+        "view": SessionView(
+            progress=SessionProgress(position=1, component_count=2, answered=1, completed=False),
+            current_component_id="c-2",
+            answered_component_ids=("c-1",),
+            completed_at=None,
+            scored=False,
+        ),
         "responses": {"c-1": {"choices": ["a"]}},
         "revealed": {},
-        "completed_at": None,
-        "scored": False,
     }
 
 
@@ -872,7 +986,7 @@ def test_an_unscored_session_resumes_without_inventing_a_result(store: SessionSt
 
     second.resume_from(first)
 
-    assert second.scored is False
+    assert second.snapshot().scored is False
     with pytest.raises(SessionTransitionError) as caught:
         second.score_once(lambda completion: pytest.fail("scored an unfinished session"))
     assert caught.value.reason == "not_completed"

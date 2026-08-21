@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,6 +26,8 @@ from learning_studio.responses import INVALID_RESPONSE_MESSAGE
 from learning_studio.sessions import SessionStore
 from learning_studio.web.app import (
     INIT_DATA_HEADER,
+    NOT_SCORED_NOTICE,
+    SCORED_NOTICE,
     SESSION_HEADER,
     create_app,
 )
@@ -566,6 +571,166 @@ def test_answering_after_completion_is_refused(client, experience_id):
     )
 
     assert response.status_code == 409
+
+
+# ── One request, one answer about it ──────────────────────────────────────
+
+
+def serve_current(client, token: str) -> dict:
+    """The component the session is on, read the way a client reads it."""
+    current = client.get("/api/session/component", headers=session_headers(token))
+    assert current.status_code == 200, current.text
+    return current.json()["component"]
+
+
+def submit(client, token: str, component: dict):
+    """Answer one served component, with a response built from what it served."""
+    return client.post(
+        "/api/session/answer",
+        json={
+            "component_id": component["component_id"],
+            "response": response_for(component["type"], component["payload"].get("content", {})),
+        },
+        headers=session_headers(token),
+    )
+
+
+def test_an_answer_response_never_describes_a_later_requests_move(client, deps, experience_id):
+    """Two real submissions, with the interleaving forced rather than hoped for.
+
+    The window is narrow and entirely real: a request commits its transition
+    and then has to decide what to send back. Anything it reads off the session
+    *after* that point can already belong to somebody else's answer — a second
+    tab, a retry, a webview that resumed. The response then reports position 1
+    beside the card that follows position 2, which is a coherent-looking body
+    that never described one move.
+
+    The second request runs on its own event loop, so the block below is real
+    concurrency against the real routes rather than a rehearsal of one.
+    """
+    from fastapi.testclient import TestClient
+
+    token, _ = open_session(client, experience_id)
+    session = next(iter(deps.sessions._sessions.values()))
+    first_card = serve_current(client, token)
+    committed = threading.Event()
+    release = threading.Event()
+    record_answer = session.record_answer
+
+    def blocking(component_id, response, *, now):
+        outcome = record_answer(component_id, response, now=now)
+        # Committed, and the route has not yet chosen what to report. Only the
+        # first submission waits here.
+        session.record_answer = record_answer
+        committed.set()
+        assert release.wait(timeout=5)
+        return outcome
+
+    session.record_answer = blocking
+
+    answered: list[dict] = []
+    first_request = threading.Thread(
+        target=lambda: answered.append(submit(client, token, first_card).json())
+    )
+    first_request.start()
+    assert committed.wait(timeout=5), "the first submission never committed"
+
+    overtaking = TestClient(client.app)
+    second = submit(overtaking, token, serve_current(overtaking, token))
+    release.set()
+    first_request.join(timeout=5)
+
+    assert not first_request.is_alive()
+    assert second.status_code == 200, second.text
+    assert answered[0]["progress"]["position"] == 1
+    assert answered[0]["next_component"]["component_id"] == "q-two"
+    assert answered[0]["notice"] == NOT_SCORED_NOTICE
+    assert second.json()["progress"]["position"] == 2
+    assert second.json()["next_component"]["component_id"] == "q-three"
+
+
+def counting_snapshot(session) -> list[int]:
+    """Count the times a route reads the session's own lifecycle projection."""
+    reads: list[int] = []
+    snapshot = session.snapshot
+
+    def counted():
+        reads.append(1)
+        return snapshot()
+
+    session.snapshot = counted
+    return reads
+
+
+def test_the_current_component_route_answers_from_one_read_of_the_session(
+    client, deps, experience_id
+):
+    """The progress and the card it is serving have to be the same moment."""
+    token, _ = open_session(client, experience_id)
+    session = next(iter(deps.sessions._sessions.values()))
+    assert submit(client, token, serve_current(client, token)).status_code == 200
+    reads = counting_snapshot(session)
+
+    body = client.get("/api/session/component", headers=session_headers(token)).json()
+
+    assert len(reads) == 1, "the position and the progress were read separately"
+    assert body["progress"] == {
+        "position": 1,
+        "component_count": 3,
+        "answered": 1,
+        "completed": False,
+    }
+    assert body["component"]["component_id"] == "q-two"
+
+
+def test_a_session_projection_does_not_follow_a_component_that_moved_position(
+    client, deps, experience_id
+):
+    """Position and identity must agree before a stored component is served.
+
+    A live session's ordered plan is immutable. If the stored experience is
+    replaced or reordered underneath it, looking up only by identifier would
+    pair progress for one position with a component now at another.
+    """
+    from fastapi.testclient import TestClient
+
+    token, _ = open_session(client, experience_id)
+    load_experience = deps.load_experience
+
+    def reordered(principal, selected_experience_id):
+        bundle = load_experience(principal, selected_experience_id)
+        experience = deepcopy(bundle.experience)
+        experience["components"][:2] = reversed(experience["components"][:2])
+        return replace(bundle, experience=experience)
+
+    changed = replace(deps, load_experience=reordered)
+    with TestClient(create_app(changed)) as changed_client:
+        body = changed_client.get("/api/session/component", headers=session_headers(token)).json()
+
+    assert body["progress"]["position"] == 0
+    assert body["component"] is None
+
+
+def test_the_result_route_answers_from_one_read_of_the_session(client, deps, experience_id):
+    """Four facts about one session, and no window between them."""
+    token, _ = open_session(client, experience_id)
+    complete_exercise(client, token)
+    client.get("/api/session/summary", headers=session_headers(token))
+    session = next(iter(deps.sessions._sessions.values()))
+    reads = counting_snapshot(session)
+
+    body = client.get("/api/session/result", headers=session_headers(token)).json()
+
+    assert len(reads) == 1, "progress, scored, and the answered set were read separately"
+    assert body["progress"] == {
+        "position": 3,
+        "component_count": 3,
+        "answered": 3,
+        "completed": True,
+    }
+    assert body["scored"] is True
+    assert sorted(body["answered_components"]) == ["q-one", "q-three", "q-two"]
+    assert body["notice"] == SCORED_NOTICE
 
 
 def test_a_session_expires(client, experience_id, clock, config):
@@ -1422,14 +1587,16 @@ def test_a_card_the_client_cannot_draw_may_still_be_skipped(client, experience_i
 
 
 def session_state(deps):
-    """Everything a refused submission must not change."""
+    """Everything a refused submission must not change.
+
+    The session's own projection — position, counts, completion, and the
+    answered set, as one frozen value — beside the two copies it deliberately
+    does not carry: the stored answers and the frozen recall.
+    """
     session = next(iter(deps.sessions._sessions.values()))
     return {
-        "position": session.position,
-        "answered": session.progress["answered"],
+        "view": session.snapshot(),
         "answers": session.responses,
-        "completed": session.completed,
-        "completed_at": session.completed_at,
         "revealed": session.revealed_attempts,
     }
 

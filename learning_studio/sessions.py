@@ -132,6 +132,61 @@ class SessionCompletion:
     completed_at: float
 
 
+@dataclass(frozen=True)
+class SessionProgress:
+    """How far through the exercise a session is, as four settled numbers.
+
+    A value rather than a mapping, and captured under the session's lock in one
+    go, so the four cannot come from four different moments. What a client is
+    sent is serialised from this at the boundary that speaks HTTP; nothing here
+    is a wire format, and nothing on the wire is read back into it.
+    """
+
+    position: int
+    component_count: int
+    answered: int
+    completed: bool
+
+
+@dataclass(frozen=True)
+class SessionView:
+    """One coherent read of a session's lifecycle.
+
+    Everything an outside consumer is allowed to know about where a learner
+    got to, taken together under one lock. Reading these one property at a
+    time was the defect this replaces: a route could hand back a position from
+    before another request's transition beside a component from after it, and
+    both were individually true.
+
+    Deliberately narrow. Raw responses, frozen recall, hidden reveal content,
+    session tokens and the cached durable result are not here and must never
+    be: this object is what travels to adapters, logs, and reprs.
+    """
+
+    progress: SessionProgress
+    #: The component the session is on, or ``None`` once it is finished.
+    current_component_id: str | None
+    answered_component_ids: tuple[str, ...]
+    completed_at: float | None
+    scored: bool
+
+
+@dataclass(frozen=True)
+class AnswerReceipt:
+    """What one recorded answer moved the session to — and nothing later.
+
+    Built while the transition still holds the lock, so the progress it reports
+    and the component it names are the two halves of *this* submission. A
+    caller that recorded an answer and then asked the session what came next
+    could be answered after somebody else's answer had already advanced it,
+    which is how one request's response came to describe another's move.
+    """
+
+    progress: SessionProgress
+    #: The component that follows this answer, or ``None`` if it was the last.
+    next_component_id: str | None
+
+
 @dataclass
 class MiniAppSession:
     """One learner working through one experience, for a bounded time.
@@ -213,40 +268,16 @@ class MiniAppSession:
         return self._steps
 
     @property
-    def component_count(self) -> int:
-        return len(self._steps)
-
-    @property
-    def position(self) -> int:
-        with self._lock:
-            return self._position
-
-    @property
-    def completed_at(self) -> float | None:
-        with self._lock:
-            return self._completed_at
-
-    @property
-    def completed(self) -> bool:
-        with self._lock:
-            return self._completed_at is not None
-
-    @property
-    def scored(self) -> bool:
-        """Whether this session already produced its one durable attempt."""
-        with self._lock:
-            return self._attempt_result is not None
-
-    @property
     def responses(self) -> dict[str, Any]:
-        """``component_id -> response``, copied. Mutating it changes nothing."""
+        """``component_id -> response``, copied. Mutating it changes nothing.
+
+        Not part of :meth:`snapshot`, and deliberately: what a learner wrote is
+        for the scorer, which receives it inside a :class:`SessionCompletion`.
+        The projection every route, grant, and log reads must not be able to
+        carry one.
+        """
         with self._lock:
             return deepcopy(self._responses)
-
-    @property
-    def answered_component_ids(self) -> tuple[str, ...]:
-        with self._lock:
-            return tuple(sorted(self._responses))
 
     @property
     def revealed_attempts(self) -> dict[str, str]:
@@ -254,21 +285,42 @@ class MiniAppSession:
         with self._lock:
             return dict(self._revealed)
 
-    @property
-    def progress(self) -> dict[str, Any]:
-        """How far through the exercise this session is, as a fresh snapshot.
+    def snapshot(self) -> SessionView:
+        """Everything a consumer may read, from one coherent state.
 
-        A plain mapping rather than an object because it is what the API sends
-        to a client verbatim, and a new one every time so that handing it out is
-        not handing out the state itself.
+        The lock is taken exactly once and every field is derived inside it, so
+        a reader cannot be handed a position from before another request's
+        transition and an answered set from after it. The result is a frozen
+        value: holding it is not holding the session, and the session moving on
+        does not rewrite what a reader was told.
         """
         with self._lock:
-            return {
-                "position": self._position,
-                "component_count": len(self._steps),
-                "answered": len(self._responses),
-                "completed": self._completed_at is not None,
-            }
+            return SessionView(
+                progress=self._progress(),
+                current_component_id=self._component_id_at(self._position),
+                answered_component_ids=tuple(sorted(self._responses)),
+                completed_at=self._completed_at,
+                scored=self._attempt_result is not None,
+            )
+
+    def _progress(self) -> SessionProgress:
+        """The four progress numbers. The caller holds the lock."""
+        return SessionProgress(
+            position=self._position,
+            component_count=len(self._steps),
+            answered=len(self._responses),
+            completed=self._completed_at is not None,
+        )
+
+    def _component_id_at(self, position: int) -> str | None:
+        """The component that position names, or ``None`` past the end.
+
+        Read from the immutable ordered plan, so it cannot name a card the
+        session was not actually going to serve. The caller holds the lock.
+        """
+        if 0 <= position < len(self._steps):
+            return self._steps[position].component_id
+        return None
 
     def expired(self, now: float) -> bool:
         with self._lock:
@@ -325,7 +377,7 @@ class MiniAppSession:
             self.expires_at = 0.0
             raise SessionTransitionError("session_retired")
 
-    def record_answer(self, component_id: object, response: Any, *, now: float) -> dict[str, Any]:
+    def record_answer(self, component_id: object, response: Any, *, now: float) -> AnswerReceipt:
         """Record the response to the current component and advance one step.
 
         Refuses — without touching anything — a session that is already
@@ -333,6 +385,12 @@ class MiniAppSession:
         the current one. The completion timestamp is stamped here, on the
         transition that reaches the end, so "finished" and "when" cannot
         disagree.
+
+        Returns a receipt for *this* move, built before the lock is released:
+        where the session now is, and which component follows — ``None`` once
+        the exercise is finished. A caller that recorded an answer and then
+        asked the session what came next could be told about somebody else's
+        answer instead, and would report it as the reply to this one.
         """
         with self._lock:
             step = self._require_current_step(component_id)
@@ -342,12 +400,10 @@ class MiniAppSession:
             self._position += 1
             if self._position >= len(self._steps):
                 self._completed_at = float(now)
-            return {
-                "position": self._position,
-                "component_count": len(self._steps),
-                "answered": len(self._responses),
-                "completed": self._completed_at is not None,
-            }
+            return AnswerReceipt(
+                progress=self._progress(),
+                next_component_id=self._component_id_at(self._position),
+            )
 
     def _require_frozen_recall(self, component_id: str, response: Any) -> None:
         """A card whose answer can be shown may only be submitted after it was.

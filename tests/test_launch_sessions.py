@@ -102,7 +102,7 @@ def answer(session, count: int = 1, *, now: float = 1000.0) -> None:
     would keep passing if the session stopped enforcing how one is reached.
     """
     for _ in range(count):
-        step = session.steps[session.position]
+        step = session.steps[session.snapshot().progress.position]
         session.record_answer(step.component_id, {"value": True}, now=now)
 
 
@@ -145,7 +145,7 @@ def test_reopening_resumes_rather_than_restarts(store, sessions):
 
     _, second = open_session(store, sessions, grant, steps=steps)
 
-    assert second.position == 2
+    assert second.snapshot().progress.position == 2
     assert set(second.responses) == {"c-1", "c-2"}
     assert second.revealed_attempts == {"c-1": "my recall"}
 
@@ -157,9 +157,10 @@ def test_progress_never_regresses_across_a_reload(store, sessions):
 
     _, second = open_session(store, sessions, grant)
 
-    assert second.position == 3
-    assert second.completed is True
-    assert second.completed_at == 1234.0
+    resumed = second.snapshot()
+    assert resumed.progress.position == 3
+    assert resumed.progress.completed is True
+    assert resumed.completed_at == 1234.0
 
 
 def test_a_scored_session_carries_its_result_across_a_reload(store, sessions):
@@ -176,7 +177,7 @@ def test_a_scored_session_carries_its_result_across_a_reload(store, sessions):
 
     _, second = open_session(store, sessions, grant)
 
-    assert second.scored is True
+    assert second.snapshot().scored is True
     assert second.score_once(lambda completion: pytest.fail("scored twice")) == {
         "attempt_id": "attempt-1"
     }
@@ -196,7 +197,10 @@ def test_capacity_eviction_resumes_scored_state_instead_of_starting_a_second_att
     replacement_token, replacement = open_session(store, sessions, first_grant)
 
     assert replacement_token != first_token
-    assert replacement.progress == first.progress
+    # The whole projection, not just the counts: a replacement that carried the
+    # position but not the completion it was reached by is a session finished
+    # for one reader and unfinished for the next.
+    assert replacement.snapshot() == first.snapshot()
     assert replacement.score_once(lambda completion: pytest.fail("scored twice")) == {
         "attempt_id": "attempt-1"
     }
@@ -217,7 +221,7 @@ def test_capacity_eviction_never_extends_the_original_session_deadline(store, cl
     with pytest.raises(SessionError):
         sessions.resolve(first_token, profile="default", telegram_user_id="1001")
     assert replacement_token != first_token
-    assert replacement.progress["position"] == 0
+    assert replacement.snapshot().progress.position == 0
     assert replacement.responses == {}
 
 
@@ -237,7 +241,7 @@ def test_capacity_retained_state_survives_the_shorter_launch_invitation(clock):
     admitted = store.admit(launch_id=first_grant.launch_id, telegram_user_id="1001")
     assert admitted is first_grant
     _, replacement = open_session(store, sessions, admitted)
-    assert replacement.progress["position"] == 1
+    assert replacement.snapshot().progress.position == 1
     assert replacement.responses == {"c-1": {"value": True}}
 
 
@@ -269,7 +273,7 @@ def test_an_unscored_session_resumes_without_inventing_a_result(store, sessions)
 
     _, second = open_session(store, sessions, grant)
 
-    assert second.scored is False
+    assert second.snapshot().scored is False
 
 
 def test_concurrent_opens_leave_exactly_one_live_session(store, sessions, clock):
@@ -357,6 +361,41 @@ def test_a_grant_that_lapsed_while_open_does_not_become_a_second_launch(store, s
 
 
 # ── Selection is a rule, not an accident of ordering ──────────────────────
+
+
+def test_a_launch_is_described_from_one_read_of_its_session(store, sessions, clock):
+    """State and position come from the same moment, or they can contradict.
+
+    Asking the session "are you finished?" and then "how far are you?" is two
+    reads of something that moves, and the pair could report a launch as still
+    *opened* beside a position that had already reached the end.
+    """
+    grant = granted(store)
+    _, session = open_session(store, sessions, grant, steps=plan(2))
+    answer(session, 2)
+    reads: list[int] = []
+    snapshot = session.snapshot
+
+    def counted():
+        reads.append(1)
+        return snapshot()
+
+    session.snapshot = counted
+
+    reported = store.progress({"telegram_user_id": "1001", "experience_id": "exp-1"})
+
+    assert len(reads) == 1, "the launch description read the session more than once"
+    assert reported["state"] == "completed"
+    assert (reported["position"], reported["component_count"]) == (2, 2)
+    assert (reported["answered"], reported["completed"]) == (2, True)
+    # Primitives, not the session's own value objects: this payload crosses the
+    # control plane as JSON.
+    assert [type(reported[field]) for field in ("position", "component_count", "answered")] == [
+        int,
+        int,
+        int,
+    ]
+    assert reported["completed"] is True and reported["scored"] is False
 
 
 def test_progress_selects_the_open_launch_not_the_first_inserted(store, sessions, clock):
@@ -582,5 +621,5 @@ def test_expired_session_state_is_not_carried_into_a_fresh_session(clock):
     opened = open_session(store, sessions, grant)
     assert opened is not None
     _, fresh = opened
-    assert fresh.position == 0
+    assert fresh.snapshot().progress.position == 0
     assert fresh.responses == {}

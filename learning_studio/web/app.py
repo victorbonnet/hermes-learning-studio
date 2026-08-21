@@ -92,7 +92,13 @@ from ..service import (
     NotFoundError,
     ServiceError,
 )
-from ..sessions import SessionError, SessionScope, SessionStep, SessionTransitionError
+from ..sessions import (
+    SessionError,
+    SessionProgress,
+    SessionScope,
+    SessionStep,
+    SessionTransitionError,
+)
 from ..telegram_auth import InitDataError, verify_init_data
 from .dependencies import Dependencies, build_dependencies, user_log_reference
 from .security import (
@@ -545,7 +551,7 @@ def create_app(dependencies: Dependencies | None = None):
                 "session_token": token,
                 "expires_in_seconds": int(session.expires_at - session.created_at),
                 "experience": _experience_summary(experience),
-                "progress": session.progress,
+                "progress": _progress_payload(session.snapshot().progress),
                 # Told to the client rather than duplicated in it. These are the
                 # bounds a submission is actually judged against, and they are
                 # operator-tunable, so a frontend constant would eventually be a
@@ -563,10 +569,17 @@ def create_app(dependencies: Dependencies | None = None):
         """The component the learner is on, as stored — nothing more."""
         verified, session = authorise_session(request)
         experience = load_bundle(verified, session.scope.experience_id).experience
+        # One read: the progress a client is shown and the card it is shown
+        # beside it are the same moment, not two.
+        view = session.snapshot()
         return JSONResponse(
             {
-                "progress": session.progress,
-                "component": _component_at(experience, session.position),
+                "progress": _progress_payload(view.progress),
+                "component": _component_named(
+                    experience,
+                    view.progress.position,
+                    view.current_component_id,
+                ),
             }
         )
 
@@ -599,7 +612,7 @@ def create_app(dependencies: Dependencies | None = None):
         # were built from this list, so they can only disagree if the stored
         # exercise changed underneath a live session — in which case neither is
         # trusted over the other.
-        current = _component_at(experience, session.position)
+        current = _component_at(experience, session.snapshot().progress.position)
         if current is None:
             raise ApiError(409, "This exercise is already finished.", reason="no_component")
         if current["component_id"] != step.component_id:
@@ -636,7 +649,7 @@ def create_app(dependencies: Dependencies | None = None):
         # can still be refused here — an unturned card, a rewritten recall — and
         # nothing moves when it is.
         try:
-            progress = session.record_answer(step.component_id, response, now=deps.now())
+            receipt = session.record_answer(step.component_id, response, now=deps.now())
         except SessionTransitionError as exc:
             raise _transition_error(exc) from exc
 
@@ -646,13 +659,23 @@ def create_app(dependencies: Dependencies | None = None):
             session_ref=session.ref,
             status=200,
         )
+        # Every field below comes from the receipt, which was taken while the
+        # transition still held the session's lock. Reading the position back
+        # off the session here — which is what this used to do — meant a second
+        # request arriving in between could supply the card this response named,
+        # so one body reported this answer's progress beside another's next
+        # question.
         return JSONResponse(
             {
                 "recorded": True,
                 "scored": False,
-                "progress": progress,
-                "next_component": _component_at(experience, session.position),
-                "notice": FINISHED_NOTICE if progress["completed"] else NOT_SCORED_NOTICE,
+                "progress": _progress_payload(receipt.progress),
+                "next_component": _component_named(
+                    experience,
+                    receipt.progress.position,
+                    receipt.next_component_id,
+                ),
+                "notice": FINISHED_NOTICE if receipt.progress.completed else NOT_SCORED_NOTICE,
             }
         )
 
@@ -755,18 +778,22 @@ def create_app(dependencies: Dependencies | None = None):
         """
         verified, session = authorise_session(request)
         experience = load_bundle(verified, session.scope.experience_id).experience
-        scored = session.scored
+        # Four facts about one session — how far, whether finished, whether
+        # scored, and which components were answered — taken together. Read one
+        # at a time they could describe different moments, and the notice would
+        # then be chosen from a completion the counts beside it did not show.
+        view = session.snapshot()
         return JSONResponse(
             {
                 "experience_id": session.scope.experience_id,
                 "title": experience["title"],
-                "progress": session.progress,
-                "scored": scored,
-                "answered_components": list(session.answered_component_ids),
+                "progress": _progress_payload(view.progress),
+                "scored": bool(view.scored),
+                "answered_components": list(view.answered_component_ids),
                 "notice": (
                     SCORED_NOTICE
-                    if scored
-                    else (FINISHED_NOTICE if session.completed else NOT_SCORED_NOTICE)
+                    if view.scored
+                    else (FINISHED_NOTICE if view.progress.completed else NOT_SCORED_NOTICE)
                 ),
             }
         )
@@ -962,6 +989,40 @@ def _experience_summary(experience: dict[str, Any]) -> dict[str, Any]:
         "accessibility": experience["accessibility"],
         "component_count": len(experience["components"]),
     }
+
+
+def _progress_payload(progress: SessionProgress) -> dict[str, Any]:
+    """A session's own progress value, as the four JSON fields clients read.
+
+    Written out field by field, and coerced to primitives here rather than
+    trusted to serialise: the session owns a typed value, and this is the one
+    place that decides what it looks like on the wire. A field added to the
+    projection later cannot reach a client without being named here.
+    """
+    return {
+        "position": int(progress.position),
+        "component_count": int(progress.component_count),
+        "answered": int(progress.answered),
+        "completed": bool(progress.completed),
+    }
+
+
+def _component_named(
+    experience: dict[str, Any], position: int, component_id: str | None
+) -> dict[str, Any] | None:
+    """The component a session named at its position, if both still agree.
+
+    The session's projection carries both values from one state. Its ordered
+    plan was built from this same list, so they normally agree; if the stored
+    exercise changed underneath a live session, neither a moved component nor
+    whatever replaced it at this position is trusted.
+    """
+    if component_id is None:
+        return None
+    component = _component_at(experience, position)
+    if component is None or component["component_id"] != component_id:
+        return None
+    return component
 
 
 def _component_at(experience: dict[str, Any], position: int) -> dict[str, Any] | None:
