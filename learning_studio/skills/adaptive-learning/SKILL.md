@@ -328,6 +328,7 @@ workflow below stands on its own.
 | [tables-and-grids](references/tables-and-grids.md) | Systematic contrasts across two dimensions |
 | [scenarios-and-simulations](references/scenarios-and-simulations.md) | Multi-step judgement with consequences |
 | [reflection-and-rubrics](references/reflection-and-rubrics.md) | Open work that needs criteria, not a key |
+| [playful-challenge-rounds](references/playful-challenge-rounds.md) | Composing a short round of cards, not choosing a single format |
 | [accessibility](references/accessibility.md) | Always — before you finalise any exercise |
 
 ## The workflow
@@ -427,6 +428,15 @@ Pick the format from the objective's verb, then open that one reference:
 A recognition format cannot assess a production objective. If the objective
 says "produce", multiple choice is the wrong instrument no matter how
 convenient it is to grade.
+
+**One objective sometimes needs several operations, not several formats.**
+When it genuinely does — recognise *and* produce, decide *and* justify — compose
+a short round rather than a longer list of the same card:
+[playful-challenge-rounds](references/playful-challenge-rounds.md) has three,
+**Quick Mix** for distinct operations on one piece of knowledge, **Story
+Mission** for judgement in a shared setting, and **Recall Sprint** for atomic
+retrieval. Open it only then. Variety is a means, never a quota: one operation,
+done thoroughly, needs no blueprint at all.
 
 Then check the exercise against
 [accessibility](references/accessibility.md) before you finalise it. Colour,

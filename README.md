@@ -128,6 +128,16 @@ read_file("${HERMES_SKILL_DIR}/references/selection-cards.md")
 `${HERMES_SKILL_DIR}` is substituted for the skill's real directory before the
 content reaches the agent, so the path is concrete by the time it is read.
 
+One of those references is a composition blueprint rather than a card family:
+`references/playful-challenge-rounds.md` describes three ways to arrange a
+short 4–6 card round — **Quick Mix**, **Story Mission**, and **Recall
+Sprint** — out of the component types that already exist. It is guidance the
+agent reads, not a runtime mode: there is no new schema field, no new tool, no
+frontend control, and no stored learner preference behind it. The blueprints
+add no timer, score economy, or streak, and the reference is explicit that a
+Story Mission runs in a fixed order because the Mini App session walks a fixed
+ordered plan rather than executing branch targets.
+
 ## Architecture
 
 The repository is simultaneously a Hermes **directory plugin** and an
@@ -215,7 +225,7 @@ registration still succeeds.
 **One skill, many references.** The skill is a single orchestration workflow —
 discovery, objectives, pedagogy, format selection, verification, activation,
 interpretation, adaptation — with a catalogue of exercise-format references
-beside it. The catalogue is *not* registered as fourteen skills; the agent
+beside it. The catalogue is *not* registered as fifteen skills; the agent
 opens one reference at a time, so it pays for only what the current decision
 needs. Tests assert that every reference is linked by a valid relative path,
 that none is orphaned, and that the registered surface stays at exactly one

@@ -33,6 +33,7 @@ REQUIRED_REFERENCES = (
     "tables-and-grids",
     "scenarios-and-simulations",
     "reflection-and-rubrics",
+    "playful-challenge-rounds",
     "accessibility",
 )
 
@@ -49,6 +50,18 @@ UI_REFERENCES = (
     "tables-and-grids",
     "scenarios-and-simulations",
     "reflection-and-rubrics",
+)
+
+#: References that are required but deliberately outside ``UI_REFERENCES``.
+#: A composition blueprint describes how to *arrange* cards; it has no "Required
+#: fields" or "Evaluation" of its own, so holding it to the card-family section
+#: template would force empty headings that say nothing.
+NON_UI_REFERENCES = (
+    "learning-discovery",
+    "activation-policy",
+    "manifest-contract",
+    "playful-challenge-rounds",
+    "accessibility",
 )
 
 REQUIRED_UI_SECTIONS = (
@@ -237,3 +250,19 @@ def test_ui_reference_documents_required_section(
     assert any(section.lower() in heading for heading in headings), (
         f"references/{name}.md is missing a '{section}' section"
     )
+
+
+def test_ui_and_non_ui_references_partition_the_required_set():
+    """Every required reference is classified exactly once.
+
+    Without this, adding a reference to neither tuple would silently exempt it
+    from both the card-family section template and this check.
+    """
+    assert sorted(REQUIRED_REFERENCES) == sorted(UI_REFERENCES + NON_UI_REFERENCES)
+    assert set(UI_REFERENCES).isdisjoint(NON_UI_REFERENCES)
+
+
+def test_composition_blueprints_are_not_held_to_the_card_family_template():
+    """The blueprint reference composes existing families; it is not one."""
+    assert "playful-challenge-rounds" in REQUIRED_REFERENCES
+    assert "playful-challenge-rounds" not in UI_REFERENCES
