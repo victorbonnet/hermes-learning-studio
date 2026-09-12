@@ -33,7 +33,8 @@
  *    and was trusted to scramble it would be one bug away from displaying the
  *    answer, and the bug would be invisible.
  *
- * A renderer returns `{ element, read, focus }`. `read()` answers
+ * A renderer returns `{ element, read, focus }`, with optional `cancel` and
+ * `cleanup` hooks for transient interaction. `read()` answers
  * `{ ok: true, response }` or `{ ok: false, error }` with an already-localized
  * message, and the response it produces is the wire shape documented in the
  * README: field names mirror the component's own answer schema so that a later
@@ -495,88 +496,316 @@
     };
   }
 
-  /** A reorderable list driven by buttons, never by dragging. */
+  /** A stable list: identity and the submitted aliases stay in closures. */
   function orderable(ctx, items, hintKey) {
-    var order = items.slice();
     var container = el("ol", { className: "ordered" });
-
-    function move(index, delta) {
-      var target = index + delta;
-      if (target < 0 || target >= order.length) {
-        return;
-      }
-      var moved = order[index];
-      order[index] = order[target];
-      order[target] = moved;
-      draw(target);
-    }
-
-    function draw(focusIndex) {
-      container.replaceChildren();
-      order.forEach(function (item, index) {
-        var up = el("button", {
-          className: "small",
-          text: "↑",
-          attrs: {
-            type: "button",
-            "aria-label": ctx.t("card.move_up") + ": " + item.label,
-          },
-          props: { disabled: index === 0 },
-        });
-        var down = el("button", {
-          className: "small",
-          text: "↓",
-          attrs: {
-            type: "button",
-            "aria-label": ctx.t("card.move_down") + ": " + item.label,
-          },
-          props: { disabled: index === order.length - 1 },
-        });
-        up.addEventListener("click", function () {
-          move(index, -1);
-        });
-        down.addEventListener("click", function () {
-          move(index, 1);
-        });
-
-        container.appendChild(
-          el("li", {
-            children: [
-              el("span", {
-                className: "rank",
-                text: String(index + 1),
-                attrs: { "aria-label": ctx.t("card.position", { position: index + 1 }) },
-              }),
-              content(ctx, "span", { className: "text", text: item.label }),
-              el("span", { className: "move-buttons", children: [up, down] }),
-            ],
-          })
-        );
+    var drag = null;
+    var disposed = false;
+    var frame = null;
+    var lastFrame = null;
+    var inverse = null;
+    var dragEnabled = false;
+    var statusIndex = 0;
+    var statusRegions = [0, 1].map(function () {
+      return chrome(ctx, "span", {
+        attrs: { role: "status", "aria-live": "polite", "aria-atomic": "true" },
       });
-      if (focusIndex !== undefined && focusIndex !== null) {
-        // Focus follows the item that moved, so a keyboard user can press the
-        // same button again instead of hunting for where the row went.
-        var row = container.children[focusIndex];
-        if (row) {
-          var buttons = row.children[2];
-          var wanted = buttons && buttons.children[focusIndex === 0 ? 1 : 0];
-          if (wanted && !wanted.disabled) {
-            wanted.focus();
-          }
+    });
+    var status = chrome(ctx, "p", {
+      className: "order-status hint", children: statusRegions,
+    });
+    var undo = chrome(ctx, "button", {
+      className: "order-undo", text: ctx.t("card.undo_move"),
+      attrs: { type: "button" }, props: { disabled: true },
+    });
+    var order = items.map(function (item) {
+      var up = chrome(ctx, "button", {
+        className: "small", text: "↑", attrs: { type: "button" },
+      });
+      var down = chrome(ctx, "button", {
+        className: "small", text: "↓", attrs: { type: "button" },
+      });
+      var rank = chrome(ctx, "span", { className: "rank" });
+      var entry = {
+        id: item.id, up: up, down: down, rank: rank,
+        row: el("li", { children: [
+          rank,
+          content(ctx, "span", { className: "text", text: item.label }),
+          el("span", { className: "move-buttons", children: [up, down] }),
+        ] }),
+      };
+      if (!ctx.keyboardOnly && typeof global.PointerEvent === "function") {
+        var handle = chrome(ctx, "span", {
+          className: "drag-handle", text: "⠿",
+          attrs: { tabindex: "-1", "aria-hidden": "true", title: ctx.t("card.drag_handle") },
+        });
+        if (typeof handle.setPointerCapture === "function" &&
+            typeof handle.releasePointerCapture === "function" &&
+            typeof handle.hasPointerCapture === "function") {
+          entry.handle = handle;
+          dragEnabled = true;
+          entry.row.appendChild(handle);
+          handle.addEventListener("pointerdown", function (event) { start(entry, event); });
         }
       }
+      up.addEventListener("click", function () { move(entry, -1); });
+      down.addEventListener("click", function () { move(entry, 1); });
+      return entry;
+    });
+
+    function clearPlacement() {
+      order.forEach(function (entry) {
+        entry.row.classList.remove("insert-before");
+        entry.row.classList.remove("insert-after");
+      });
     }
 
-    draw(null);
+    function announceStatus(message) {
+      var next = statusRegions[statusIndex];
+      statusRegions[1 - statusIndex].textContent = "";
+      next.textContent = message;
+      statusIndex = 1 - statusIndex;
+    }
 
+    function clearStatus() {
+      statusRegions.forEach(function (region) { region.textContent = ""; });
+      statusIndex = 0;
+    }
+
+    // The visual viewport excludes the software keyboard. `index.html` owns
+    // `#actions`; its actual box includes safe-area padding and must never be a
+    // drop destination.
+    function viewport() {
+      var visual = global.visualViewport;
+      var top = visual ? visual.offsetTop : 0;
+      var bottom = top + (visual ? visual.height : global.innerHeight);
+      var footer = doc().getElementById("actions");
+      if (footer && !footer.hidden) {
+        var rect = footer.getBoundingClientRect();
+        if (rect.bottom > top && rect.top < bottom) { bottom = Math.max(top, rect.top); }
+      }
+      if (typeof global.getComputedStyle === "function") {
+        top += parseFloat(global.getComputedStyle(doc().body).paddingTop) || 0;
+      }
+      return { top: top, bottom: bottom };
+    }
+
+    function scrollSpeed() {
+      if (!drag || !drag.moving) { return 0; }
+      var bounds = container.getBoundingClientRect();
+      var view = viewport();
+      var x = drag.clientX;
+      var y = drag.clientY;
+      if (x < bounds.left || x > bounds.right || y < view.top || y > view.bottom) { return 0; }
+      var edge = Math.min(48, (view.bottom - view.top) / 3);
+      if (edge <= 0) { return 0; }
+      if (y < view.top + edge && bounds.top < view.top) {
+        return -360 * (1 - (y - view.top) / edge);
+      }
+      if (y > view.bottom - edge && bounds.bottom > view.bottom) {
+        return 360 * (1 - (view.bottom - y) / edge);
+      }
+      return 0;
+    }
+
+    function stopScroll() {
+      if (frame !== null) { global.cancelAnimationFrame(frame); }
+      frame = null;
+      lastFrame = null;
+    }
+
+    function scheduleScroll() {
+      if (!scrollSpeed()) { stopScroll(); return; }
+      if (frame === null && typeof global.requestAnimationFrame === "function" &&
+          typeof global.cancelAnimationFrame === "function" && typeof global.scrollBy === "function") {
+        frame = global.requestAnimationFrame(scrollFrame);
+      }
+    }
+
+    function scrollFrame(time) {
+      frame = null;
+      var speed = scrollSpeed();
+      if (!speed) { stopScroll(); return; }
+      var elapsed = lastFrame === null ? 16 : Math.min(32, Math.max(0, time - lastFrame));
+      lastFrame = time;
+      // Instant, bounded increments under every motion preference. There is no
+      // smooth-scroll operation left running after the pointer is released.
+      var before = typeof global.scrollY === "number" ? global.scrollY : null;
+      global.scrollBy({ top: speed * elapsed / 1000, left: 0, behavior: "instant" });
+      place();
+      if (before !== null && global.scrollY === before) { stopScroll(); return; }
+      scheduleScroll();
+    }
+
+    function destination(x, y) {
+      var bounds = container.getBoundingClientRect();
+      var view = viewport();
+      if (y < view.top || y > view.bottom) { return null; }
+      if (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom) {
+        return null;
+      }
+      var slot = 0;
+      order.forEach(function (entry) {
+        var rect = entry.row.getBoundingClientRect();
+        if (y >= (rect.top + rect.bottom) / 2) { slot += 1; }
+      });
+      return slot;
+    }
+
+    function preview(event) {
+      if (!drag || event.pointerId !== drag.id) { return; }
+      if (!drag.moving && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 6) { return; }
+      drag.moving = true;
+      drag.entry.row.classList.add("order-moving");
+      drag.clientX = event.clientX;
+      drag.clientY = event.clientY;
+      place();
+      scheduleScroll();
+    }
+
+    function place() {
+      if (!drag || !drag.moving) { return; }
+      drag.slot = destination(drag.clientX, drag.clientY);
+      clearPlacement();
+      if (drag.slot !== null) {
+        var after = drag.slot === order.length;
+        order[after ? order.length - 1 : drag.slot].row.classList.add(after ? "insert-after" : "insert-before");
+      }
+    }
+
+    function release() {
+      if (!drag) { return; }
+      var ended = drag;
+      stopScroll();
+      drag = null;
+      global.removeEventListener("pointermove", preview);
+      global.removeEventListener("pointerup", drop);
+      global.removeEventListener("pointercancel", cancelPointer);
+      global.removeEventListener("keydown", escape);
+      ended.entry.handle.removeEventListener("lostpointercapture", cancelPointer);
+      ended.entry.row.classList.remove("order-moving");
+      clearPlacement();
+      if (ended.entry.handle.hasPointerCapture(ended.id)) {
+        ended.entry.handle.releasePointerCapture(ended.id);
+      }
+      return ended;
+    }
+
+    function drop(event) {
+      if (!drag || event.pointerId !== drag.id) { return; }
+      preview(event);
+      var ended = release();
+      if (!ended.moving) { return; }
+      if (ended.slot === null) { announceStatus(ctx.t("card.move_cancelled")); return; }
+      var index = order.indexOf(ended.entry);
+      var target = ended.slot > index ? ended.slot - 1 : ended.slot;
+      commit(ended.entry, target);
+    }
+
+    function cancelPointer(event) {
+      if (drag && event.pointerId === drag.id) { cancel(); }
+    }
+
+    function escape(event) {
+      if (event.key === "Escape" && drag) {
+        if (drag.moving) { event.preventDefault(); }
+        cancel();
+      }
+    }
+
+    function start(entry, event) {
+      if (disposed || drag || !event.isPrimary || event.button !== 0) { return; }
+      event.preventDefault();
+      try { entry.handle.setPointerCapture(event.pointerId); } catch (error) { return; }
+      drag = { entry: entry, id: event.pointerId, x: event.clientX, y: event.clientY, moving: false, slot: null };
+      global.addEventListener("pointermove", preview);
+      global.addEventListener("pointerup", drop);
+      global.addEventListener("pointercancel", cancelPointer);
+      global.addEventListener("keydown", escape);
+      entry.handle.addEventListener("lostpointercapture", cancelPointer);
+    }
+
+    function draw() {
+      var focused = doc().activeElement;
+      var focusRow = order.filter(function (entry) { return entry.row.contains(focused); })[0];
+      order.forEach(function (entry, index) {
+        container.appendChild(entry.row);
+        entry.rank.textContent = String(index + 1);
+        entry.up.disabled = index === 0;
+        entry.down.disabled = index === order.length - 1;
+        entry.up.setAttribute("aria-label", ctx.t("card.move_up") + ", " + ctx.t("card.position", { position: index + 1 }));
+        entry.down.setAttribute("aria-label", ctx.t("card.move_down") + ", " + ctx.t("card.position", { position: index + 1 }));
+      });
+      // Moving existing nodes may blur a descendant in older WebViews.
+      if (focusRow) {
+        if (focused !== focusRow.up && focused !== focusRow.down) {
+          focused = focusRow.up.disabled ? focusRow.down : focusRow.up;
+        } else if (focused.disabled) {
+          focused = focused === focusRow.up ? focusRow.down : focusRow.up;
+        }
+        if (!focused.disabled) { focused.focus({ preventScroll: true }); }
+      }
+    }
+
+    function cancel() {
+      var ended = release();
+      if (ended && ended.moving) { announceStatus(ctx.t("card.move_cancelled")); }
+    }
+
+    function commit(entry, target) {
+      var index = order.indexOf(entry);
+      if (index === target) {
+        announceStatus(ctx.t("card.position_unchanged", { position: index + 1, count: order.length }));
+        return;
+      }
+      inverse = { entry: entry, index: index };
+      order.splice(index, 1);
+      order.splice(target, 0, entry);
+      draw();
+      undo.disabled = false;
+      announceStatus(ctx.t("card.moved", { from: index + 1, to: target + 1, count: order.length }));
+    }
+
+    undo.addEventListener("click", function () {
+      if (disposed || !inverse) { return; }
+      cancel();
+      var restore = inverse;
+      order.splice(order.indexOf(restore.entry), 1);
+      order.splice(restore.index, 0, restore.entry);
+      inverse = null;
+      draw();
+      undo.disabled = true;
+      announceStatus(ctx.t("card.move_undone"));
+      (restore.entry.up.disabled ? restore.entry.down : restore.entry.up).focus({ preventScroll: true });
+    });
+
+    function move(entry, delta) {
+      if (disposed) { return; }
+      cancel();
+      var index = order.indexOf(entry);
+      var target = index + delta;
+      if (target < 0 || target >= order.length) { return; }
+      commit(entry, target);
+      var wanted = delta < 0 ? entry.up : entry.down;
+      (wanted.disabled ? (delta < 0 ? entry.down : entry.up) : wanted).focus({ preventScroll: true });
+    }
+
+    draw();
     return {
       node: el("div", {
-        children: [hint(ctx, hintKey), container],
+        className: "ordering",
+        children: [hint(ctx, dragEnabled ? hintKey + "_drag" : hintKey), container, undo, status],
       }),
+      cancel: cancel,
+      cleanup: function () {
+        release();
+        disposed = true;
+        inverse = null;
+        undo.disabled = true;
+        clearStatus();
+      },
       order: function () {
-        return order.map(function (item) {
-          return item.id;
-        });
+        return order.map(function (entry) { return entry.id; });
       },
     };
   }
@@ -589,6 +818,8 @@
       var control = orderable(ctx, entries, hintKey);
       return {
         body: [control.node],
+        cancel: control.cancel,
+        cleanup: control.cleanup,
         read: function () {
           return ok({ order: control.order() });
         },
@@ -1750,6 +1981,8 @@
       unsupported: built.unsupported === true,
       read: built.read,
       focus: built.focus || null,
+      cancel: built.cancel || null,
+      cleanup: built.cleanup || null,
     };
   }
 

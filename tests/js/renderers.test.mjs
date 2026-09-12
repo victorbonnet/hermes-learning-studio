@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { check, click, press, type } from "./dom.mjs";
+import { check, click, press, type, pointerEnvironment, pointer, orderingGeometry } from "./dom.mjs";
 import { completeCard } from "./complete.mjs";
 import {
   canaryPrefix,
@@ -359,7 +359,7 @@ test("ordering submits the current order and the buttons change it", () => {
   assert.deepEqual(plain(card.read().response.order), swapped);
 });
 
-test("ordering needs no pointer: every control is a button", () => {
+test("ordering fallback needs no pointer and every control is a button", () => {
   const { card } = renderType("sentence_order");
   const rows = card.element.byTag("li");
 
@@ -1189,4 +1189,377 @@ test("the hotspot describes itself with the alt text only once there is one", as
   for (const id of brokenNamed) {
     assert.ok(brokenIds.has(id));
   }
+});
+
+function orderingCard(type = "sequence_order", options = {}, win = loadRenderers()) {
+  const field = { sentence_order: "tokens", sequence_order: "steps", timeline: "events", process_flow: "stages" }[type];
+  const component = plain(FIXTURES[type]);
+  component.payload.content[field] = Array.from({ length: options.itemCount || 4 }, (_, index) => ({ id: `alias-${index}`, text: "Repeated label" }));
+  const ctx = Object.assign(renderContext(win, options), options);
+  const card = win.LearningStudioRenderers.render(component, ctx);
+  return { win, card, ctx, rows: card.element.byTag("li"), order: () => plain(card.read().response.order) };
+}
+
+test("ordering buttons preserve row identity and directional focus through every position", () => {
+  for (const type of ["sentence_order", "sequence_order", "timeline", "process_flow"]) {
+    const { win, card, rows, order } = orderingCard(type);
+    const down = rows[0].byTag("button")[1];
+    down.focus();
+    click(down);
+    assert.equal(card.element.byTag("li")[1], rows[0], "the moved row must be the same node");
+    assert.equal(win.document.activeElement, down);
+    click(down);
+    assert.equal(win.document.activeElement, down, "interior move keeps direction");
+    click(down);
+    const up = rows[0].byTag("button")[0];
+    assert.equal(win.document.activeElement, up, "boundary chooses enabled opposite");
+    assert.deepEqual(order(), ["alias-1", "alias-2", "alias-3", "alias-0"]);
+    click(up); click(up); click(up);
+    assert.equal(win.document.activeElement, down);
+    assert.deepEqual(order(), ["alias-0", "alias-1", "alias-2", "alias-3"]);
+  }
+});
+
+function pointerCard(type = "sequence_order", options = {}) {
+  const win = loadRenderers(pointerEnvironment());
+  const result = orderingCard(type, options, win);
+  orderingGeometry(result.card);
+  return { ...result, handles: result.card.element.all().filter(node => node.classList.contains("drag-handle")) };
+}
+
+test("ordering offers dedicated pointer handles only with capture support and without keyboard_only", () => {
+  const { card, ctx, rows, handles } = pointerCard();
+  assert.equal(handles.length, rows.length, "each row needs a dedicated handle");
+  const visibleHint = card.element.all().find(n => n.classList.contains("hint") && !n.classList.contains("order-status"));
+  assert.equal(visibleHint.textContent, ctx.t("card.order_hint_drag"));
+  for (const handle of handles) {
+    assert.equal(handle.getAttribute("tabindex"), "-1");
+    assert.equal(handle.getAttribute("aria-hidden"), "true");
+    assert.equal(handle.getAttribute("draggable"), null);
+  }
+  for (const row of rows) assert.equal(row.getAttribute("draggable"), null);
+  const keyboard = pointerCard("sequence_order", { keyboardOnly: true });
+  assert.equal(keyboard.handles.length, 0);
+  const keyboardHint = keyboard.card.element.all().find(n => n.classList.contains("hint") && !n.classList.contains("order-status"));
+  assert.equal(keyboardHint.textContent, keyboard.ctx.t("card.order_hint"));
+  assert.equal(orderingCard().card.element.all().filter(n => n.classList.contains("drag-handle")).length, 0);
+  const win = loadRenderers(pointerEnvironment());
+  const create = win.document.createElement.bind(win.document);
+  win.document.createElement = tag => { const node = create(tag); node.setPointerCapture = undefined; return node; };
+  const fallback = orderingCard("sequence_order", {}, win);
+  assert.equal(fallback.card.element.all().filter(n => n.classList.contains("drag-handle")).length, 0);
+  click(fallback.rows[0].byTag("button")[1]);
+  assert.equal(fallback.order()[1], "alias-0");
+
+  const handleWin = loadRenderers(pointerEnvironment());
+  const createHandle = handleWin.document.createElement.bind(handleWin.document);
+  handleWin.document.createElement = tag => {
+    const node = createHandle(tag);
+    if (tag === "span") {
+      let className = node.className;
+      Object.defineProperty(node, "className", {
+        configurable: true,
+        get: () => className,
+        set: value => {
+          className = String(value);
+          if (className.split(/\s+/).includes("drag-handle")) node.setPointerCapture = undefined;
+        },
+      });
+    }
+    return node;
+  };
+  const handleFallback = orderingCard("sequence_order", {}, handleWin);
+  assert.equal(handleFallback.card.element.all().filter(n => n.classList.contains("drag-handle")).length, 0);
+  assert.equal(card.unsupported, false);
+});
+
+test("pointer drop commits any position in each ordering family without exposing identity", () => {
+  for (const type of ["sentence_order", "sequence_order", "timeline", "process_flow"]) {
+    for (let from = 0; from < 4; from++) for (let to = 0; to < 4; to++) {
+      const { win, card, rows, handles, order } = pointerCard(type);
+      const initial = order();
+      const focused = rows[1].byTag("button")[1]; focused.focus();
+      const y = 100 + to * 80 + (to > from ? 70 : 2);
+      pointer(handles[from], "pointerdown", 100, 120 + from * 80);
+      pointer(win, "pointermove", 100, y);
+      assert.deepEqual(order(), initial, "preview must not change response");
+      assert.ok(rows[from].classList.contains("order-moving"), "threshold marks source");
+      assert.ok(rows.some(row => row.classList.contains("insert-before") || row.classList.contains("insert-after")), "destination is visible");
+      pointer(win, "pointerup", 100, y);
+      const expected = initial.slice(); expected.splice(to, 0, expected.splice(from, 1)[0]);
+      assert.deepEqual(order(), expected);
+      assert.deepEqual(card.element.byTag("li"), expected.map(alias => rows[initial.indexOf(alias)]));
+      assert.equal(win.document.activeElement, focused.disabled ? rows[1].byTag("button")[0] : focused);
+      assert.equal(handles[from].hasPointerCapture(1), false);
+      for (const node of card.element.all()) {
+        assert.ok(!JSON.stringify(node.attributes).includes("alias-"));
+        assert.ok(!JSON.stringify(node.attributes).includes("Repeated label"));
+      }
+      assert.ok(!card.element.serialize().includes(CANARY));
+    }
+  }
+});
+
+test("pointer cancellation leaves order intact and removes capture and listeners", () => {
+  for (const reason of ["pointercancel", "lostpointercapture", "Escape", "outside", "tap", "cleanup", "cancel"]) {
+    const { win, card, handles, rows, order } = pointerCard();
+    const initial = order();
+    pointer(handles[0], "pointerdown");
+    if (reason !== "tap") pointer(win, "pointermove", 100, 410);
+    if (reason === "Escape") win.dispatchEvent({ type: "keydown", key: "Escape", preventDefault() {} });
+    else if (reason === "lostpointercapture") handles[0].releasePointerCapture(1);
+    else if (reason === "outside") pointer(win, "pointerup", 390, 410);
+    else if (reason === "tap") pointer(win, "pointerup", 102, 122);
+    else if (reason === "cleanup" || reason === "cancel") card[reason]();
+    else pointer(win, reason);
+    assert.equal(handles[0].hasPointerCapture(1), false, reason);
+    assert.ok(rows.every(row => !row.classList.contains("order-moving") && !row.classList.contains("insert-before") && !row.classList.contains("insert-after")), reason);
+    assert.deepEqual(order(), initial, reason);
+    assert.equal([...win.listeners.values()].reduce((n, set) => n + set.size, 0), 0, reason);
+    pointer(win, "pointerup", 100, 410);
+    assert.deepEqual(order(), initial);
+    if (reason === "cleanup") {
+      pointer(handles[0], "pointerdown");
+      click(rows[0].byTag("button")[1]);
+      assert.equal(handles[0].hasPointerCapture(1), false);
+      assert.deepEqual(order(), initial, "detached controls are inert");
+    }
+  }
+});
+
+test("only the primary handle pointer can start or finish a gesture", () => {
+  const { win, handles, rows, order } = pointerCard();
+  const initial = order();
+  for (const extra of [{ isPrimary: false }, { button: 2 }]) {
+    pointer(handles[0], "pointerdown", 100, 120, extra);
+    assert.equal(handles[0].hasPointerCapture(1), false);
+  }
+  pointer(rows[0], "pointerdown");
+  pointer(win, "pointermove", 100, 410);
+  assert.deepEqual(order(), initial);
+  pointer(handles[0], "pointerdown");
+  pointer(handles[1], "pointerdown", 100, 200, { pointerId: 2 });
+  pointer(win, "pointermove", 100, 410, { pointerId: 2 });
+  pointer(win, "pointerup", 100, 410, { pointerId: 2 });
+  pointer(win, "pointercancel", 100, 410, { pointerId: 2 });
+  assert.equal(handles[0].hasPointerCapture(1), true);
+  assert.deepEqual(order(), initial);
+  pointer(win, "pointermove", 100, 410);
+  pointer(win, "pointerup", 100, 410);
+  assert.equal(order()[3], initial[0]);
+});
+
+test("ordering announces positions locally and offers untimed one-step undo in each UI language", () => {
+  for (const locale of ["en", "fr", "es"]) {
+    const { win, card, rows, handles, order, ctx } = pointerCard("sequence_order", { locale, contentLocale: "ja" });
+    const status = card.element.all().find(n => n.classList.contains("order-status"));
+    const regions = card.element.all().filter(n => n.getAttribute("role") === "status");
+    const undo = card.element.byTag("button").find(n => n.classList.contains("order-undo"));
+    assert.equal(regions.length, 2, "card needs alternating status regions");
+    assert.ok(regions.every(region => region.getAttribute("aria-live") === "polite"));
+    assert.ok(regions.every(region => region.getAttribute("lang") === locale));
+    assert.equal(undo.getAttribute("lang"), locale);
+    assert.equal(undo.disabled, true);
+    assert.equal(undo.textContent, ctx.t("card.undo_move"));
+    assert.notEqual(undo.textContent, "card.undo_move");
+    const initial = order();
+    click(rows[0].byTag("button")[1]);
+    assert.equal(status.textContent, ctx.t("card.moved", { from: 1, to: 2, count: 4 }));
+    assert.ok(!status.textContent.includes("Repeated label"));
+    assert.equal(undo.disabled, false);
+    const previous = order();
+    pointer(handles[0], "pointerdown", 100, 200);
+    pointer(win, "pointermove", 100, 410);
+    pointer(win, "pointerup", 100, 410);
+    assert.equal(status.textContent, ctx.t("card.moved", { from: 2, to: 4, count: 4 }));
+    // There is no expiry timer; frame progression cannot spend Undo.
+    for (let n = 0; n < 100; n++) win.frame();
+    undo.focus(); click(undo);
+    assert.deepEqual(order(), previous);
+    assert.equal(status.textContent, ctx.t("card.move_undone"));
+    assert.equal(undo.disabled, true);
+    assert.ok(rows[0].contains(win.document.activeElement), "undo leaves focus on the restored row");
+    click(undo);
+    assert.deepEqual(order(), previous, "only the last move can be undone");
+    click(rows[0].byTag("button")[0]);
+    assert.deepEqual(order(), initial);
+    pointer(handles[0], "pointerdown"); pointer(win, "pointermove", 100, 410); pointer(win, "pointercancel");
+    assert.equal(status.textContent, ctx.t("card.move_cancelled"));
+    assert.equal(undo.disabled, false, "cancelling does not discard last committed inverse");
+    click(undo);
+    assert.deepEqual(order(), previous);
+    card.cleanup();
+    assert.equal(undo.disabled, true);
+    assert.equal(status.textContent, "");
+  }
+});
+
+test("repeated ordering feedback alternates live regions and same-position drops are explicit", () => {
+  const repeated = pointerCard();
+  const regions = repeated.card.element.all().filter(n => n.getAttribute("role") === "status");
+  assert.equal(regions.length, 2);
+  click(repeated.rows[0].byTag("button")[1]);
+  const first = regions.find(region => region.textContent);
+  const firstText = first.textContent;
+  click(repeated.rows[1].byTag("button")[1]);
+  const second = regions.find(region => region.textContent);
+  assert.notEqual(second, first, "an identical sentence must still mutate a different live region");
+  assert.equal(second.textContent, firstText);
+
+  const unchanged = pointerCard();
+  const unchangedRegions = unchanged.card.element.all().filter(n => n.getAttribute("role") === "status");
+  pointer(unchanged.handles[0], "pointerdown", 100, 120);
+  pointer(unchanged.win, "pointermove", 100, 130);
+  pointer(unchanged.win, "pointerup", 100, 130);
+  assert.equal(
+    unchangedRegions.map(region => region.textContent).join(""),
+    unchanged.ctx.t("card.position_unchanged", { position: 1, count: 4 }),
+  );
+});
+
+test("ordering autoscroll is bounded at unobscured edges and stops on every exit", () => {
+  for (const exit of ["pointerup", "pointercancel", "lostpointercapture", "Escape", "cleanup", "cancel"]) {
+    const { win, card, handles, order } = pointerCard();
+    const footer = win.document.createElement("footer"); footer.id = "actions";
+    footer.getBoundingClientRect = () => ({ top: 600, bottom: 800, height: 200 });
+    win.document.body.appendChild(footer);
+    win.visualViewport = { offsetTop: 30, height: 730 };
+    let offset = 0;
+    orderingGeometry(card, () => 450 - offset);
+    win.scrollBy = options => { win.scrolls.push(options); offset += options.top; };
+    const initial = order();
+    pointer(handles[0], "pointerdown", 100, 470);
+    pointer(win, "pointermove", 100, 590);
+    assert.equal(win.frames.size, 1, "edge schedules autoscroll above sticky footer");
+    for (let i = 0; i < 8; i++) win.frame();
+    assert.ok(win.scrolls.length > 0);
+    assert.ok(win.scrolls.every(s => s.top > 0 && s.top <= 12 && s.behavior === "instant"));
+    assert.deepEqual(order(), initial);
+    if (exit === "Escape") win.dispatchEvent({ type: "keydown", key: "Escape", preventDefault() {} });
+    else if (exit === "lostpointercapture") handles[0].releasePointerCapture(1);
+    else if (exit === "cleanup" || exit === "cancel") card[exit]();
+    else pointer(win, exit, 390, 590);
+    assert.equal(win.frames.size, 0, exit);
+    const count = win.scrolls.length; win.frame();
+    assert.equal(win.scrolls.length, count);
+    assert.deepEqual(order(), initial);
+  }
+});
+
+test("ordering autoscroll respects visual viewport, list bounds, and reduced motion", () => {
+  const { win, card, handles } = pointerCard("sequence_order", { reducedMotion: true });
+  win.matchMedia = () => ({ matches: true });
+  win.visualViewport = { offsetTop: 100, height: 500 };
+  orderingGeometry(card, () => -20);
+  pointer(handles[1], "pointerdown", 100, 180);
+  pointer(win, "pointermove", 100, 115);
+  win.frame();
+  assert.ok(win.scrolls.some(s => s.top < 0 && s.top >= -12 && s.behavior === "instant"));
+  for (const [x, y] of [[100, 90], [390, 115], [100, 300], [100, 610]]) {
+    pointer(win, "pointermove", x, y);
+    assert.equal(win.frames.size, 0, `${x},${y} must not autoscroll`);
+  }
+  pointer(win, "pointerup", 100, 610);
+  assert.deepEqual(plain(card.read().response.order), ["alias-0", "alias-1", "alias-2", "alias-3"], "occluded drop cancels");
+});
+
+test("ordering excludes the computed safe-area inset from drops", () => {
+  const { win, card, handles, order, ctx } = pointerCard();
+  const initial = order();
+  const status = card.element.all().find(n => n.classList.contains("order-status"));
+  win.visualViewport = { offsetTop: 30, height: 700 };
+  win.getComputedStyle = () => ({ paddingTop: "40px" });
+  orderingGeometry(card, () => 0);
+  pointer(handles[1], "pointerdown", 100, 120);
+  pointer(win, "pointermove", 100, 60);
+  pointer(win, "pointerup", 100, 60);
+  assert.deepEqual(order(), initial);
+  assert.equal(status.textContent, ctx.t("card.move_cancelled"));
+});
+
+test("ordering autoscroll stops when the document cannot move farther", () => {
+  const { win, card, handles } = pointerCard();
+  const footer = win.document.createElement("footer"); footer.id = "actions";
+  footer.getBoundingClientRect = () => ({ top: 600, bottom: 800, height: 200 });
+  win.document.body.appendChild(footer);
+  orderingGeometry(card, () => 450);
+  win.scrollY = 500;
+  win.scrollBy = options => { win.scrolls.push(options); };
+  pointer(handles[0], "pointerdown", 100, 470);
+  pointer(win, "pointermove", 100, 590);
+  assert.equal(win.frames.size, 1);
+  win.frame();
+  assert.equal(win.frames.size, 0, "a no-op scroll must not schedule another frame");
+});
+
+test("pointer moves keep focus on an enabled control of the same row at a boundary", () => {
+  const { win, rows, handles } = pointerCard();
+  const [up, down] = rows[1].byTag("button");
+  down.focus();
+  pointer(handles[1], "pointerdown", 100, 200);
+  pointer(win, "pointermove", 100, 410);
+  pointer(win, "pointerup", 100, 410);
+  assert.equal(win.document.activeElement, up, "disabled focused direction needs its enabled opposite");
+
+  const hiddenFocus = pointerCard();
+  hiddenFocus.handles[1].focus();
+  pointer(hiddenFocus.handles[1], "pointerdown", 100, 200);
+  pointer(hiddenFocus.win, "pointermove", 100, 410);
+  pointer(hiddenFocus.win, "pointerup", 100, 410);
+  assert.ok(hiddenFocus.rows[1].contains(hiddenFocus.win.document.activeElement));
+  assert.notEqual(hiddenFocus.win.document.activeElement, hiddenFocus.handles[1]);
+  assert.notEqual(hiddenFocus.win.document.activeElement.getAttribute("aria-hidden"), "true");
+});
+
+test("Escape before movement cancels capture without swallowing the key", () => {
+  const { win, handles, order } = pointerCard();
+  const initial = order();
+  let prevented = false;
+  pointer(handles[0], "pointerdown");
+  win.dispatchEvent({ type: "keydown", key: "Escape", preventDefault() { prevented = true; } });
+  assert.equal(prevented, false);
+  assert.equal(handles[0].hasPointerCapture(1), false);
+  assert.equal([...win.listeners.values()].reduce((n, entries) => n + entries.size, 0), 0);
+  assert.deepEqual(order(), initial);
+});
+
+test("a long list can reach its last destination through autoscroll in one gesture", () => {
+  const { win, card, handles, order } = pointerCard("sequence_order", { itemCount: 12 });
+  let offset = 0;
+  orderingGeometry(card, () => 100 - offset);
+  win.scrollBy = options => { offset += options.top; };
+  const initial = order();
+  pointer(handles[0], "pointerdown");
+  pointer(win, "pointermove", 100, 790);
+  for (let n = 0; n < 400 && win.frames.size; n++) win.frame();
+  assert.equal(win.frames.size, 0, "autoscroll stops when the list fits above the lower edge");
+  assert.ok(offset > 200);
+  assert.deepEqual(order(), initial);
+  pointer(win, "pointerup", 100, 790);
+  assert.deepEqual(order(), [...initial.slice(1), initial[0]]);
+});
+
+test("capture refusal leaves buttons available and no transient work behind", () => {
+  const { win, handles, rows, order } = pointerCard();
+  handles[0].setPointerCapture = () => { throw new Error("capture unavailable"); };
+  pointer(handles[0], "pointerdown");
+  pointer(win, "pointermove", 100, 410);
+  assert.equal(win.frames.size, 0);
+  assert.equal([...win.listeners.values()].reduce((n, entries) => n + entries.size, 0), 0);
+  click(rows[0].byTag("button")[1]);
+  assert.equal(order()[1], "alias-0");
+});
+
+test("tap and same-position drop leave the last committed Undo available", () => {
+  const { win, card, handles, rows, order } = pointerCard();
+  const initial = order();
+  click(rows[0].byTag("button")[1]);
+  const undo = card.element.byTag("button").find(n => n.classList.contains("order-undo"));
+  pointer(handles[0], "pointerdown", 100, 200);
+  pointer(win, "pointerup", 101, 201);
+  pointer(handles[0], "pointerdown", 100, 200);
+  pointer(win, "pointermove", 100, 240);
+  pointer(win, "pointerup", 100, 240);
+  click(undo);
+  assert.deepEqual(order(), initial);
 });

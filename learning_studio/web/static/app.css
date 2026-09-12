@@ -563,6 +563,14 @@ button.small {
 
 /* ── Ordering ────────────────────────────────────────────────────────── */
 
+.ordering {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
 .ordered {
   list-style: none;
   margin: 0;
@@ -574,6 +582,7 @@ button.small {
 }
 
 .ordered li {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -593,6 +602,7 @@ button.small {
 }
 
 .ordered .text {
+  min-width: 0;
   flex: 1 1 auto;
   overflow-wrap: anywhere;
 }
@@ -604,9 +614,95 @@ button.small {
 }
 
 .move-buttons button {
-  min-height: 36px;
-  min-width: 36px;
+  min-height: var(--tap);
+  min-width: var(--tap);
   padding: 4px 8px;
+}
+
+.drag-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-height: var(--tap);
+  min-width: var(--tap);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 1.4rem;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.ordered .order-moving {
+  outline: 2px dashed var(--accent);
+  outline-offset: -4px;
+}
+
+.order-moving .drag-handle {
+  cursor: grabbing;
+  border-color: var(--accent);
+}
+
+/* Spatial lines with end caps remain legible without colour or movement. */
+.insert-before::before,
+.insert-after::before {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  left: 0;
+  right: 0;
+  height: 7px;
+  border: 3px solid var(--accent);
+  border-top: 0;
+  border-bottom-width: 2px;
+  top: -8px;
+}
+
+.insert-after::before {
+  top: auto;
+  bottom: -8px;
+}
+
+.order-undo {
+  align-self: flex-start;
+  border-color: var(--accent);
+  text-decoration: underline;
+}
+
+.order-status {
+  min-height: 1.5em;
+}
+
+@media (max-width: 420px) {
+  .ordered li {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .ordered .rank {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .ordered .text {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .drag-handle {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  .move-buttons {
+    grid-column: 2 / -1;
+    grid-row: 2;
+    justify-self: end;
+  }
 }
 
 /* ── Pairs, buckets, grids ───────────────────────────────────────────── */
