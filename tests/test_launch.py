@@ -91,6 +91,7 @@ class FakeRuntime:
                 "tunnel_ready": bool(self.tunnel_url),
                 "tunnel_url": self.tunnel_url,
                 "sessions": 0,
+                "startup_fingerprint": "test-policy",
                 "expires_in_seconds": 300,
             }
         if path == ownership.SHUTDOWN_PATH:
@@ -138,6 +139,7 @@ def runtime(clock, monkeypatch, hermes_home) -> FakeRuntime:
     """A running, proved-owned runtime with a validated tunnel."""
     fake = FakeRuntime(clock)
     monkeypatch.setattr(ownership, "_request", fake)
+    monkeypatch.setattr(supervisor, "startup_fingerprint", lambda *_: "test-policy")
     state.write_record(
         state.RuntimeRecord(
             runtime_id="runtime-1",
@@ -598,6 +600,7 @@ def test_a_runtime_without_a_tunnel_refuses_and_sends_nothing(
 ):
     fake = FakeRuntime(clock, tunnel_url="")
     monkeypatch.setattr(ownership, "_request", fake)
+    monkeypatch.setattr(supervisor, "startup_fingerprint", lambda *_: "test-policy")
     monkeypatch.setattr(bootstrap, "is_bootstrapped", lambda: True)
     monkeypatch.setattr(supervisor, "resolve_cloudflared", lambda cfg: "/usr/bin/cloudflared")
     state.write_record(

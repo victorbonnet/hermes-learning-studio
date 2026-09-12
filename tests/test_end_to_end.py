@@ -200,6 +200,7 @@ def runtime(clock, grants, monkeypatch, hermes_home, config):
                 "tunnel_ready": True,
                 "tunnel_url": TUNNEL_URL,
                 "sessions": len(grants),
+                "startup_fingerprint": "test-policy",
                 "expires_in_seconds": 7200,
             }
         if path == ownership.SHUTDOWN_PATH:
@@ -216,6 +217,7 @@ def runtime(clock, grants, monkeypatch, hermes_home, config):
         raise ownership.ControlError("control_status_404")
 
     monkeypatch.setattr(ownership, "_request", control)
+    monkeypatch.setattr(supervisor, "startup_fingerprint", lambda *_: "test-policy")
     monkeypatch.setattr(bootstrap, "is_bootstrapped", lambda: True)
     monkeypatch.setattr(supervisor, "resolve_cloudflared", lambda cfg: "/usr/bin/cloudflared")
     state.write_record(
