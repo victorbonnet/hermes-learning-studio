@@ -279,10 +279,10 @@ def test_the_button_carries_the_configured_label(
         principal,
         experience_id,
         deliver=deliver,
-        settings=config(launch_button_label="Open Aula Lola"),
+        settings=config(launch_button_label="Open Practice Room"),
     )
 
-    assert deliver.sent[0]["label"] == "Open Aula Lola"
+    assert deliver.sent[0]["label"] == "Open Practice Room"
 
 
 def test_the_result_never_carries_the_public_address(

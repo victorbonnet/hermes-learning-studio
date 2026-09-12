@@ -307,9 +307,8 @@ class LearningStudioConfig:
     #: it on PATH". This plugin never downloads it and never installs it.
     cloudflared_path: str = ""
 
-    #: Caption on the Telegram Web App button. Operators localise or brand it
-    #: here — ``Open Aula Lola`` is a perfectly good value for one profile and
-    #: is exactly why it is not the default.
+    #: Caption on the Telegram Web App button. Operators may localise or
+    #: customise it per profile without changing the generic product default.
     launch_button_label: str = DEFAULT_BUTTON_LABEL
 
     #: Context values that apply to the whole profile (``profile_config``
