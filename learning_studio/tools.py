@@ -14,8 +14,10 @@ storage, so they hold to four rules:
    schema is built from are re-checked here — before the database is opened,
    so a malformed request cannot half-apply.
 4. **Leak nothing.** Filesystem paths, SQL text, and raw exception strings
-   stay in the log. In particular an error must never reveal whether another
-   learner's object exists — see :data:`service.NOT_FOUND_MESSAGE`.
+   never reach the log — an unexpected failure logs only the fixed tool name
+   and the exception's class. In particular an error must never reveal
+   whether another learner's object exists — see
+   :data:`service.NOT_FOUND_MESSAGE`.
 """
 
 from __future__ import annotations
@@ -50,7 +52,8 @@ from .validation import SchemaViolation, validate
 logger = logging.getLogger(__name__)
 
 #: Shown to the agent when something unexpected fails. Deliberately free of
-#: paths, SQL, and exception detail; the real error goes to the log.
+#: paths, SQL, and exception detail; the log only gets the tool name and the
+#: exception's class, not the real error.
 _INTERNAL_ERROR = (
     "The Learning Studio could not complete that request. Nothing was saved. "
     "Continue the session in conversation."
@@ -109,14 +112,18 @@ def _run(tool_name: str, raw: Any, call) -> str:
         # without naming a path, a profile, or another learner.
         return _error(str(exc))
     except Exception as exc:
-        # The **class name**, not `str(exc)`. An unexpected exception here can
-        # be carrying anything the code below it was handling — a learner's
-        # answer, a storage path, a request URL with a bot token in it — and
-        # this line is the one place all of them converge. The traceback still
-        # goes to the log, because a tool that fails silently is worse; what
-        # does not go is a message chosen by whatever raised.
-        logger.exception("%s failed: %s", tool_name, type(exc).__name__)
-        return _error(_INTERNAL_ERROR)
+        # Keep only the programmer-chosen class name. The exception itself can
+        # be carrying a learner's answer, a storage path, a token-bearing URL,
+        # or a sensitive `__cause__`/`__context__` chain.
+        exception_name = type(exc).__name__
+
+    # This must run outside the active `except` block. Passing no `exc_info`
+    # prevents the standard logger from attaching a traceback, while leaving
+    # the block first also clears `sys.exc_info()`. Otherwise a custom record
+    # factory, filter, handler, or formatter could recover the ambient caught
+    # exception even though this call did not pass it explicitly.
+    logger.error("%s failed: %s", tool_name, exception_name)
+    return _error(_INTERNAL_ERROR)
 
 
 def handle_get_context(params: Any = None, **_kwargs: Any) -> str:
