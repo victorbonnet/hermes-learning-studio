@@ -376,10 +376,9 @@ def test_an_unexpected_transport_failure_never_carries_the_token_out(raised, cap
     """The arm that closes the hole.
 
     Only three exception classes were caught. Anything else propagated out of
-    the sender untouched and reached the tool layer's ``logger.exception``,
-    which renders an exception's text and every ``__context__`` behind it — and
-    a transport exception's text routinely quotes the request, whose path is
-    the bot token.
+    the sender untouched and up to the tool layer's unexpected-exception
+    handler — and a transport exception's text routinely quotes the request,
+    whose path is the bot token.
     """
     token = "123456:AAHsecret-token-value"
     failure = type(raised)(str(raised).replace("{token}", token))

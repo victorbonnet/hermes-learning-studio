@@ -8,6 +8,8 @@ types, extra keys, and someone else's IDs.
 from __future__ import annotations
 
 import json
+import logging
+import sys
 
 import pytest
 
@@ -592,6 +594,98 @@ def test_an_internal_failure_returns_a_safe_message(hermes_home, gateway_session
     assert "on fire" not in result["error"]
     assert str(hermes_home) not in result["error"]
     assert "could not complete" in result["error"]
+
+
+def test_an_internal_failure_does_not_log_the_exception_message_or_traceback(
+    hermes_home, gateway_session, monkeypatch, caplog
+):
+    """A direct exception can carry a learner's answer in its message."""
+    canary = "the learner's private answer was 'xyzzy-canary'"
+
+    def explode(*args, **kwargs):
+        raise RuntimeError(canary)
+
+    monkeypatch.setattr("learning_studio.service.get_context", explode)
+
+    with caplog.at_level("DEBUG", logger="learning_studio.tools"):
+        result = _call(tools.handle_get_context)
+
+    assert result["ok"] is False
+    assert "could not complete" in result["error"]
+
+    [record] = caplog.records
+    assert record.exc_info is None
+    assert canary not in record.getMessage()
+    assert canary not in caplog.text
+    assert record.getMessage() == "learning_studio_get_context failed: RuntimeError"
+
+
+def test_an_internal_failure_does_not_log_a_chained_causes_message(
+    hermes_home, gateway_session, monkeypatch, caplog
+):
+    """A chained cause's message can carry sensitive detail too, e.g. a raw SQL error."""
+    cause_canary = "sqlite3.OperationalError: near 'xyzzy-cause-canary'"
+    outer_canary = "outer failure referencing xyzzy-outer-canary"
+
+    def explode(*args, **kwargs):
+        try:
+            raise ValueError(cause_canary)
+        except ValueError as cause:
+            raise RuntimeError(outer_canary) from cause
+
+    monkeypatch.setattr("learning_studio.service.get_context", explode)
+
+    with caplog.at_level("DEBUG", logger="learning_studio.tools"):
+        result = _call(tools.handle_get_context)
+
+    assert result["ok"] is False
+    assert "could not complete" in result["error"]
+
+    [record] = caplog.records
+    assert record.exc_info is None
+    assert cause_canary not in record.getMessage()
+    assert outer_canary not in record.getMessage()
+    assert cause_canary not in caplog.text
+    assert outer_canary not in caplog.text
+    assert record.getMessage() == "learning_studio_get_context failed: RuntimeError"
+
+
+def test_the_exception_is_inactive_before_the_failure_log_record_is_created(
+    hermes_home, gateway_session, monkeypatch, caplog
+):
+    """Logging instrumentation must not be able to recover the caught exception."""
+    cause_canary = "implicit-context-cause-canary"
+    outer_canary = "implicit-context-outer-canary"
+    observed_exc_info = []
+    original_factory = logging.getLogRecordFactory()
+
+    def capturing_factory(*args, **kwargs):
+        observed_exc_info.append(sys.exc_info())
+        return original_factory(*args, **kwargs)
+
+    def explode(*args, **kwargs):
+        try:
+            raise ValueError(cause_canary)
+        except ValueError:
+            raise RuntimeError(outer_canary)  # noqa: B904 - intentional implicit context
+
+    monkeypatch.setattr("learning_studio.service.get_context", explode)
+    logging.setLogRecordFactory(capturing_factory)
+    try:
+        with caplog.at_level("DEBUG", logger="learning_studio.tools"):
+            result = _call(tools.handle_get_context)
+    finally:
+        logging.setLogRecordFactory(original_factory)
+
+    assert result["ok"] is False
+    assert observed_exc_info == [(None, None, None)]
+    [record] = caplog.records
+    assert record.exc_info is None
+    assert record.exc_text is None
+    assert record.stack_info is None
+    assert record.getMessage() == "learning_studio_get_context failed: RuntimeError"
+    assert cause_canary not in caplog.text
+    assert outer_canary not in caplog.text
 
 
 # ── The evaluation runtime's handlers ──────────────────────────────────────

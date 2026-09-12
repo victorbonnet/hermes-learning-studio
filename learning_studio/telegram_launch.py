@@ -258,12 +258,12 @@ def _post(token: str, payload: dict[str, Any], *, opener=None) -> None:
         # The arm that closes the hole. The three above name the failures the
         # standard library documents; anything else — an `http.client`
         # exception, something raised by an injected opener, a bug in this
-        # module — used to propagate out of here untouched and land in the tool
-        # layer's `logger.exception`, which renders an exception's own text and
-        # every `__context__` behind it. The text of a transport exception
-        # routinely quotes the request, and the request is a URL with the bot
-        # token in its path, so "unexpected" was a way for the credential to
-        # reach the log.
+        # module — used to propagate out of here untouched and land in the
+        # tool layer's unexpected-exception handler, which only ever logs a
+        # class name, but this module should not depend on that backstop. The
+        # text of a transport exception routinely quotes the request, and the
+        # request is a URL with the bot token in its path, so "unexpected" was
+        # a way for the credential to reach the log.
         #
         # `Exception` and not `BaseException`: a cancellation or a Ctrl-C is
         # not a delivery failure and must keep unwinding. And, like the others,
