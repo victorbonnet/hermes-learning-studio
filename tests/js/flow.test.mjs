@@ -15,7 +15,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { click } from "./dom.mjs";
+import { click, pointerEnvironment, pointer, orderingGeometry } from "./dom.mjs";
 import { completeCard } from "./complete.mjs";
 import { canaryPrefix, loadApp, payloads, settle } from "./harness.mjs";
 
@@ -288,6 +288,7 @@ async function boot(options = {}) {
   const { win, booted } = loadApp({
     telegram,
     fetch: fetchImpl,
+    windowOverrides: options.windowOverrides || {},
     location: options.location === undefined ? buttonLocation() : options.location,
   });
   await booted;
@@ -1895,5 +1896,132 @@ test("an empty palette clears every property it previously set", async () => {
     "--tg-secondary-bg-color",
   ]) {
     assert.equal(themeProperty(context, property), "", `${property} survived an empty palette`);
+  }
+});
+
+async function bootOrdering(options = {}) {
+  const context = await boot({ types: ["sequence_order", "short_answer"], windowOverrides: pointerEnvironment(), ...options });
+  const card = context.win.LearningStudioApp.instance.inspect().card;
+  orderingGeometry(card);
+  const rows = card.element.byTag("li");
+  const handles = card.element.all().filter(n => n.classList.contains("drag-handle"));
+  return { ...context, card, rows, handles };
+}
+
+test("submit cancels a transient drag before reading and advances only on server confirmation", async () => {
+  const waiting = deferred();
+  const context = await bootOrdering({ wrapFetch: fetch => async (path, init) => {
+    if (path === "/api/session/answer") await waiting.promise;
+    return fetch(path, init);
+  } });
+  const { win, card, handles, api, node } = context;
+  const initial = JSON.parse(JSON.stringify(card.read().response));
+  const before = api.log.length;
+  pointer(handles[0], "pointerdown"); pointer(win, "pointermove", 100, 250);
+  assert.equal(api.log.length, before, "dragging makes no request");
+  const read = card.read;
+  card.read = () => {
+    assert.equal(handles[0].hasPointerCapture(1), false, "cancel before reading");
+    return read();
+  };
+  click(node("primary-action"));
+  assert.equal(handles[0].hasPointerCapture(1), false);
+  click(node("primary-action"));
+  assert.equal(cardOf(win).children[0], card.element);
+  waiting.release(); await settle(30);
+  assert.equal(api.answers.length, 1);
+  assert.deepEqual(api.answers[0].response, initial);
+  assert.equal(cardOf(win).children[0].getAttribute("data-component-type"), "short_answer");
+  assert.match(node("announcer").textContent, /recorded/);
+  assert.ok(!JSON.stringify(api.log).includes(CANARY));
+});
+
+test("card replacement clears all interaction and undo state on advance, completion, error, and restart", async () => {
+  for (const route of ["advance", "complete", "error", "restart"]) {
+    const context = await bootOrdering({ types: route === "complete" ? ["sequence_order"] : ["sequence_order", "short_answer"] });
+    const { win, card, handles, rows, api, node } = context;
+    click(rows[0].byTag("button")[1]);
+    const undo = card.element.byTag("button").find(n => n.classList.contains("order-undo"));
+    assert.equal(undo.disabled, false);
+    const committed = JSON.stringify(card.read());
+    // A pending answer still leaves the old card on screen. Begin another
+    // gesture before its response, so replacement itself must clean it up.
+    if (route === "error" || route === "restart") api.failWith["/api/session/answer"] = 500;
+    click(node("primary-action"));
+    orderingGeometry(card, () => 650);
+    pointer(handles[0], "pointerdown", 100, 675);
+    pointer(win, "pointermove", 100, 790);
+    assert.equal(handles[0].hasPointerCapture(1), true);
+    assert.equal(win.frames.size, 1);
+    await settle(30);
+    assert.equal(handles[0].hasPointerCapture(1), false, route);
+    assert.equal(win.frames.size, 0, route);
+    assert.equal([...win.listeners.values()].reduce((n, entries) => n + entries.size, 0), 0, route);
+    assert.equal(undo.disabled, true, route);
+    pointer(handles[0], "pointerdown"); click(undo); click(rows[0].byTag("button")[1]);
+    assert.equal(JSON.stringify(card.read()), committed);
+    if (route === "restart") { click(node("primary-action")); await settle(30); }
+    if (route === "complete") assert.equal(stateOf(win), "complete");
+    if (route === "error") assert.equal(stateOf(win), "server");
+    assert.ok(!win.document.documentElement.serialize().includes(CANARY));
+  }
+});
+
+test("experience keyboard_only omits handles while ordering and immediate submission remain complete", async () => {
+  const context = await bootOrdering({ accommodations: ["keyboard_only"] });
+  assert.equal(context.handles.length, 0);
+  click(context.rows[0].byTag("button")[1]);
+  const expected = JSON.parse(JSON.stringify(context.card.read().response));
+  click(context.node("primary-action")); await settle(30);
+  assert.deepEqual(context.api.answers[0].response, expected);
+  assert.equal(cardOf(context.win).children[0].getAttribute("data-component-type"), "short_answer");
+});
+
+test("malformed accommodation strings do not activate exact accommodation flags", async () => {
+  const context = await bootOrdering({ accommodations: "keyboard_only,reduced_motion" });
+  assert.equal(context.handles.length, context.rows.length);
+  assert.equal(motionMarkerOf(context.win), null);
+});
+
+test("all ordering families submit pointer permutations without requests during movement", async () => {
+  for (const type of ["sentence_order", "sequence_order", "timeline", "process_flow"]) {
+    const { win, card, handles, rows, node, api } = await bootOrdering({ types: [type, "short_answer"] });
+    const initial = JSON.parse(JSON.stringify(card.read().response.order));
+    const requests = api.log.length;
+    const announcement = node("announcer").textContent;
+    pointer(handles[0], "pointerdown");
+    pointer(win, "pointermove", 100, 100 + rows.length * 80 - 10);
+    pointer(win, "pointerup", 100, 100 + rows.length * 80 - 10);
+    assert.equal(api.log.length, requests);
+    assert.equal(node("announcer").textContent, announcement, "movement never uses submit announcer");
+    click(node("primary-action")); await settle(30);
+    assert.deepEqual(api.answers[0].response, { order: [...initial.slice(1), initial[0]] });
+    assert.equal(cardOf(win).children[0].getAttribute("data-component-type"), "short_answer");
+  }
+});
+
+test("ordering autoscroll stays instant under OS, experience, and component reduced motion", async () => {
+  for (const preference of ["os", "experience", "component"]) {
+    const api = preference === "component"
+      ? componentReducedMotionApi(["sequence_order"])
+      : fakeApi({ types: ["sequence_order"], accommodations: preference === "experience" ? ["reduced_motion"] : [] });
+    const { win, booted } = loadApp({
+      telegram: telegramStub(), fetch: api.fetchImpl, location: buttonLocation(),
+      windowOverrides: { ...pointerEnvironment(), matchMedia: () => ({ matches: preference === "os" }) },
+    });
+    await booted;
+    const card = win.LearningStudioApp.instance.inspect().card;
+    orderingGeometry(card, () => 700);
+    const handle = card.element.all().find(n => n.classList.contains("drag-handle"));
+    pointer(handle, "pointerdown", 100, 720);
+    pointer(win, "pointermove", 100, 790); win.frame();
+    assert.ok(win.scrolls.length > 0);
+    assert.ok(win.scrolls.every(s => s.behavior === "instant"));
+    if (preference !== "os") {
+      assert.equal(motionMarkerOf(win), "true");
+      assert.equal(entersWithAnimation(win), false);
+    }
+    card.cleanup();
+    assert.equal(win.frames.size, 0);
   }
 });

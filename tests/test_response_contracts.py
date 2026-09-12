@@ -166,13 +166,18 @@ def test_a_served_alias_is_translated_back_to_the_canonical_identifier():
     assert accepted["option_id"] in {entry["id"] for entry in component.content["options"]}
 
 
-@pytest.mark.parametrize("component_type", ["sentence_order", "sequence_order", "timeline"])
+@pytest.mark.parametrize(
+    "component_type", ["sentence_order", "sequence_order", "timeline", "process_flow"]
+)
 def test_an_ordering_is_translated_entry_by_entry(component_type: str):
     component = build_component(example(component_type), "component")
     projected = component.project()
-    field = {"sentence_order": "tokens", "sequence_order": "steps", "timeline": "events"}[
-        component_type
-    ]
+    field = {
+        "sentence_order": "tokens",
+        "sequence_order": "steps",
+        "timeline": "events",
+        "process_flow": "stages",
+    }[component_type]
     shown = [entry["id"] for entry in projected.payload["content"][field]]
 
     accepted = validate_component_response(

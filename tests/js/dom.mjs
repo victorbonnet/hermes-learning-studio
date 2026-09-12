@@ -157,7 +157,14 @@ class Element {
     return child;
   }
 
+  contains(node) {
+    return this.all().includes(node);
+  }
+
   removeChild(child) {
+    if (child.contains(this.ownerDocument.activeElement)) {
+      this.ownerDocument.activeElement = this.ownerDocument.body;
+    }
     this.children = this.children.filter((node) => node !== child);
     child.parentNode = null;
     return child;
@@ -193,6 +200,17 @@ class Element {
       this.onclick(payload);
     }
     return true;
+  }
+
+  setPointerCapture(id) { this.capturedPointer = id; }
+
+  hasPointerCapture(id) { return this.capturedPointer === id; }
+
+  releasePointerCapture(id) {
+    if (this.hasPointerCapture(id)) {
+      this.capturedPointer = null;
+      this.dispatchEvent({ type: "lostpointercapture", pointerId: id });
+    }
   }
 
   focus() {
@@ -329,3 +347,49 @@ export function press(node, key, modifiers = {}) {
 }
 
 export { Element, FakeDocument };
+
+/** Opt-in Pointer Events, capture, and frame clock; no wall-clock timers. */
+export function pointerEnvironment() {
+  const listeners = new Map();
+  const frames = new Map();
+  const scrolls = [];
+  let frameId = 0;
+  let time = 0;
+  return {
+    PointerEvent: function () {},
+    innerHeight: 800,
+    innerWidth: 400,
+    listeners, frames, scrolls,
+    addEventListener(type, handler) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(handler);
+    },
+    removeEventListener(type, handler) { listeners.get(type)?.delete(handler); },
+    dispatchEvent(event) { for (const handler of [...(listeners.get(event.type) || [])]) handler(event); },
+    requestAnimationFrame(handler) { frames.set(++frameId, handler); return frameId; },
+    cancelAnimationFrame(id) { frames.delete(id); },
+    frame() {
+      time += 16;
+      const pending = [...frames.values()]; frames.clear();
+      for (const handler of pending) handler(time);
+    },
+    scrollBy(options) { scrolls.push(options); },
+  };
+}
+
+export function pointer(node, type, x = 100, y = 120, extra = {}) {
+  node.dispatchEvent({ type, clientX: x, clientY: y, pointerId: 1, isPrimary: true, button: 0, preventDefault() {}, ...extra });
+}
+
+/** Geometry follows DOM order, with optional scrolling supplied by the test. */
+export function orderingGeometry(card, top = () => 100) {
+  const list = card.element.byTag("ol")[0];
+  list.getBoundingClientRect = () => ({ left: 20, right: 380, top: top(), bottom: top() + list.children.length * 80 });
+  for (const row of list.children) {
+    row.getBoundingClientRect = () => {
+      const y = top() + list.children.indexOf(row) * 80;
+      return { left: 20, right: 380, top: y, bottom: y + 72 };
+    };
+  }
+  return list;
+}

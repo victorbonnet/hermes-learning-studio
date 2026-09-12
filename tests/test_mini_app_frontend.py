@@ -228,7 +228,8 @@ def test_every_element_the_application_asks_for_exists_in_the_document():
     assert cached, "app.js no longer caches its elements from one list of ids"
 
     wanted = set(re.findall(r'"([^"]+)"', cached.group(1)))
-    wanted |= set(re.findall(r'getElementById\("([^"]+)"\)', app_source))
+    for name in ("app.js", "renderers.js"):
+        wanted |= set(re.findall(r'getElementById\("([^"]+)"\)', code(name)))
 
     assert len(wanted) > 5, "too few element ids found; this check has stopped working"
     assert wanted <= declared, sorted(wanted - declared)
@@ -722,3 +723,45 @@ def test_the_renderers_cannot_reach_the_network_at_all():
 
     for reachable in ("XMLHttpRequest", "WebSocket", "EventSource", "navigator.sendBeacon"):
         assert reachable not in renderers
+
+
+def test_ordering_drag_styles_preserve_targets_scrolling_and_static_cues():
+    stylesheet = source("app.css")
+    controls = re.search(r"\.move-buttons button\s*\{([^}]+)\}", stylesheet).group(1)
+    assert "min-height: var(--tap)" in controls
+    assert "min-width: var(--tap)" in controls
+    handle = re.search(r"\.drag-handle\s*\{([^}]+)\}", stylesheet)
+    assert handle, "the optional pointer affordance needs its own styling"
+    assert "min-height: var(--tap)" in handle.group(1)
+    assert "min-width: var(--tap)" in handle.group(1)
+    assert "touch-action: none" in handle.group(1)
+    assert stylesheet.count("touch-action:") == 1, "surrounding content must still scroll"
+    for state in ("order-moving", "insert-before", "insert-after", "order-undo"):
+        assert f".{state}" in stylesheet
+    ordering = stylesheet.split("/* ── Ordering", 1)[1].split("/* ── Pairs", 1)[0]
+    assert "dashed" in ordering, "source state cannot rely on colour alone"
+    assert "::before" in ordering, "insertion needs a spatial placement indicator"
+    assert "transform:" not in ordering
+    assert "animation:" not in ordering
+    assert "min-width: 0" in ordering
+    assert "@media" in ordering, "44px controls need room on narrow screens"
+
+
+def test_ordering_drag_keeps_pointer_state_inert_and_ephemeral():
+    ordering = (
+        code("renderers.js")
+        .split("function orderable(", 1)[1]
+        .split("function orderingRenderer", 1)[0]
+    )
+    for forbidden in (
+        "DataTransfer",
+        '"draggable"',
+        "dragstart",
+        ".style",
+    ):
+        assert forbidden not in ordering
+    # Attribute and serialized-DOM privacy belong to the executable renderer
+    # tests, which exercise real node values instead of source formatting.
+    assert "PointerEvent" in ordering
+    assert "setPointerCapture" in ordering
+    assert 'behavior: "instant"' in ordering
