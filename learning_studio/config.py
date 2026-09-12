@@ -14,7 +14,8 @@ that degraded to "off" would look identical to the setting working.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .components import MINIMUM_REQUEST_BYTES
@@ -306,9 +307,8 @@ class LearningStudioConfig:
     #: it on PATH". This plugin never downloads it and never installs it.
     cloudflared_path: str = ""
 
-    #: Caption on the Telegram Web App button. Operators localise or brand it
-    #: here — ``Open Aula Lola`` is a perfectly good value for one profile and
-    #: is exactly why it is not the default.
+    #: Caption on the Telegram Web App button. Operators may localise or
+    #: customise it per profile without changing the generic product default.
     launch_button_label: str = DEFAULT_BUTTON_LABEL
 
     #: Context values that apply to the whole profile (``profile_config``
@@ -406,6 +406,35 @@ _PARSERS: dict[str, Any] = {
 }
 
 _KNOWN_KEYS = frozenset(_PARSERS)
+
+
+def config_to_json(config: LearningStudioConfig) -> str:
+    """Serialise every validated setting for the isolated runtime."""
+    return json.dumps(asdict(config), allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+
+def config_from_json(payload: str) -> LearningStudioConfig:
+    """Rebuild and revalidate a complete runtime settings handoff."""
+
+    def unique_mapping(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError("duplicate configuration key")
+            parsed[key] = value
+        return parsed
+
+    try:
+        parsed = json.loads(payload, object_pairs_hook=unique_mapping)
+    except ValueError as exc:
+        raise ConfigError(f"{CONFIG_SECTION} settings were not handed over as JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ConfigError(f"{CONFIG_SECTION} settings must be handed over as a mapping")
+    if set(parsed) != _KNOWN_KEYS:
+        raise ConfigError(
+            f"{CONFIG_SECTION} settings must be handed over naming every setting exactly once"
+        )
+    return LearningStudioConfig.from_mapping({CONFIG_SECTION: parsed})
 
 
 def load_raw_config() -> dict[str, Any]:

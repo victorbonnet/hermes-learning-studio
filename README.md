@@ -401,9 +401,8 @@ learning_studio:
   # chose.
   cloudflared_path: ""
 
-  # Caption on the Telegram Web App button. Localise or brand it here —
-  # "Open Aula Lola" is a perfectly good value for one profile, which is
-  # exactly why it is not the default.
+  # Caption on the Telegram Web App button. Localise or customise it per
+  # profile without changing the generic product default.
   launch_button_label: Open Learning Studio
 
   # Context values that apply to everyone on this profile.

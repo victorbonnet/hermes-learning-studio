@@ -56,7 +56,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..config import LearningStudioConfig
+from ..config import LearningStudioConfig, config_to_json
 from . import bootstrap, ownership
 from . import environment as env
 from .errors import (
@@ -135,11 +135,49 @@ def resolve_cloudflared(config: LearningStudioConfig) -> str:
     return str(path)
 
 
+def resolve_allowed_users(
+    config: LearningStudioConfig, *, source: dict[str, str] | None = None
+) -> frozenset[str]:
+    """Resolve every host and plugin admission gate in the Hermes parent."""
+    from ..authorization import effective_allowed_users
+    from ..config import load_raw_config
+
+    return effective_allowed_users(
+        plugin_restriction=config.mini_app_allowed_telegram_users,
+        env=source,
+        host_config=load_raw_config(),
+    )
+
+
+def _startup_payloads(
+    config: LearningStudioConfig, allowed_users: frozenset[str]
+) -> tuple[str, str]:
+    config_payload = env.bounded_startup_instruction(env.CONFIG, config_to_json(config))
+    allowed_users_payload = env.bounded_startup_instruction(
+        env.ALLOWED_USERS, env.allowed_users_to_json(allowed_users)
+    )
+    return config_payload, allowed_users_payload
+
+
+def startup_fingerprint(config: LearningStudioConfig, allowed_users: frozenset[str]) -> str:
+    """Identify the complete policy a reusable runtime must still be serving."""
+    return env.startup_fingerprint(*_startup_payloads(config, allowed_users))
+
+
+def _stop_proved_runtime(record: RuntimeRecord, config: LearningStudioConfig) -> None:
+    outcome = ownership.stop_owned(record, graceful_seconds=config.runtime_graceful_stop_seconds)
+    if outcome.result not in ("stopped", "not_running"):
+        raise ownership.unprovable_error()
+    clear_record()
+
+
 def child_environment(
     record: RuntimeRecord,
     *,
     handshake: Path,
     cloudflared: str,
+    config: LearningStudioConfig,
+    allowed_users: frozenset[str] | None = None,
     source: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """The complete environment the runtime is given — nothing inherited by default.
@@ -149,7 +187,13 @@ def child_environment(
     credential for an unrelated tool: a copy-and-delete list would pass it
     straight into a process that answers a public URL, and nobody would notice
     until it appeared in a crash report.
+
+    ``config`` is required: defaulting it would discard operator settings.
     """
+    resolved_allowed_users = (
+        resolve_allowed_users(config, source=source) if allowed_users is None else allowed_users
+    )
+    config_payload, allowed_users_payload = _startup_payloads(config, resolved_allowed_users)
     child: dict[str, str] = {
         env.RUNTIME_ID: record.runtime_id,
         env.GENERATION: str(record.generation),
@@ -158,6 +202,8 @@ def child_environment(
         env.HANDSHAKE: str(handshake),
         env.IDLE_SECONDS: str(record.idle_timeout_seconds),
         env.MAX_LIFETIME_SECONDS: str(record.max_lifetime_seconds),
+        env.CONFIG: config_payload,
+        env.ALLOWED_USERS: allowed_users_payload,
     }
     if cloudflared:
         child[env.CLOUDFLARED] = cloudflared
@@ -261,6 +307,19 @@ def ensure_running(
         raise _unavailable(UNSUPPORTED_PLATFORM, "platform_unsupported")
 
     previous = read_record()
+    allowed_users = resolve_allowed_users(config)
+    try:
+        expected_fingerprint = startup_fingerprint(config, allowed_users)
+    except (OSError, ValueError) as exc:
+        if previous is not None:
+            try:
+                ownership.query(previous)
+            except ownership.ControlError:
+                clear_record()
+            else:
+                _stop_proved_runtime(previous, config)
+        logger.warning("the runtime process could not be started: %s", exc)
+        raise _unavailable(START_FAILED, "runtime_spawn_failed") from exc
     if previous is not None:
         try:
             reply = ownership.query(previous)
@@ -270,7 +329,9 @@ def ensure_running(
             # is left to the deadline it enforces on itself.
             clear_record()
         else:
-            return RuntimeHandle(record=previous, reply=reply, started=False)
+            if reply.payload.get("startup_fingerprint") == expected_fingerprint:
+                return RuntimeHandle(record=previous, reply=reply, started=False)
+            _stop_proved_runtime(previous, config)
 
     if python is not None:
         # A caller-supplied interpreter, which only the tests and the bootstrap
@@ -299,6 +360,8 @@ def ensure_running(
     # coincidence rather than a check.
     return _start(
         config,
+        allowed_users=allowed_users,
+        expected_fingerprint=expected_fingerprint,
         interpreter=interpreter,
         previous=previous,
         popen=popen,
@@ -357,6 +420,8 @@ def _interruptions_deferred():
 def _start(
     config: LearningStudioConfig,
     *,
+    allowed_users: frozenset[str],
+    expected_fingerprint: str,
     interpreter: Path,
     previous: RuntimeRecord | None,
     popen,
@@ -385,14 +450,15 @@ def _start(
         idle_timeout_seconds=config.runtime_idle_timeout_seconds,
         max_lifetime_seconds=config.runtime_max_lifetime_seconds,
     )
-    child_env = child_environment(
-        record_without_port,
-        handshake=handshake,
-        cloudflared=resolve_cloudflared(config),
-    )
-
     child = None
     try:
+        child_env = child_environment(
+            record_without_port,
+            handshake=handshake,
+            cloudflared=resolve_cloudflared(config),
+            config=config,
+            allowed_users=allowed_users,
+        )
         with _interruptions_deferred():
             child = popen(
                 # An argument array. There is no shell anywhere in this package
@@ -419,6 +485,7 @@ def _start(
             child=child,
             record=record,
             handshake=handshake,
+            expected_fingerprint=expected_fingerprint,
             clock=clock,
             sleep=sleep,
         )
@@ -447,6 +514,7 @@ def _await_ready(
     child,
     record: RuntimeRecord,
     handshake: Path,
+    expected_fingerprint: str,
     clock,
     sleep,
 ) -> RuntimeHandle:
@@ -477,6 +545,9 @@ def _await_ready(
         except ownership.ControlError:
             sleep(POLL_SECONDS)
             continue
+
+        if reply.payload.get("startup_fingerprint") != expected_fingerprint:
+            raise _unavailable(START_FAILED, "runtime_startup_contract_mismatch")
 
         write_record(record)
         _forget_handshake(handshake)

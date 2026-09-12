@@ -148,6 +148,7 @@ class Answering:
             "server_state": "ready",
             "tunnel_state": "ready",
             "tunnel_ready": True,
+            "startup_fingerprint": supervisor.startup_fingerprint(config(), frozenset()),
         }
 
 
@@ -173,6 +174,34 @@ def test_a_start_records_a_runtime_only_once_it_answers(
     assert stored is not None
     assert stored.pid == 31337
     assert stored.port == 45678
+
+
+def test_a_start_is_rolled_back_when_the_child_reports_another_policy(
+    hermes_home: Path, interpreter: Path, monkeypatch
+):
+    class WrongPolicy(Answering):
+        def __call__(self, record, method, path, *, body=None, timeout=None):
+            reply = super().__call__(record, method, path, body=body, timeout=timeout)
+            reply["startup_fingerprint"] = "another-policy"
+            return reply
+
+    monkeypatch.setattr(ownership, "_request", WrongPolicy())
+    monkeypatch.setattr(ownership, "owned", lambda *_args, **_kwargs: False)
+    clock = Clock()
+    child = FakeChild()
+
+    with pytest.raises(RuntimeUnavailable) as caught:
+        supervisor.ensure_running(
+            config(),
+            popen=FakePopen(child, publishes=45678),  # type: ignore[arg-type]
+            clock=clock,
+            sleep=clock.sleep,
+            python=interpreter,
+        )
+
+    assert caught.value.reason == "runtime_startup_contract_mismatch"
+    assert child.poll() == 0
+    assert state.read_record() is None
 
 
 def test_the_recorded_port_is_the_one_the_runtime_reports(
@@ -269,6 +298,7 @@ def test_the_child_environment_is_built_by_naming_every_variable(hermes_home: Pa
         record,
         handshake=Path("/tmp/h.json"),
         cloudflared="/usr/bin/cloudflared",
+        config=config(),
         source={
             "HERMES_HOME": "/profiles/family",
             "TELEGRAM_BOT_TOKEN": "123:abc",
@@ -457,6 +487,86 @@ def test_a_healthy_runtime_is_reused_and_nothing_is_started(
     assert popen.command is None
 
 
+@pytest.mark.parametrize("old_fingerprint", [None, "superseded-policy"])
+def test_a_runtime_with_stale_startup_policy_is_stopped_and_replaced(
+    hermes_home: Path, interpreter: Path, monkeypatch, old_fingerprint: str | None
+):
+    old = stored_record()
+    expected = "current-policy"
+    monkeypatch.setattr(supervisor, "startup_fingerprint", lambda *_: expected, raising=False)
+
+    class PolicyAnswering(Answering):
+        def __call__(self, record, method, path, *, body=None, timeout=None):
+            reply = super().__call__(record, method, path, body=body, timeout=timeout)
+            if record.runtime_id != old.runtime_id:
+                reply["startup_fingerprint"] = expected
+            elif old_fingerprint is None:
+                reply.pop("startup_fingerprint")
+            else:
+                reply["startup_fingerprint"] = old_fingerprint
+            return reply
+
+    monkeypatch.setattr(ownership, "_request", PolicyAnswering())
+    stopped: list[str] = []
+
+    def stop_owned(record, **_kwargs):
+        stopped.append(record.runtime_id)
+        return ownership.StopOutcome(result="stopped", method="control")
+
+    monkeypatch.setattr(ownership, "stop_owned", stop_owned)
+    clock = Clock()
+    popen = FakePopen(publishes=45678)
+
+    handle = supervisor.ensure_running(
+        config(), popen=popen, clock=clock, sleep=clock.sleep, python=interpreter
+    )
+
+    assert stopped == [old.runtime_id]
+    assert handle.started is True
+    assert handle.record.runtime_id != old.runtime_id
+    assert handle.record.generation == old.generation + 1
+
+
+def test_an_invalid_new_startup_instruction_stops_a_proved_existing_runtime(
+    hermes_home: Path, interpreter: Path, monkeypatch
+):
+    old = stored_record()
+
+    def answer(record, method, path, *, body=None, timeout=None):
+        return {
+            "runtime_id": record.runtime_id,
+            "generation": record.generation,
+            "pid": record.pid,
+            "executable": record.executable,
+            "started_at": 1000.0,
+            "idle_seconds": None,
+            "server_state": "ready",
+            "tunnel_state": "ready",
+            "tunnel_ready": True,
+        }
+
+    monkeypatch.setattr(ownership, "_request", answer)
+
+    def oversized(*_args):
+        raise ValueError("oversized LEARNING_STUDIO_CONFIG")
+
+    monkeypatch.setattr(supervisor, "startup_fingerprint", oversized)
+    stopped: list[str] = []
+
+    def stop_owned(record, **_kwargs):
+        stopped.append(record.runtime_id)
+        return ownership.StopOutcome(result="stopped", method="control")
+
+    monkeypatch.setattr(ownership, "stop_owned", stop_owned)
+
+    with pytest.raises(RuntimeUnavailable) as caught:
+        supervisor.ensure_running(config(), python=interpreter)
+
+    assert caught.value.reason == "runtime_spawn_failed"
+    assert stopped == [old.runtime_id]
+    assert state.read_record() is None
+
+
 class AnsweringExcept:
     """Unreachable for one named runtime id, and answers for every other.
 
@@ -481,6 +591,7 @@ class AnsweringExcept:
             "server_state": "ready",
             "tunnel_state": "ready",
             "tunnel_ready": True,
+            "startup_fingerprint": supervisor.startup_fingerprint(config(), frozenset()),
         }
 
 

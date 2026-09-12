@@ -383,6 +383,8 @@ def runtime_state(tunnel_obj, grants=None):
         handshake_path=Path("/tmp/h.json"),
         idle_timeout_seconds=600,
         max_lifetime_seconds=3600,
+        config=LearningStudioConfig(),
+        allowed_users=frozenset(),
     )
     state_ = server.RuntimeState(settings=settings, started_at=0.0, server_state="ready")
     state_.tunnel = tunnel_obj

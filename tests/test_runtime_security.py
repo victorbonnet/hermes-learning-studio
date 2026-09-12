@@ -514,6 +514,7 @@ def test_the_control_secret_travels_in_the_environment_and_not_an_argument(herme
         record(control_token=secret),
         handshake=Path("/tmp/handshake.json"),
         cloudflared="/usr/bin/cloudflared",
+        config=LearningStudioConfig(),
         source={},
     )
     command = [str(bootstrap.runtime_python()), str(supervisor.LAUNCHER)]
@@ -535,6 +536,7 @@ def test_the_child_environment_is_an_allowlist_not_a_copy():
         record(),
         handshake=Path("/tmp/h.json"),
         cloudflared="",
+        config=LearningStudioConfig(),
         source={"ANTHROPIC_API_KEY": "sk-x", "AWS_SESSION_TOKEN": "y", "HOME": "/home/x"},
     )
 

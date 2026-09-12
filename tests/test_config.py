@@ -348,9 +348,11 @@ def test_a_relative_or_malformed_cloudflared_path_is_refused(value):
         _config(cloudflared_path=value)
 
 
-def test_an_operator_may_brand_the_button():
-    """`Open Aula Lola` is a configuration example, never a built-in assumption."""
-    assert _config(launch_button_label="Open Aula Lola").launch_button_label == "Open Aula Lola"
+def test_an_operator_may_customize_the_button():
+    assert (
+        _config(launch_button_label="Open Practice Room").launch_button_label
+        == "Open Practice Room"
+    )
 
 
 @pytest.mark.parametrize(
@@ -366,4 +368,3 @@ def test_the_default_button_label_names_no_product_or_profile():
     from learning_studio.config import DEFAULT_BUTTON_LABEL
 
     assert DEFAULT_BUTTON_LABEL == "Open Learning Studio"
-    assert "Lola" not in DEFAULT_BUTTON_LABEL

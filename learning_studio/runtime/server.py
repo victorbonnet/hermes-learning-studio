@@ -56,6 +56,7 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from ..config import LearningStudioConfig, config_from_json
 from . import environment as env
 from .ownership import CONTROL_HEADER
 
@@ -88,6 +89,11 @@ class RuntimeSettings:
     handshake_path: Path
     idle_timeout_seconds: int
     max_lifetime_seconds: int
+    #: Validated by the supervisor and revalidated at this process boundary.
+    config: LearningStudioConfig
+    #: Final Mini App allowlist after every host and plugin gate.
+    allowed_users: frozenset[str]
+    startup_fingerprint: str = ""
     cloudflared_path: str = ""
 
 
@@ -120,9 +126,33 @@ def settings_from_environment(source: dict[str, str] | None = None) -> RuntimeSe
             raise BadEnvironment(f"out of range {name}")
         return number
 
+    def instruction(name: str) -> str:
+        raw = str(values.get(name, "") or "")
+        if not raw.strip():
+            raise BadEnvironment(f"missing {name}")
+        try:
+            env.bounded_startup_instruction(name, raw)
+        except ValueError as exc:
+            raise BadEnvironment(f"malformed {name}") from exc
+        return raw.strip()
+
     handshake = Path(required(env.HANDSHAKE))
     if not handshake.is_absolute():
         raise BadEnvironment(f"malformed {env.HANDSHAKE}")
+
+    idle_seconds = whole(env.IDLE_SECONDS, low=1, high=86_400)
+    max_lifetime_seconds = whole(env.MAX_LIFETIME_SECONDS, low=1, high=86_400)
+    config_payload = instruction(env.CONFIG)
+    allowed_users_payload = instruction(env.ALLOWED_USERS)
+    config = _configuration(config_payload)
+    allowed_users = _allowed_users(allowed_users_payload)
+    if idle_seconds != config.runtime_idle_timeout_seconds:
+        raise BadEnvironment(f"malformed {env.IDLE_SECONDS}")
+    if max_lifetime_seconds != config.runtime_max_lifetime_seconds:
+        raise BadEnvironment(f"malformed {env.MAX_LIFETIME_SECONDS}")
+    restriction = frozenset(config.mini_app_allowed_telegram_users)
+    if restriction and not allowed_users <= restriction:
+        raise BadEnvironment(f"malformed {env.ALLOWED_USERS}")
 
     return RuntimeSettings(
         runtime_id=required(env.RUNTIME_ID),
@@ -130,10 +160,29 @@ def settings_from_environment(source: dict[str, str] | None = None) -> RuntimeSe
         control_token=required(env.CONTROL_TOKEN),
         profile=required(env.PROFILE),
         handshake_path=handshake,
-        idle_timeout_seconds=whole(env.IDLE_SECONDS, low=1, high=86_400),
-        max_lifetime_seconds=whole(env.MAX_LIFETIME_SECONDS, low=1, high=86_400),
+        idle_timeout_seconds=idle_seconds,
+        max_lifetime_seconds=max_lifetime_seconds,
+        config=config,
+        allowed_users=allowed_users,
+        startup_fingerprint=env.startup_fingerprint(config_payload, allowed_users_payload),
         cloudflared_path=str(values.get(env.CLOUDFLARED, "") or "").strip(),
     )
+
+
+def _configuration(payload: str) -> LearningStudioConfig:
+    """Revalidate settings while keeping refusal text value-free."""
+    try:
+        return config_from_json(payload)
+    except (ValueError, TypeError) as exc:
+        raise BadEnvironment(f"malformed {env.CONFIG}") from exc
+
+
+def _allowed_users(payload: str) -> frozenset[str]:
+    """The final allowlist, parsed strictly. ``[]`` is "nobody", not "unset"."""
+    try:
+        return env.allowed_users_from_json(payload)
+    except (ValueError, TypeError) as exc:
+        raise BadEnvironment(f"malformed {env.ALLOWED_USERS}") from exc
 
 
 @dataclass
@@ -213,6 +262,7 @@ class RuntimeState:
             "sessions": len(self.sessions) if self.sessions is not None else 0,
             "idle_timeout_seconds": self.settings.idle_timeout_seconds,
             "max_lifetime_seconds": self.settings.max_lifetime_seconds,
+            "startup_fingerprint": self.settings.startup_fingerprint,
             "expires_in_seconds": max(
                 0.0, self.started_at + self.settings.max_lifetime_seconds - now
             ),
@@ -467,15 +517,18 @@ async def serve(settings: RuntimeSettings, *, clock=time.time) -> int:
     """Run the runtime until a deadline, a signal, or a control request ends it."""
     import uvicorn
 
-    from ..config import load_config
     from ..web.app import create_app
     from ..web.dependencies import build_dependencies
     from .grants import GrantStore
 
-    config = load_config()
+    config = settings.config
     grants = GrantStore(profile=settings.profile, generation=settings.generation, clock=clock)
     dependencies = build_dependencies(config=config, profile=lambda: settings.profile)
-    dependencies = dataclasses.replace(dependencies, grants=grants)
+    dependencies = dataclasses.replace(
+        dependencies,
+        grants=grants,
+        allowed_users=lambda: settings.allowed_users,
+    )
 
     state = RuntimeState(
         settings=settings,
@@ -562,10 +615,9 @@ async def _start_tunnel(state: RuntimeState, settings: RuntimeSettings, *, clock
     plane and decides whether a launch may proceed, which keeps that decision
     in one place instead of two.
     """
-    from ..config import load_config
     from .tunnel import child_environment, loopback_target, open_tunnel
 
-    config = load_config()
+    config = settings.config
     state.tunnel = await open_tunnel(
         executable=settings.cloudflared_path,
         target=loopback_target(config.runtime_host, state.port),

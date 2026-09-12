@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from learning_studio.config import LearningStudioConfig, config_to_json
 from learning_studio.runtime import environment as env
 from learning_studio.runtime import server
 from learning_studio.runtime.ownership import CONTROL_HEADER
@@ -34,6 +35,13 @@ def environ(**overrides) -> dict[str, str]:
         env.HANDSHAKE: "/tmp/handshake.json",
         env.IDLE_SECONDS: "60",
         env.MAX_LIFETIME_SECONDS: "300",
+        env.CONFIG: config_to_json(
+            LearningStudioConfig(
+                runtime_idle_timeout_seconds=60,
+                runtime_max_lifetime_seconds=300,
+            )
+        ),
+        env.ALLOWED_USERS: "[]",
     }
     values.update(overrides)
     return {key: value for key, value in values.items() if value is not None}
@@ -392,6 +400,8 @@ async def test_shutdown_reports_whether_the_public_address_is_known_closed(
         handshake_path=tmp_path / "handshake.json",
         idle_timeout_seconds=60,
         max_lifetime_seconds=300,
+        config=LearningStudioConfig(),
+        allowed_users=frozenset(),
     )
     settings.handshake_path.write_text("{}", encoding="utf-8")
     state = server.RuntimeState(settings=settings, started_at=clock())

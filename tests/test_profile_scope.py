@@ -97,6 +97,7 @@ def test_a_child_runtime_is_given_the_active_profile_values(
     """The runtime verifies signatures with whatever it is handed."""
     from pathlib import Path
 
+    from learning_studio.config import LearningStudioConfig
     from learning_studio.runtime import state, supervisor
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", PROFILE_A["TELEGRAM_BOT_TOKEN"])
@@ -118,6 +119,7 @@ def test_a_child_runtime_is_given_the_active_profile_values(
         ),
         handshake=Path("/tmp/h.json"),
         cloudflared="",
+        config=LearningStudioConfig(),
     )
 
     assert child["TELEGRAM_BOT_TOKEN"] == "222:BBBprofileB"
@@ -184,3 +186,57 @@ def test_no_module_reads_the_telegram_token_from_the_process_environment():
         offenders.append(relative)
 
     assert offenders == [], offenders
+
+
+def test_two_profiles_hand_their_own_authorisation_to_their_own_runtime(
+    hermes_secret_scope, monkeypatch, hermes_home
+):
+    """The resolved allowlist is computed per start, in the parent, for that profile.
+
+    A value resolved once and reused would authorise profile A's learners in
+    profile B's runtime — the same cross-profile leak the token has, but for
+    access rather than for a credential.
+    """
+    from pathlib import Path
+
+    from learning_studio.config import LearningStudioConfig
+    from learning_studio.runtime import environment as env
+    from learning_studio.runtime import server, state, supervisor
+
+    monkeypatch.setattr(
+        "learning_studio.config.load_raw_config",
+        lambda: {"platforms": {"telegram": {"allow_from": ["1001", "2002"]}}},
+    )
+
+    def handed_to_child(profile: str) -> frozenset[str]:
+        child = supervisor.child_environment(
+            state.RuntimeRecord(
+                runtime_id="r",
+                generation=1,
+                profile=profile,
+                pid=1,
+                host="127.0.0.1",
+                port=1,
+                control_token="t",
+                executable="/x/python",
+                started_at=0.0,
+                idle_timeout_seconds=60,
+                max_lifetime_seconds=300,
+            ),
+            handshake=Path("/tmp/h.json"),
+            cloudflared="",
+            config=LearningStudioConfig(
+                runtime_idle_timeout_seconds=60,
+                runtime_max_lifetime_seconds=300,
+            ),
+        )
+        assert env.ALLOWED_USERS in child
+        return server.settings_from_environment(child).allowed_users
+
+    hermes_secret_scope["scope"] = PROFILE_A
+    first = handed_to_child("a")
+    hermes_secret_scope["scope"] = PROFILE_B
+    second = handed_to_child("b")
+
+    assert first == frozenset({"1001"})
+    assert second == frozenset({"2002"})
