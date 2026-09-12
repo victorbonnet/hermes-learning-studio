@@ -42,23 +42,25 @@ verdict that decides when the item comes back.
 Flashcards are **self-graded**, and the grade drives two separate mechanisms.
 Keep them distinct — conflating them is why hand-rolled schedules misbehave:
 
-- **Relearning step** — what happens *within* the current session. A failed
-  card re-enters the session queue and comes back after a few intervening
-  cards. It stays in the relearning queue until it is retrieved correctly.
-- **Next review interval** — when the card is next due in a *future* session.
+- **Relearning step** — bringing a failed card back soon, before it has had
+  time to decay again. **You** arrange this, in a later round or in chat: an
+  exercise's card plan is fixed when `learning_studio_prepare` validates it,
+  and the Mini App walks that fixed order to the end. It does not re-queue a
+  failed card behind a few others, so never tell the learner it will.
+- **Next review interval** — when the card is next due in a *future* exercise.
   This is assigned only after the relearning attempt succeeds; a card still
   failing has no future interval yet, because there is nothing to space.
 
 | Verdict | Relearning step | Next review interval |
 | --- | --- | --- |
-| Failed | Re-queue in this session | None yet — assigned once relearned |
+| Failed | Rebuild it into a later round | None yet — assigned once relearned |
 | Hard | None | Shorten relative to the last interval |
 | Good | None | Expand |
 | Easy | None | Expand sharply |
 
-So a card failed and then relearned in the same session does not resume its old
-schedule: it starts again from the shortest interval. "Halve the interval" is
-the rule for a *hard* card that was still retrieved, not for a failed one.
+So a card failed and then relearned does not resume its old schedule: it starts
+again from the shortest interval. "Halve the interval" is the rule for a *hard*
+card that was still retrieved, not for a failed one.
 
 Self-grading is only honest if the learner attempted retrieval *before* the
 reveal. Say this explicitly: showing the answer first destroys the effect that
@@ -69,9 +71,24 @@ weeks, a month. Interleave tags rather than blocking by topic — mixing enzyme
 cards with membrane-transport cards teaches discrimination that blocked
 practice never does.
 
-**Today there is no scheduler.** Nothing persists between sessions. Give the
-learner the schedule as advice and tell them plainly they must keep it
-themselves. Never imply a review will be delivered to them.
+**What the Studio actually schedules.** Four different things, and it is easy
+to promise the wrong one:
+
+- **The current exercise is a fixed ordered plan.** Its card plan is set at
+  preparation time and runs in that order. Nothing is reordered, repeated, or
+  requeued inside it.
+- **A completed tracked attempt persists.** It updates durable, objective-level
+  SM-2 review state — so a self-rating on a flashcard does outlive the session,
+  and the old advice that nothing survives it is wrong.
+- **`learning_studio_review_plan` reports that state**: which objectives are due
+  now and which are coming up. Read it and raise it in conversation.
+- **Nothing is delivered by itself.** This plugin never sends a reminder, even
+  with the learner's opt-in flag on; a reminder can only reach them through a
+  cron job an operator configured separately. So an item comes back because you
+  build it into a later round, not because the schedule fetched it.
+
+An exercise you ran in chat is marked by you in the moment and produces no
+durable attempt, so it moves none of that state. Say which one happened.
 
 ## Accessibility
 
@@ -101,8 +118,8 @@ themselves. Never imply a review will be delivered to them.
 
 ## Combinations
 
-- Convert failed [selection-card](selection-cards.md) items into flashcards for
-  the rest of the session.
+- Convert failed [selection-card](selection-cards.md) items into flashcards in
+  the next round you prepare.
 - Promote [text-input](text-input-cards.md) items that the learner answers
   reliably into the maintenance deck.
 - Pair with [media-cards](media-cards.md) for audio-front vocabulary, which

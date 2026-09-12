@@ -623,3 +623,117 @@ def test_operator_docs_state_the_live_tool_count():
             assert re.search(claim, body) is None, (
                 f"{document} still contains an obsolete tool-count claim: {claim}"
             )
+
+
+# ── Playful challenge rounds ───────────────────────────────────────────────
+
+ROUND_BLUEPRINTS = ("quick mix", "story mission", "recall sprint")
+
+
+@pytest.fixture
+def rounds(references: dict[str, str]) -> str:
+    return references["playful-challenge-rounds"]
+
+
+def test_round_reference_names_the_three_blueprints(rounds: str):
+    assert_states(rounds, ROUND_BLUEPRINTS, "round blueprints")
+
+
+def test_rounds_are_short_objective_led_and_accessible(rounds: str):
+    assert_states(
+        rounds,
+        (
+            r"4[-–]6 cards",
+            r"objective'?s (observable )?verb",
+            r"variety is a means, never a quota",
+            r"keyboard",
+            r"reduced motion",
+            r"colour[^.]{0,80}(never|not) the only|no colour-only",
+        ),
+        "round design rules",
+    )
+
+
+def test_story_mission_is_sequential_and_does_not_execute_branches(rounds: str):
+    assert_states(
+        rounds,
+        (
+            r"shared setting|sharing (one )?[^.]{0,40}setting",
+            r"fixed ordered plan",
+            r"does not execute branch targets",
+            r"does not carry mutable simulated state",
+            r"decision_path.*one card",
+        ),
+        "story mission runtime truthfulness",
+    )
+
+
+def test_recall_sprint_has_no_timer_requeue_or_automatic_reminder(rounds: str):
+    assert_states(
+        rounds,
+        (
+            r"no timer",
+            r"nothing is requeued inside the current exercise",
+            r"never sends a reminder on its own",
+            r"durable sm-2",
+            r"learning_studio_review_plan",
+        ),
+        "recall sprint runtime truthfulness",
+    )
+
+
+def test_rounds_preserve_existing_learning_and_ux_contracts(rounds: str):
+    assert_states(
+        rounds,
+        (
+            r"recognition card cannot assess a production objective",
+            r"no points economy",
+            r"no daily streak",
+            r"no leaderboard",
+            r"no sound",
+            r"advance(?:s)? immediately",
+            r"scoring arrives at the end of the block",
+            r"assessment preference",
+            r"after the round",
+            r"change exactly one thing",
+            r"no new schema field",
+            r"existing component types",
+        ),
+        "existing learning and UX contracts",
+    )
+
+
+def test_round_examples_span_unrelated_subjects(rounds: str):
+    represented = [domain for domain, hits in domain_counts(rounds).items() if hits]
+    assert len(represented) >= 4, f"examples cover only {represented}"
+
+
+def test_skill_exposes_the_blueprint_at_the_format_choice(skill_md: str):
+    start = skill_md.index("### 4. Choose the exercise format")
+    end = skill_md.index("### 5. Verify the content")
+    section = skill_md[start:end]
+    assert "references/playful-challenge-rounds.md" in section
+    assert all(blueprint in normalize(section) for blueprint in ROUND_BLUEPRINTS)
+    assert len(section.split()) < 500
+
+
+def test_flashcard_reference_describes_current_persistence_truthfully(references: dict[str, str]):
+    body = normalize(references["flashcards-and-recall"])
+    for stale in (
+        "today there is no scheduler",
+        "nothing persists between sessions",
+        "re-enters the session queue",
+        "re-queue in this session",
+    ):
+        assert stale not in body
+    assert_states(
+        body,
+        (
+            r"fixed ordered plan",
+            r"completed tracked attempt persists",
+            r"sm-2",
+            r"learning_studio_review_plan",
+            r"never sends a reminder",
+        ),
+        "flashcard persistence truthfulness",
+    )
