@@ -89,8 +89,8 @@ export function loadRenderers(overrides = {}) {
  * browser too, so the stubs have to be in place first. The returned promise is
  * the boot, exposed by the application for exactly this reason.
  */
-export function loadApp({ telegram = null, fetch = null, location = null } = {}) {
-  const win = createWindow();
+export function loadApp({ telegram = null, fetch = null, location = null, windowOverrides = {} } = {}) {
+  const win = createWindow(windowOverrides);
   for (const id of documentIds()) {
     const node = win.document.createElement("div");
     node.setAttribute("id", id);

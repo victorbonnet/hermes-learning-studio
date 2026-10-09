@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Ordering focus browser checks</title>
+    <link rel="stylesheet" href="../../learning_studio/web/static/app.css" />
+    <script src="../../learning_studio/web/static/i18n.js" defer></script>
+    <script src="../../learning_studio/web/static/icons.js" defer></script>
+    <script src="../../learning_studio/web/static/renderers.js" defer></script>
+    <script src="ordering-focus.js" defer></script>
+    <style>
+      .browser-checks { padding: 16px; }
+      #browser-results { height: 9em; overflow: auto; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <header class="browser-checks">
+      <h1>Ordering focus browser checks</h1>
+      <p>Twenty items, real renderer and styles, native focus and a sticky action bar.
+        Use a window shorter than the list. Reload to rerun the keyboard checks.</p>
+      <pre id="browser-results" role="status" aria-live="polite">Running…</pre>
+      <button id="prepare-pointer" type="button">Prepare native pointer check</button>
+      <p id="pointer-instructions">The pointer check uses a real drag; synthetic events cannot capture a native pointer.</p>
+    </header>
+    <main id="card" class="card"></main>
+    <footer id="actions" class="actions">
+      <button class="primary" type="button">Submit</button>
+    </footer>
+  </body>
+</html>

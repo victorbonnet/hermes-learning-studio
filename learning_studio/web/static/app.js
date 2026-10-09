@@ -279,16 +279,15 @@
       objectUrls = [];
     }
 
-    /**
-     * Whether an experience declares reduced motion for the whole session.
-     *
-     * The accommodation vocabulary is a closed list on the manifest, so this is
-     * an exact membership test rather than a search for a substring.
-     */
-    function experienceDeclaresReducedMotion(source) {
+    /** Exact accommodation membership; malformed non-arrays grant nothing. */
+    function experienceHasAccommodation(source, accommodation) {
       var access = (source && source.accessibility) || {};
       var declared = access.accommodations;
-      return Boolean(declared && declared.indexOf && declared.indexOf(REDUCED_MOTION) !== -1);
+      return Array.isArray(declared) && declared.indexOf(accommodation) !== -1;
+    }
+
+    function experienceDeclaresReducedMotion(source) {
+      return experienceHasAccommodation(source, REDUCED_MOTION);
     }
 
     /** Whether one component asks for reduced motion in its own payload. */
@@ -323,9 +322,15 @@
       }
     }
 
+    function cleanupCard() {
+      if (currentCard && currentCard.cleanup) { currentCard.cleanup(); }
+      currentCard = null;
+    }
+
     /** Replace the card, move focus to it, and clear anything stale. */
     function paint(element, options) {
       var config = options || {};
+      cleanupCard();
       releaseImages();
       showFieldError("");
       if (element.classList && !reducedMotion()) {
@@ -526,6 +531,7 @@
 
     function renderContext() {
       return {
+        keyboardOnly: experienceHasAccommodation(experience, "keyboard_only"),
         t: function (key, values) {
           return t(key, values);
         },
@@ -659,13 +665,15 @@
         // Deliberately before the per-component preference is recomputed: the
         // completion screen belongs to the exercise that just ended, so the last
         // card's claim is still the one in force.
+        cleanupCard();
         return showResult();
       }
       currentComponent = component;
       componentReducedMotion = componentDeclaresReducedMotion(component);
       applyReducedMotion();
-      currentCard = Renderers.render(component, renderContext());
-      paint(currentCard.element, { focus: currentCard.focus });
+      var nextCard = Renderers.render(component, renderContext());
+      paint(nextCard.element, { focus: nextCard.focus });
+      currentCard = nextCard;
       if (currentCard.unsupported) {
         // Nothing to submit, but the exercise should not dead-end: skipping the
         // card is the only honest move available.
@@ -702,6 +710,7 @@
         return Promise.resolve();
       }
 
+      if (currentCard && currentCard.cancel) { currentCard.cancel(); }
       var payload = override;
       if (!payload) {
         var read = currentCard.read();
