@@ -752,6 +752,19 @@
       if (ended && ended.moving) { announceStatus(ctx.t("card.move_cancelled")); }
     }
 
+    function focusVisibleControl(control) {
+      if (typeof global.scrollBy !== "function") { control.focus(); return; }
+      control.focus({ preventScroll: true });
+      // draw() may already have focused this control. A second focus() does
+      // not scroll it, so explicitly reveal it above the footer and safe area.
+      var rect = control.getBoundingClientRect();
+      var view = viewport();
+      var margin = 6; // Include the focus outline, not just the button's box.
+      var offset = rect.top < view.top + margin ? rect.top - view.top - margin
+        : rect.bottom > view.bottom - margin ? rect.bottom - view.bottom + margin : 0;
+      if (offset) { global.scrollBy({ top: offset, left: 0, behavior: "instant" }); }
+    }
+
     function commit(entry, target) {
       var index = order.indexOf(entry);
       if (index === target) {
@@ -776,7 +789,7 @@
       draw();
       undo.disabled = true;
       announceStatus(ctx.t("card.move_undone"));
-      (restore.entry.up.disabled ? restore.entry.down : restore.entry.up).focus({ preventScroll: true });
+      focusVisibleControl(restore.entry.up.disabled ? restore.entry.down : restore.entry.up);
     });
 
     function move(entry, delta) {
@@ -787,7 +800,7 @@
       if (target < 0 || target >= order.length) { return; }
       commit(entry, target);
       var wanted = delta < 0 ? entry.up : entry.down;
-      (wanted.disabled ? (delta < 0 ? entry.down : entry.up) : wanted).focus({ preventScroll: true });
+      focusVisibleControl(wanted.disabled ? (delta < 0 ? entry.down : entry.up) : wanted);
     }
 
     draw();

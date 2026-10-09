@@ -1227,6 +1227,76 @@ function pointerCard(type = "sequence_order", options = {}) {
   return { ...result, handles: result.card.element.all().filter(node => node.classList.contains("drag-handle")) };
 }
 
+function keyboardViewport(type = "sequence_order") {
+  const context = pointerCard(type, { itemCount: 20, keyboardOnly: true });
+  const { win, card, rows } = context;
+  const footer = win.document.createElement("footer"); footer.id = "actions";
+  footer.getBoundingClientRect = () => ({ top: 600, bottom: 800 });
+  win.document.body.appendChild(footer);
+  win.visualViewport = { offsetTop: 30, height: 730 };
+  win.getComputedStyle = () => ({ paddingTop: "40px" });
+  let offset = 0;
+  orderingGeometry(card, () => 100 - offset);
+  for (const row of rows) for (const button of row.byTag("button")) {
+    button.getBoundingClientRect = () => {
+      const top = row.getBoundingClientRect().top + 12;
+      return { top, bottom: top + 44 };
+    };
+  }
+  win.scrollBy = options => { win.scrolls.push(options); offset += options.top; };
+  return context;
+}
+
+test("long-list keyboard moves reveal focus above the footer and below the safe area", () => {
+  for (const type of ["sentence_order", "sequence_order", "timeline", "process_flow"]) {
+    const { win, rows, order } = keyboardViewport(type);
+    const [up, down] = rows[0].byTag("button");
+    const initial = order();
+    const visible = () => {
+      const rect = win.document.activeElement.getBoundingClientRect();
+      assert.ok(rect.top >= 76, `focus above safe area: ${rect.top}`);
+      assert.ok(rect.bottom <= 594, `focus under footer: ${rect.bottom}`);
+    };
+    down.focus();
+    for (let index = 0; index < 19; index++) { click(down); visible(); }
+    assert.equal(win.document.activeElement, up, "last row focuses enabled opposite");
+    assert.equal(order()[19], initial[0]);
+    assert.ok(win.scrolls.some(scroll => scroll.top > 0));
+    for (let index = 0; index < 19; index++) { click(up); visible(); }
+    assert.equal(win.document.activeElement, down, "first row focuses enabled opposite");
+    assert.deepEqual(order(), initial);
+    assert.ok(win.scrolls.some(scroll => scroll.top < 0));
+    assert.ok(win.scrolls.every(scroll => scroll.behavior === "instant"));
+  }
+});
+
+test("Undo reveals its restored control even when focus starts at the bottom of a long list", () => {
+  const { win, card, rows, order } = keyboardViewport();
+  const initial = order();
+  click(rows[0].byTag("button")[1]);
+  win.scrollBy({ top: 1000, left: 0, behavior: "instant" });
+  const undo = card.element.byTag("button").find(node => node.classList.contains("order-undo"));
+  undo.focus(); click(undo);
+  assert.deepEqual(order(), initial);
+  assert.equal(win.document.activeElement, rows[0].byTag("button")[1]);
+  const rect = win.document.activeElement.getBoundingClientRect();
+  assert.ok(rect.top >= 76 && rect.bottom <= 594);
+  assert.ok(win.scrolls.at(-1).top < 0);
+});
+
+test("visible keyboard controls and pointer focus recovery do not scroll", () => {
+  const keyboard = keyboardViewport();
+  click(keyboard.rows[0].byTag("button")[1]);
+  assert.equal(keyboard.win.scrolls.length, 0, "visible keyboard focus needs no scrolling");
+  const { win, rows, handles } = pointerCard();
+  rows[1].byTag("button")[1].focus();
+  pointer(handles[1], "pointerdown", 100, 200);
+  pointer(win, "pointermove", 100, 410);
+  pointer(win, "pointerup", 100, 410);
+  assert.equal(win.scrolls.length, 0, "pointer focus recovery must stay stationary");
+  assert.equal(win.document.activeElement, rows[1].byTag("button")[0]);
+});
+
 test("ordering offers dedicated pointer handles only with capture support and without keyboard_only", () => {
   const { card, ctx, rows, handles } = pointerCard();
   assert.equal(handles.length, rows.length, "each row needs a dedicated handle");

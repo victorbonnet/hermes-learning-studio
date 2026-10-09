@@ -25,6 +25,15 @@ uv run pytest                  # tests
 
 Run `uv run ruff format .` to fix formatting.
 
+Ordering focus also has a browser check, since the dependency-free DOM shim
+cannot measure native scrolling or a sticky footer. Serve the repository root
+with `python -m http.server --bind 127.0.0.1 8000`, then open
+`http://127.0.0.1:8000/tests/browser/ordering-focus.html` in a browser window
+shorter than the twenty-item list. It checks repeated up/down moves and Undo on
+load; **Prepare native pointer check** gives instructions for the real drag.
+Results are visible on the page and available as `window.orderingFocusResults`.
+This optional check needs no browser automation package, API or credentials.
+
 ## Testing against the Hermes API
 
 Hermes is not a dependency of this repository. Tests exercise the host
