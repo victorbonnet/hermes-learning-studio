@@ -80,7 +80,8 @@
       results.pointer.status !== "fail";
     report.textContent = results.checks.map(function (result) {
       return (result.passed ? "PASS " : "FAIL ") + result.name + "\n" + JSON.stringify(result.detail);
-    }).join("\n") + "\nNative pointer: " + results.pointer.status;
+    }).join("\n") + "\nNative pointer: " + results.pointer.status +
+      "\n" + JSON.stringify(results.pointer);
     report.setAttribute("data-result", results.passed ? "pass" : "fail");
   }
 
@@ -140,16 +141,24 @@
     });
     assert(visible.length >= 2, "Increase browser height enough to show two full rows");
     assert(row.getBoundingClientRect().bottom < view.top, "Pointer setup must leave the focused row offscreen");
-    pointerCheck = {
-      focused: focused,
-      scrollY: window.scrollY,
-      order: JSON.stringify(currentCard.read().response.order),
-    };
-    results.pointer = { status: "ready", scrollY: window.scrollY };
+    results.pointer = { status: "preparing" };
     instructions.textContent = "Drag the handle of " + visible[0].querySelector(".text").textContent +
       " below the midpoint of " + visible[1].querySelector(".text").textContent +
       ". The page must stay at its current scroll position, with focus on the original offscreen row.";
     display();
+    // The longer instructions can wrap and change scroll anchoring on a
+    // narrow screen. Record the baseline after that layout has been painted.
+    window.requestAnimationFrame(function () {
+      window.requestAnimationFrame(function () {
+        pointerCheck = {
+          focused: focused,
+          scrollY: window.scrollY,
+          order: JSON.stringify(currentCard.read().response.order),
+        };
+        results.pointer = { status: "ready", scrollY: window.scrollY };
+        display();
+      });
+    });
   });
 
   window.addEventListener("pointerup", function () {
